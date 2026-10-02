@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu (sh = dash)
+            os: ubuntu-latest
+            shell: ''
+          - name: ubuntu (bash --posix)
+            os: ubuntu-latest
+            shell: 'bash --posix'
+          - name: macos
+            os: macos-latest
+            shell: ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install shellcheck (ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Show /bin/sh (ubuntu)
+        if: runner.os == 'Linux'
+        run: ls -l /bin/sh
+      - run: npm ci
+      - name: Assert bin/gate-lock is mode 100755 in git
+        run: |
+          mode=$(git ls-files -s bin/gate-lock | cut -d' ' -f1)
+          test "$mode" = 100755 || { echo "bin/gate-lock mode is $mode, want 100755"; exit 1; }
+      - run: npm run lint
+      - run: npm run format:check
+      - name: Test
+        env:
+          GATE_LOCK_TEST_SHELL: ${{ matrix.shell }}
+        run: npm test
+      - name: Assert the published file list
+        run: node scripts/pack-check.js
