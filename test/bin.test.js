@@ -31,12 +31,14 @@ describe('bin/gate-lock preamble and dispatch', () => {
     }
   });
 
-  it('run and clean are not implemented yet (exit 2)', () => {
-    for (const args of [['clean'], ['run', 'x', '--', 'true']]) {
-      const r = runBin(args, { env: { GATE_LOCK_DIR: freshPool() } });
-      expect(r.status).toBe(2);
-      expect(r.stderr).toBe('gate-lock: not implemented yet\n');
-    }
+  it('run is not implemented yet (exit 2) and clean runs the janitor', () => {
+    const pool = freshPool();
+    const r = runBin(['run', 'x', '--', 'true'], { env: { GATE_LOCK_DIR: pool } });
+    expect(r).toMatchObject({ status: 2, stderr: 'gate-lock: not implemented yet\n' });
+    // clean is built (D16): it runs the pass and says nothing when there is
+    // nothing to remove.
+    const c = runBin(['clean'], { env: { GATE_LOCK_DIR: pool } });
+    expect(c).toMatchObject({ status: 0, stdout: '', stderr: '' });
   });
 
   it('--format with extra arguments is not the bare query (exit 2)', () => {
