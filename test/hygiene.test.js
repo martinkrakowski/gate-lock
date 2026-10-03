@@ -256,25 +256,31 @@ describe('D16 the janitor pass', () => {
       },
     });
     await waitForFile(hook);
-    // While the janitor is deciding on the corpse, the holder at the aside name
-    // is replaced by a live, fresh one (a reclaimer restoring a slot, say).
-    fs.rmSync(path.join(pool, name), { recursive: true });
-    writeSlot(pool, name, {
+    // The aside has been moved to a name of the janitor's own and is parked
+    // between the two reads of its holder.
+    const priv = names(pool).find((n) => /\.reclaim\.\d+\.j/.test(n));
+    expect(priv).toBeDefined();
+    // What it holds is replaced by a live, fresh holder while it is read.
+    fs.rmSync(path.join(pool, priv), { recursive: true });
+    writeSlot(pool, priv, {
       owner: 'live',
       pid: livePid(),
       beat: nowS(),
       worktree: '/x',
       project: 'x',
     });
-    setAge(path.join(pool, name), 3600);
-    const holder = readSlot(pool, name);
+    setAge(path.join(pool, priv), 3600);
+    const holder = readSlot(pool, priv);
     // Later entries park at the same seam; let them through.
     const timer = setInterval(() => releaseHook(hook), 50);
     const r = await done;
     clearInterval(timer);
     expect(r.status).toBe(0);
     expect(r.stdout).toBe('');
-    // Judged on the generation it read, twice: nothing was removed.
+    expect(r.stderr).toBe('');
+    // Judged on the generation it read, twice: nothing was removed, and the
+    // copy went back under the name it had.
+    expect(names(pool).sort()).toEqual(['.format', name].sort());
     expect(readSlot(pool, name)).toEqual(holder);
   });
 
@@ -301,18 +307,106 @@ describe('D16 the janitor pass', () => {
       },
     });
     await waitForFile(hook);
-    // The name becomes a link to a directory of ours while the janitor is
-    // deciding: the provenance judged at the start of the entry no longer holds.
-    fs.rmSync(path.join(pool, name), { recursive: true });
-    fs.symlinkSync(victim, path.join(pool, name));
+    // The name this pass judges becomes a link to a directory of ours, after
+    // the provenance was judged: the second look must catch it.
+    const priv = names(pool).find((n) => /\.reclaim\.\d+\.j/.test(n));
+    expect(priv).toBeDefined();
+    fs.rmSync(path.join(pool, priv), { recursive: true });
+    fs.symlinkSync(victim, path.join(pool, priv));
     setAge(victim, 3600);
     const timer = setInterval(() => releaseHook(hook), 50);
     const r = await done;
     clearInterval(timer);
     expect(r.status).toBe(0);
     expect(r.stdout).toBe('');
-    expect(fs.lstatSync(path.join(pool, name)).isSymbolicLink()).toBe(true);
+    expect(fs.lstatSync(path.join(pool, priv)).isSymbolicLink()).toBe(true);
     expect(names(victim)).toEqual(['precious']);
+  });
+
+  it('D16 an overlapping pass never touches the private name another one is judging', async () => {
+    const pool = freshPool();
+    const name = `gate.lock.reclaim.${deadPid()}.1`;
+    writeSlot(pool, name, {
+      owner: 'gone',
+      pid: deadPid(),
+      beat: nowS(),
+      worktree: '/x',
+      project: 'x',
+    });
+    setAge(path.join(pool, name), 3600);
+    const hook = path.join(scratchOf(pool), 'hook-rename');
+    const first = startBin(['clean'], {
+      env: {
+        GATE_LOCK_DIR: pool,
+        ...TM,
+        GATE_LOCK_TEST_PAUSE_AFTER_JANITOR_RENAME: hook,
+      },
+    });
+    await waitForFile(hook);
+    // The first pass has moved the aside aside under a name of its own and is
+    // parked there: the original name is free while it judges.
+    const priv = names(pool).find((n) => /\.reclaim\.\d+\.j/.test(n));
+    expect(priv).toBeDefined();
+    expect(names(pool)).not.toContain(name);
+    // A second, overlapping pass runs to completion. The private name is young
+    // and carries a live pid, so this pass may not remove it, nor anything else.
+    const second = clean(pool);
+    expect(second).toMatchObject({ status: 0, stdout: '', stderr: '' });
+    expect(names(pool).sort()).toEqual(['.format', priv].sort());
+    // A reclaimer whose pid was recycled recreates the old name while the first
+    // pass is still parked.
+    const takerPid = livePid();
+    writeSlot(pool, name, {
+      owner: 'reclaimed',
+      pid: takerPid,
+      beat: nowS(),
+      worktree: '/x',
+      project: 'x',
+    });
+    const replacement = readSlot(pool, name);
+    releaseHook(hook);
+    const r = await first.done;
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    // It reports the name the operator knows, and removed only its own copy.
+    expect(r.stdout).toBe(`gate-lock: janitor: removed ${name}\n`);
+    expect(readSlot(pool, name)).toEqual(replacement);
+    expect(names(pool).sort()).toEqual(['.format', name].sort());
+  });
+
+  it('D16 a private name that is all taken makes the pass skip the aside, not loop', async () => {
+    const pool = freshPool();
+    const name = `gate.lock.reclaim.${deadPid()}.1`;
+    writeSlot(pool, name, {
+      owner: 'gone',
+      pid: deadPid(),
+      beat: nowS(),
+      worktree: '/x',
+      project: 'x',
+    });
+    setAge(path.join(pool, name), 3600);
+    const hook = path.join(scratchOf(pool), 'hook-ref');
+    const { child, done } = startBin(['clean'], {
+      env: {
+        GATE_LOCK_DIR: pool,
+        ...TM,
+        GATE_LOCK_TEST_PAUSE_AFTER_JANITOR_REF: hook,
+      },
+    });
+    // Parked before the pass: plant every private name this janitor could want,
+    // each naming its own live pid, so none of them can be removed either.
+    await waitForFile(hook);
+    for (let k = 0; k <= 99; k += 1) {
+      const planted = path.join(pool, `gate.lock.reclaim.${child.pid}.${k === 0 ? 'j' : `j${k}`}`);
+      fs.mkdirSync(planted, { mode: 0o700 });
+      setAge(planted, 3600);
+    }
+    const before = listing(pool);
+    releaseHook(hook);
+    const r = await done;
+    expect(r).toMatchObject({ status: 0, stdout: '', stderr: '' });
+    // Nothing moved and nothing was removed, not even the planted names.
+    expect(listing(pool)).toEqual(before);
   });
 
   it('D16 an unusable TMPDIR falls back to the temp root, so the pass still runs', () => {

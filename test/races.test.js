@@ -87,7 +87,6 @@ describe('R6 a reader never sees an empty or missing beat', () => {
     const pid = livePid();
     expect(acquire(pool, 'lane', pid).status).toBe(0);
     const slot = path.join(pool, 'gate.lock');
-    const before = Number(readSlot(pool, 'gate.lock').beat);
     const reads = { total: 0, empty: 0, missing: 0 };
     let stopping = false;
     // The beat is replaced by rename (F38), so a reader only ever sees a whole
@@ -107,15 +106,19 @@ describe('R6 a reader never sees an empty or missing beat', () => {
       }
     })();
     // A loop of refreshes, pinned to the slot, under the shell under test, in
-    // the harness's own environment (T110/H14) so nothing is inherited.
+    // the harness's own environment (T110/H14) so nothing is inherited. The
+    // binary is passed through the environment, not interpolated into the
+    // script, so a checkout path with a space (or anything else the shell would
+    // read) cannot break the loop.
     const refreshes = 40;
-    const script = `i=0; while [ "$i" -lt ${refreshes} ]; do "${BIN}" heartbeat || exit 1; i=$((i + 1)); done`;
+    const script = `i=0; while [ "$i" -lt ${refreshes} ]; do "$GATE_LOCK_TEST_LOOP_BIN" heartbeat || exit 1; i=$((i + 1)); done`;
     const [shellCmd, argv] = shellCommand(script);
     const loop = spawn(shellCmd, argv, {
       env: buildEnv({
         GATE_LOCK_DIR: pool,
         GATE_LOCK_CALLER_PID: String(pid),
         GATE_LOCK_SLOT_PATH: slot,
+        GATE_LOCK_TEST_LOOP_BIN: BIN,
       }),
       stdio: 'ignore',
     });
@@ -129,8 +132,9 @@ describe('R6 a reader never sees an empty or missing beat', () => {
     expect(reads.total).toBeGreaterThan(1000);
     expect(reads.empty).toBe(0);
     expect(reads.missing).toBe(0);
-    // The refreshes really happened while the hammer ran.
-    expect(Number(readSlot(pool, 'gate.lock').beat)).toBeGreaterThan(before);
+    // No assertion that the beat advanced by a second: all 40 refreshes can
+    // land in one epoch second, and the loop's exit status (checked above) is
+    // what proves they were made.
   });
 });
 
@@ -213,6 +217,10 @@ describe('T93 a storm of N+2 acquirers into N slots', () => {
         expect(winners.length).toBeLessThanOrEqual(N);
         expect(winners.length).toBeGreaterThanOrEqual(1);
         if (winners.length === N) saturated += 1;
+        // The peak is recorded from the settled round as well as from the
+        // sampler, so the "never more than N complete slots" claim does not
+        // depend on the timer having fired during the round.
+        peak = Math.max(peak, winners.length);
         // Every winner is intact, with its own lane and its own pid, and no
         // two winners ever claim the same slot.
         const held = [];

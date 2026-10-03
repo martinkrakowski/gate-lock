@@ -1102,6 +1102,78 @@ janitor_name() {
   j_pid=$norm
 }
 
+# janitor_put_back ORIGINAL (D16): put the private copy back under the name it
+# had, when that name is free again. When the name has been taken again the copy
+# stays where it is - it is a transient, so a later pass removes it - and says
+# so. Never deletes, and never moves anything that is not still the plain
+# directory of ours that was moved.
+janitor_put_back() {
+  if [ ! -e "$jp_priv" ] && [ ! -h "$jp_priv" ]; then
+    return 0
+  fi
+  if ! aside_ok "$jp_priv"; then
+    printf 'gate-lock: janitor: left %s alone: it is not the directory this pass moved\n' "$jp_priv" >&2
+    return 0
+  fi
+  if [ -e "$1" ] || [ -h "$1" ]; then
+    printf 'gate-lock: janitor: left %s: %s was taken again while it was judged\n' "$jp_priv" "$1" >&2
+    return 0
+  fi
+  mv "$jp_priv" "$1" 2>/dev/null || :
+  return 0
+}
+
+# janitor_take ASIDE (D16): move a reclaim aside to a name this pass owns before
+# anything is read or removed through it, and set $jp_priv to that name.
+#
+# Two janitor passes can overlap, and a reclaimer whose pid was recycled can
+# recreate the old name with the same pass token. Reading and removing through a
+# name only this process knows means whatever appears at the old name is neither
+# judged nor removed by this pass. The new name is itself a transient
+# (`.reclaim.<pid>.<token>`), so a later pass can clean it up once this process
+# is gone and the entry is old enough.
+#
+# Returns 1 with the aside left exactly where it was when the name is taken, the
+# rename fails, it nests, or what moved is not a plain directory of ours; the
+# caller then judges nothing and removes nothing.
+janitor_take() {
+  jt_slot=${1%.reclaim.*}
+  jt_k=0
+  while :; do
+    if [ "$jt_k" -eq 0 ]; then
+      jp_priv=$jt_slot.reclaim.$$.j
+    else
+      jp_priv=$jt_slot.reclaim.$$.j$jt_k
+    fi
+    if [ ! -e "$jp_priv" ] && [ ! -h "$jp_priv" ]; then
+      break
+    fi
+    jt_k=$((jt_k + 1))
+    [ "$jt_k" -le 99 ] || return 1
+  done
+  # A symlink is never moved through, and never moved.
+  if [ -h "$1" ]; then
+    return 1
+  fi
+  mv "$1" "$jp_priv" 2>/dev/null || return 1
+  # mv onto an existing directory nests the source inside it and exits 0 (D11):
+  # the source itself goes back where it was, never the destination, never
+  # deleted.
+  if [ -d "$jp_priv/${1##*/}" ]; then
+    if [ ! -e "$1" ] && [ ! -h "$1" ]; then
+      mv "$jp_priv/${1##*/}" "$1" 2>/dev/null || :
+    fi
+    return 1
+  fi
+  # The same provenance an aside is judged by: a real directory, not a link,
+  # ours. Anything else stays at the private name, which is a transient, and is
+  # left for a later pass.
+  if ! aside_ok "$jp_priv"; then
+    return 1
+  fi
+  return 0
+}
+
 # janitor_pass: one pass over the pool's entries. Prints `janitor: removed
 # <name>` for each removal.
 janitor_pass() {
@@ -1136,6 +1208,15 @@ janitor_pass() {
       continue
     fi
     if [ "$j_kind" = reclaim ]; then
+      # Judged and removed through a name this pass owns alone: an overlapping
+      # pass, and a reclaimer with a recycled pid that recreated the old name,
+      # can then never have their directory read or deleted here.
+      jp_orig=$jp_file
+      if ! janitor_take "$jp_orig"; then
+        continue
+      fi
+      jp_file=$jp_priv
+      pause_at GATE_LOCK_TEST_PAUSE_AFTER_JANITOR_RENAME
       # What the aside holds is judged by F40, exactly as any other reader
       # would: a dead holder, or a beat that is stale or missing. The two values
       # are read and read again, and only a pair of reads that agree is judged,
@@ -1147,16 +1228,19 @@ janitor_pass() {
       pause_at GATE_LOCK_TEST_PAUSE_AFTER_JANITOR_CONTENTS
       rdf "$jp_file/pid"
       if [ "$rd" != "$jp_pid" ]; then
+        janitor_put_back "$jp_orig"
         continue
       fi
       rdf "$jp_file/beat"
       if [ "$rd" != "$jp_beat" ]; then
+        janitor_put_back "$jp_orig"
         continue
       fi
       jp_alive=0
       pid_alive "$jp_pid" && jp_alive=1
       judge_beat "$jp_beat"
       if [ "$jp_alive" = 1 ] && [ "$beat_fresh" = 1 ]; then
+        janitor_put_back "$jp_orig"
         continue
       fi
     fi
@@ -1165,7 +1249,14 @@ janitor_pass() {
     # judged on its own turn.
     pause_at GATE_LOCK_TEST_PAUSE_BEFORE_JANITOR_REMOVE
     if [ "$j_kind" = cand ] || [ "$j_kind" = reclaim ]; then
-      aside_ok "$jp_file" || continue
+      if ! aside_ok "$jp_file"; then
+        # A copy this pass moved goes back under the name it had; anything else
+        # is left exactly as it is.
+        if [ "$j_kind" = reclaim ]; then
+          janitor_put_back "$jp_orig"
+        fi
+        continue
+      fi
     else
       [ ! -h "$jp_file" ] || continue
       [ -f "$jp_file" ] || continue
