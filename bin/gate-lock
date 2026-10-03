@@ -1,9 +1,13 @@
 #!/bin/sh
-# gate-lock: host-wide gate lock (on-disk format 1). Stub: only --format and
-# --version are implemented so far.
+# shellcheck disable=SC2034 # the resolved configuration is read by later subcommands
+# gate-lock: host-wide gate lock (on-disk format 1). So far: configuration,
+# the pool and the .format marker, and `workers`; the lock subcommands are
+# not built yet.
 set -u
 LC_ALL=C
 export LC_ALL
+# Everything this tool creates is owner-only unless a mode is set explicitly.
+umask 077
 
 # Resolve $0 to an absolute, physical path once (no realpath): follow symlinks
 # (npm's .bin links to this file), then canonicalise the directory with
@@ -48,6 +52,423 @@ if [ "$#" -eq 1 ]; then
     ;;
   esac
 fi
+
+# ---------------------------------------------------------------------------
+# Helpers. Messages go through printf: dash's echo would expand backslashes in
+# a value an operator typed.
+# ---------------------------------------------------------------------------
+
+die() {
+  printf 'gate-lock: %s\n' "$*" >&2
+  exit 2
+}
+
+# is_digits VALUE: non-empty and nothing but ASCII digits (LC_ALL=C, so a
+# non-ASCII digit is not one). A newline inside VALUE is not a digit either.
+is_digits() {
+  case $1 in
+  '' | *[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+# strip_zeros VALUE: leading zeros are a spelling; keep at least one digit.
+# Sets $norm.
+strip_zeros() {
+  norm=$1
+  while :; do
+    case $norm in
+    0?*) norm=${norm#0} ;;
+    *) break ;;
+    esac
+  done
+}
+
+# reduce PATH: drop trailing slashes (F2). Sets $reduced; "/" reduces to "".
+reduce() {
+  reduced=$1
+  while :; do
+    case $reduced in
+    */) reduced=${reduced%/} ;;
+    *) break ;;
+    esac
+  done
+}
+
+# Directory attributes without stat or realpath, neither of which is portable.
+# `find <p> -prune` tests the path itself (it never follows a symlink named on
+# the command line, and never descends); -user takes a numeric id; -perm takes
+# an octal mode. Unlike parsing `ls -ld`, the answer does not depend on the
+# locale, on user-name mapping, or on the ACL and attribute marker some
+# systems append to the mode string.
+owned_by() { [ -n "$(find "$1" -prune -user "$2" -print 2>/dev/null)" ]; }
+not_group_other_writable() {
+  [ -n "$(find "$1" -prune ! -perm -020 ! -perm -002 -print 2>/dev/null)" ]
+}
+mode_is_0700() { [ -n "$(find "$1" -prune -perm 0700 -print 2>/dev/null)" ]; }
+
+# ---------------------------------------------------------------------------
+# Test-mode gate (D20): the GATE_LOCK_TEST_* seams are honoured only when
+# GATE_LOCK_TEST_MODE is exactly 1. Otherwise a set one is named in a one-line
+# warning and ignored.
+# ---------------------------------------------------------------------------
+
+test_mode=0
+if [ "${GATE_LOCK_TEST_MODE:-}" = 1 ]; then
+  test_mode=1
+else
+  ignored=$(env | sed -n 's/^\(GATE_LOCK_TEST_[A-Za-z0-9_]*\)=..*$/\1/p' | tr '\n' ' ')
+  ignored=${ignored% }
+  if [ -n "$ignored" ]; then
+    printf 'gate-lock: warning: ignoring %s (test seams need GATE_LOCK_TEST_MODE=1)\n' "$ignored" >&2
+  fi
+fi
+
+# seam NAME: the value of a seam variable, empty when it is unset, empty or not
+# in test mode. Sets $seam_value.
+seam() {
+  seam_value=
+  if [ "$test_mode" = 1 ]; then
+    eval "seam_value=\${$1:-}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Numbers (section 4). A slot count is 1..64; a worker count is at least 1 and
+# never compared by a shell when it has many digits.
+# ---------------------------------------------------------------------------
+
+# parse_slots NAME VALUE (V3-V5): sets $slots_n.
+parse_slots() {
+  is_digits "$2" || die "$1 must be a number of slots, got '$2'"
+  strip_zeros "$2"
+  case $norm in
+  ???*) die "$1 must be at most 64 slots: $2" ;;
+  esac
+  [ "$norm" -ne 0 ] || die "$1 must be at least one slot: $2"
+  [ "$norm" -le 64 ] || die "$1 must be at most 64 slots: $2"
+  slots_n=$norm
+}
+
+# parse_workers NAME VALUE (V7): sets $workers_norm (the spelling without
+# leading zeros, for comparing) and $workers_n (clamped, for dividing).
+parse_workers() {
+  is_digits "$2" || die "$1 must be a number of workers, got '$2'"
+  strip_zeros "$2"
+  [ "$norm" != 0 ] || die "$1 must be at least one worker: $2"
+  workers_norm=$norm
+  case $norm in
+  ??????????*) workers_n=999999999 ;;
+  *) workers_n=$norm ;;
+  esac
+}
+
+# cap_validate NAME VALUE SLOTVAR (V23): a worker cap is a positive whole
+# number. Sets $norm. The text is shared with resolveMaxWorkers in src/index.js.
+cap_validate() {
+  if is_digits "$2"; then
+    strip_zeros "$2"
+    [ "$norm" != 0 ] && return 0
+  fi
+  die "$1 must be a positive whole number, got '$2'; the worker cap is set host-wide, beside $3"
+}
+
+# get_procs (V19): read the online-processor count at most once. Sets $procs_ok
+# (1 when it is a number), $procs_raw and $procs_n (leading zeros stripped, nine
+# or more digits clamped so no arithmetic can wrap).
+procs_done=0
+procs_ok=0
+procs_raw=
+procs_n=
+get_procs() {
+  [ "$procs_done" = 0 ] || return 0
+  procs_done=1
+  seam GATE_LOCK_TEST_NPROC
+  if [ -n "$seam_value" ]; then
+    procs_raw=$seam_value
+  else
+    procs_raw=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || procs_raw=
+  fi
+  if is_digits "$procs_raw"; then
+    strip_zeros "$procs_raw"
+    case $norm in
+    ?????????*) procs_n=999999999 ;;
+    *) procs_n=$norm ;;
+    esac
+    procs_ok=1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# `gate-lock workers` (V28): the per-run worker cap, by the same rules as
+# resolveMaxWorkers (V21-V26). It needs no pool, so it does not resolve the
+# pool configuration.
+# ---------------------------------------------------------------------------
+
+if [ "${1:-}" = workers ]; then
+  [ "$#" -eq 1 ] || {
+    echo "gate-lock: usage: gate-lock workers" >&2
+    exit 2
+  }
+  if [ "${GATE_LOCK_WORKERS+set}" = set ]; then
+    cap_name=GATE_LOCK_WORKERS
+    cap_raw=$GATE_LOCK_WORKERS
+    cap_slotvar=GATE_LOCK_SLOTS
+  elif [ -n "${GATE_HOST_WORKERS:-}" ]; then
+    cap_name=GATE_HOST_WORKERS
+    cap_raw=$GATE_HOST_WORKERS
+    cap_slotvar=GATE_HOST_SLOTS
+  else
+    exit 0
+  fi
+  cap_validate "$cap_name" "$cap_raw" "$cap_slotvar"
+  cap_norm=$norm
+  get_procs
+  [ "$procs_ok" = 1 ] || die "cannot read the processor count: getconf _NPROCESSORS_ONLN gave '$procs_raw'"
+  cap_above=0
+  case $cap_norm in
+  ??????????*) cap_above=1 ;;
+  *) [ "$cap_norm" -le "$procs_n" ] || cap_above=1 ;;
+  esac
+  [ "$cap_above" = 0 ] ||
+    die "$cap_name=$cap_raw is above this host's available parallelism ($procs_n); a cap above the thread count is not a cap"
+  printf '%s\n' "$cap_norm"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Configuration (C1, D9): resolved once per invocation, for every other
+# subcommand, before the usage check. Order (V16): pool directory, marker,
+# stale threshold, heartbeat period, worker agreement, counts, budget,
+# disagreement. A refusal is exit 2 and takes no lock.
+# ---------------------------------------------------------------------------
+
+real_uid=$(id -u) || die "cannot determine the user id"
+leaf_uid=$real_uid
+seam GATE_LOCK_TEST_UID
+[ -z "$seam_value" ] || leaf_uid=$seam_value
+parent_uid=$leaf_uid
+seam GATE_LOCK_TEST_PARENT_UID
+[ -z "$seam_value" ] || parent_uid=$seam_value
+is_digits "$leaf_uid" || die "GATE_LOCK_TEST_UID must be a numeric user id"
+is_digits "$parent_uid" || die "GATE_LOCK_TEST_PARENT_UID must be a numeric user id"
+
+# --- Pool resolution (D1) -----------------------------------------------------
+
+if [ -n "${GATE_LOCK_DIR:-}" ]; then
+  # F1-F3, judged on the spelling before anything is created (F6).
+  case $GATE_LOCK_DIR in
+  /*) ;;
+  *) die "GATE_LOCK_DIR=$GATE_LOCK_DIR must be an absolute path" ;;
+  esac
+  reduce "$GATE_LOCK_DIR"
+  pool=$reduced
+  [ -n "$pool" ] ||
+    die "GATE_LOCK_DIR=$GATE_LOCK_DIR is the filesystem root; the pool must be a directory of its own, not the filesystem root"
+  case $pool in
+  *//* | */./* | */../* | */. | */..)
+    die "GATE_LOCK_DIR=$pool must be a plain absolute path (no empty, . or .. components)"
+    ;;
+  esac
+  pool_label="GATE_LOCK_DIR=$pool"
+  parent_label="GATE_LOCK_DIR's parent"
+else
+  pool=
+  # XDG_RUNTIME_DIR, when it is a plain, absolute, existing 0700 directory of
+  # ours with no symlinked component. An unusable one is ignored, never an error.
+  xdg=${XDG_RUNTIME_DIR:-}
+  if [ -n "$xdg" ]; then
+    reduce "$xdg"
+    xdg=$reduced
+    xdg_ok=1
+    case $xdg in
+    /?*) ;;
+    *) xdg_ok=0 ;;
+    esac
+    case $xdg in
+    *//* | */./* | */../* | */. | */..) xdg_ok=0 ;;
+    esac
+    if [ "$xdg_ok" = 1 ]; then
+      if [ -h "$xdg" ] || [ ! -d "$xdg" ] || ! owned_by "$xdg" "$leaf_uid" || ! mode_is_0700 "$xdg"; then
+        xdg_ok=0
+      else
+        a=$xdg
+        while :; do
+          a=${a%/*}
+          [ -n "$a" ] || break
+          if [ -h "$a" ]; then
+            xdg_ok=0
+            break
+          fi
+        done
+      fi
+    fi
+    [ "$xdg_ok" = 1 ] && pool=$xdg/gate-lock
+  fi
+  if [ -z "$pool" ]; then
+    # Our own per-uid intermediate under the physical TMPDIR (or /tmp), so the
+    # pool's parent is a directory only we can write, never the sticky /tmp.
+    tmp_phys=
+    case ${TMPDIR:-} in
+    /*) tmp_phys=$(CDPATH='' cd -- "$TMPDIR" 2>/dev/null && pwd -P) || tmp_phys= ;;
+    esac
+    if [ -z "$tmp_phys" ]; then
+      tmp_phys=$(CDPATH='' cd -- /tmp 2>/dev/null && pwd -P) || die "cannot resolve /tmp"
+    fi
+    [ "$tmp_phys" != / ] || tmp_phys=
+    inter=$tmp_phys/gate-lock-$real_uid
+    mkdir -m 0700 "$inter" 2>/dev/null
+    if [ -h "$inter" ] || [ ! -d "$inter" ] || ! owned_by "$inter" "$leaf_uid" || ! mode_is_0700 "$inter"; then
+      die "GATE_LOCK_DIR is unset and the default directory $inter is not a private directory (mode 0700, owned by uid $leaf_uid, not a symlink); remove it or set GATE_LOCK_DIR to a pool under a directory you own"
+    fi
+    pool=$inter/pool
+  fi
+  pool_label="the default pool $pool"
+  parent_label="the default pool's parent"
+fi
+
+# --- Directory rules (F4-F8) --------------------------------------------------
+
+parent=${pool%/*}
+[ -n "$parent" ] || parent=/
+if [ -h "$parent" ] || [ ! -d "$parent" ] || ! owned_by "$parent" "$parent_uid" || ! not_group_other_writable "$parent"; then
+  die "$parent_label $parent is not safe to use: it must be a directory, not a symlink, owned by uid $parent_uid and not writable by group or others; no lock was taken (if a symlink is the problem, name the pool by its physical path: cd to the directory and use pwd -P)"
+fi
+a=$parent
+while :; do
+  a=${a%/*}
+  [ -n "$a" ] || break
+  if [ -h "$a" ]; then
+    die "$pool_label: $a is a symlink; name the pool by its physical path (cd to the directory and use pwd -P); no lock was taken"
+  fi
+done
+
+# F7: owner-only, set explicitly so the umask cannot loosen it. Failures,
+# including "already exists", are ignored; the judgement below decides.
+mkdir -m 0700 "$pool" 2>/dev/null
+if [ -h "$pool" ] || [ ! -d "$pool" ] || ! owned_by "$pool" "$leaf_uid" || ! not_group_other_writable "$pool"; then
+  die "$pool_label is not safe to use: it must be a directory, not a symlink, owned by uid $leaf_uid, and neither group- nor world-writable; no lock was taken"
+fi
+
+# --- The .format marker (F11-F15, D2) -------------------------------------------
+
+marker=$pool/.format
+if [ ! -e "$marker" ]; then
+  # Temp file, then a hard link: link(2) fails if the name exists, so it never
+  # replaces another client's marker (F12). The temp file is named after .format
+  # plus our pid; `clean` removes a dead one (D2). noclobber makes the write
+  # refuse an existing name.
+  marker_tmp=$pool/.format.tmp.$$
+  if (
+    set -C
+    printf '1\n' >"$marker_tmp"
+  ) 2>/dev/null; then
+    chmod 0600 "$marker_tmp" 2>/dev/null
+    ln "$marker_tmp" "$marker" 2>/dev/null
+    rm -f "$marker_tmp"
+  fi
+fi
+# Read back, trailing newlines trimmed by the command substitution; only a
+# regular file (never a symlink, a directory or a fifo) can say 1.
+found=
+if [ -f "$marker" ] && [ ! -h "$marker" ]; then
+  found=$(cat "$marker" 2>/dev/null) || found=
+fi
+if [ "$found" != 1 ]; then
+  if [ -z "$found" ]; then
+    shown=nothing
+  else
+    shown="'$(printf '%s' "$found" | tr '\n' ' ' | cut -c1-64)'"
+  fi
+  die "$pool_label has lock format $shown, but this gate speaks 1; no lock was taken"
+fi
+
+# --- Stale threshold (F36, V20) and heartbeat period (D5) ------------------------
+
+stale_raw=${GATE_LOCK_STALE_SECONDS:-}
+if [ -z "$stale_raw" ]; then
+  stale_seconds=600
+else
+  is_digits "$stale_raw" || die "GATE_LOCK_STALE_SECONDS must be a whole number of seconds (at most 10 digits), got '$stale_raw'"
+  strip_zeros "$stale_raw"
+  case $norm in
+  ???????????*) die "GATE_LOCK_STALE_SECONDS must be a whole number of seconds (at most 10 digits), got '$stale_raw'" ;;
+  esac
+  [ "$norm" -ge 600 ] ||
+    die "GATE_LOCK_STALE_SECONDS=$stale_raw is below 600s; under a pool the stale threshold must be at least 600s"
+  stale_seconds=$norm
+fi
+
+beat_raw=${GATE_LOCK_HEARTBEAT_SECONDS:-}
+if [ -z "$beat_raw" ]; then
+  heartbeat_seconds=60
+else
+  is_digits "$beat_raw" || die "GATE_LOCK_HEARTBEAT_SECONDS must be a whole number of seconds, at least 1 and at most 10 digits, got '$beat_raw'"
+  strip_zeros "$beat_raw"
+  case $norm in
+  ???????????*) die "GATE_LOCK_HEARTBEAT_SECONDS must be a whole number of seconds, at least 1 and at most 10 digits, got '$beat_raw'" ;;
+  esac
+  [ "$norm" -ge 1 ] || die "GATE_LOCK_HEARTBEAT_SECONDS must be a whole number of seconds, at least 1 and at most 10 digits, got '$beat_raw'"
+  heartbeat_seconds=$norm
+fi
+
+# --- Worker agreement (V9, D22) ----------------------------------------------------
+
+host_workers_raw=${GATE_HOST_WORKERS:-}
+host_workers_norm=
+host_workers_n=
+if [ -n "$host_workers_raw" ]; then
+  parse_workers GATE_HOST_WORKERS "$host_workers_raw"
+  host_workers_norm=$workers_norm
+  host_workers_n=$workers_n
+fi
+if [ "${GATE_LOCK_WORKERS+set}" = set ]; then
+  # Set but empty or unusable is refused, never read as unset (D22).
+  cap_validate GATE_LOCK_WORKERS "$GATE_LOCK_WORKERS" GATE_LOCK_SLOTS
+  if [ -n "$host_workers_raw" ] && [ "$norm" != "$host_workers_norm" ]; then
+    die "GATE_LOCK_WORKERS=$GATE_LOCK_WORKERS does not match GATE_HOST_WORKERS=$host_workers_raw; a run's cap and the host's budget are one decision"
+  fi
+fi
+
+# --- Slot count (V8-V12), budget (V13), disagreement (V15) --------------------------
+
+project_slots=
+if [ -n "${GATE_LOCK_SLOTS:-}" ]; then
+  parse_slots GATE_LOCK_SLOTS "$GATE_LOCK_SLOTS"
+  project_slots=$slots_n
+fi
+slot_source=
+if [ -n "${GATE_HOST_SLOTS:-}" ]; then
+  parse_slots GATE_HOST_SLOTS "$GATE_HOST_SLOTS"
+  slot_count=$slots_n
+  slot_source="GATE_HOST_SLOTS=$GATE_HOST_SLOTS"
+elif [ -n "$host_workers_raw" ]; then
+  get_procs
+  [ "$procs_ok" = 1 ] ||
+    die "cannot derive a slot count from GATE_HOST_WORKERS=$host_workers_raw: getconf _NPROCESSORS_ONLN did not give a number (got '$procs_raw'); set GATE_HOST_SLOTS, or unset GATE_HOST_WORKERS"
+  slot_count=$((procs_n / host_workers_n))
+  [ "$slot_count" -ge 1 ] || slot_count=1
+  [ "$slot_count" -le 64 ] || slot_count=64
+  slot_source="GATE_HOST_WORKERS=$host_workers_raw"
+else
+  slot_count=${project_slots:-1}
+fi
+
+if [ -n "${GATE_HOST_SLOTS:-}" ] && [ -n "$host_workers_raw" ]; then
+  get_procs
+  [ "$procs_ok" = 1 ] ||
+    die "GATE_HOST_SLOTS=$GATE_HOST_SLOTS with GATE_HOST_WORKERS=$host_workers_raw can only be checked against the host's processor count, but getconf _NPROCESSORS_ONLN did not give a number (got '$procs_raw')"
+  fit=$((procs_n / host_workers_n))
+  [ "$slot_count" -le "$fit" ] ||
+    die "GATE_HOST_SLOTS=$GATE_HOST_SLOTS with GATE_HOST_WORKERS=$host_workers_raw does not fit the $procs_n processors of this host (at most $fit slots of that many workers); lower the slots, raise the workers, or unset GATE_HOST_WORKERS and let the slot count be derived"
+fi
+
+if [ -n "$project_slots" ] && [ -n "$slot_source" ] && [ "$project_slots" -ne "$slot_count" ]; then
+  die "GATE_LOCK_SLOTS=$GATE_LOCK_SLOTS does not match $slot_source, which gives $slot_count slots, for pool $pool; the host's count wins in a pool"
+fi
+
+# The resolved configuration, for the subcommands GL2a builds:
+# $pool $slot_count $stale_seconds $heartbeat_seconds $real_uid.
 
 echo "gate-lock: not implemented yet" >&2
 exit 2
