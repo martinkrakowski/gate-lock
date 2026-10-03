@@ -13,8 +13,14 @@ case $self in
 */*) ;;
 *) self=$(command -v -- "$self") || self=$0 ;;
 esac
+hops=0
 while [ -h "$self" ]; do
-  target=$(readlink "$self") || break
+  hops=$((hops + 1))
+  if [ "$hops" -gt 40 ]; then
+    echo "gate-lock: too many levels of symbolic links" >&2
+    exit 2
+  fi
+  target=$(readlink -- "$self") || break
   case $target in
   /*) self=$target ;;
   *) self=$(dirname -- "$self")/$target ;;
@@ -32,7 +38,7 @@ if [ "$#" -eq 1 ]; then
     exit 0
     ;;
   --version)
-    version=$(sed -n 's/^  "version": "\([^"]*\)",*$/\1/p' "$self_dir/../package.json") || version=
+    version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*$/\1/p' "$self_dir/../package.json" | head -n 1) || version=
     if [ -z "$version" ]; then
       echo "gate-lock: cannot read the package version" >&2
       exit 2

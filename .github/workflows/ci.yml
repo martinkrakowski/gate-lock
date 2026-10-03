@@ -27,6 +27,8 @@ jobs:
             shell: ''
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -34,9 +36,14 @@ jobs:
       - name: Install shellcheck (ubuntu)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: Show /bin/sh (ubuntu)
-        if: runner.os == 'Linux'
-        run: ls -l /bin/sh
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+      - name: Assert /bin/sh is dash (ubuntu, sh leg)
+        if: runner.os == 'Linux' && matrix.shell == ''
+        run: |
+          ls -l /bin/sh
+          case "$(readlink -f /bin/sh)" in */dash) ;; *) echo "/bin/sh is not dash"; exit 1 ;; esac
       - run: npm ci
       - name: Assert bin/gate-lock is mode 100755 in git
         run: |

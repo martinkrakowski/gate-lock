@@ -12,6 +12,9 @@ Conventions used below:
 
 ---
 
+
+> **Precedence.** This file specifies format 1 as an existing client behaves. Where `plan.md` records a decision (D1–D23) that differs, the plan wins for this package. §2, the on-disk format, is frozen and no decision changes what another client observes on disk.
+
 ## 1. Purpose and model
 
 **P1.** The tool serialises a bounded number of expensive jobs ("gates") on one host, across any number of projects and git worktrees, with one shared pool of N slots. At most N gates run at once on the host. A gate is any command a caller wraps with the lock.
@@ -81,7 +84,6 @@ Changing any item in this section bumps the format number. A rewrite targeting f
 **F19.** A directory is a slot name only if it is the base name, or the base name plus a dot plus a number written as one or two digits with no leading zero, that is below MAX_SLOTS. So `.0`, `.007`, `.64` and `.100` are not slot names, even when the configured slot count is 64.
 
 **F20.** Transient names are derived from a slot's own path and are never slots. (Rev 2: the `<token>`/`<pass>` part of a reclaim aside is opaque; readers match `.reclaim.<pid>.*` and must not assume digits.)
-
 - `<slot>.cand.<pid>`: the candidate directory a creator fills before renaming it onto the slot name;
 - `<slot>.reclaim.<pid>.<pass>`: where a reclaimer moves a slot aside;
 - `<slot>.beatnew.<pid>`: a staged beat file next to the slot (a file, not a directory) before it is renamed onto the slot's beat.
@@ -240,7 +242,6 @@ Program name `gate-lock`. Synopsis:
 **C4.** The paths in messages are the slot's full path including the pool directory, spelled exactly as the slot path is spelled everywhere else, so a reader can go and look at it.
 
 **C5.** Environment inputs (see section 4 for the full table):
-
 - `GATE_LOCK_CALLER_PID`: the pid to record and to match on.
 - `GATE_LOCK_SLOT_OUT`: path of a file to receive the slot path after a successful acquire.
 - `GATE_LOCK_SLOT_PATH`: the pin for release, verify and heartbeat.
@@ -343,15 +344,15 @@ Program name `gate-lock`. Synopsis:
 
 ### 3.3 Exit code table
 
-| Code  | Meaning                                                                                                                                                                               |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0     | success (acquire, release including nothing-to-release, verify ok, heartbeat ok, status always, run with command exit 0 and clean release)                                            |
-| 1     | verify failed or no lock; heartbeat refused or no lock or cannot write/replace; release refused or failed; run where the lock was lost or release failed and the command had exited 0 |
-| 2     | usage error; any configuration refusal; bare acquire; acquire while self-held; empty worktree; slot output unwritable (slot given back); bad pin; bad heartbeat period                |
-| 75    | busy: every slot answering; or same worktree. Also what `run` exits when its acquire is busy.                                                                                         |
-| 130   | `run` interrupted by INT                                                                                                                                                              |
-| 143   | `run` terminated by TERM (also what the command's own TERM status becomes when the heartbeat loop stops it, in practice)                                                              |
-| other | `run` returns the wrapped command's own status                                                                                                                                        |
+| Code | Meaning |
+|------|---------|
+| 0 | success (acquire, release including nothing-to-release, verify ok, heartbeat ok, status always, run with command exit 0 and clean release) |
+| 1 | verify failed or no lock; heartbeat refused or no lock or cannot write/replace; release refused or failed; run where the lock was lost or release failed and the command had exited 0 |
+| 2 | usage error; any configuration refusal; bare acquire; acquire while self-held; empty worktree; slot output unwritable (slot given back); bad pin; bad heartbeat period |
+| 75 | busy: every slot answering; or same worktree. Also what `run` exits when its acquire is busy. |
+| 130 | `run` interrupted by INT |
+| 143 | `run` terminated by TERM (also what the command's own TERM status becomes when the heartbeat loop stops it, in practice) |
+| other | `run` returns the wrapped command's own status |
 
 ### 3.4 How a gate runner uses it (informative, derived from the observed caller)
 
@@ -373,19 +374,19 @@ These are requirements on the package's contract so that a runner can be written
 
 ### 4.1 Variable table
 
-| Variable                      | Scope      | Meaning                                                                                                   |
-| ----------------------------- | ---------- | --------------------------------------------------------------------------------------------------------- |
-| `GATE_LOCK_DIR`               | host       | Pool directory. Unset or empty means pool-less mode.                                                      |
-| `GATE_HOST_SLOTS`             | host       | Number of slots in the pool. Optional.                                                                    |
-| `GATE_HOST_WORKERS`           | host       | Workers one test run may spawn. Optional.                                                                 |
-| `GATE_LOCK_SLOTS`             | project    | A project's own view of the slot count (pool-less: the count; pool: must agree with the host). Default 1. |
-| `GATE_LOCK_WORKERS`           | project    | A project's own worker cap. Read by the worker-cap resolver; compared to the host's under a pool.         |
-| `GATE_LOCK_STALE_SECONDS`     | per call   | Stale threshold seconds. Default 600; under a pool at least 600.                                          |
-| `GATE_LOCK_HEARTBEAT_SECONDS` | per call   | `run` heartbeat period. Default 60, at least 1.                                                           |
-| `GATE_LOCK_CALLER_PID`        | per call   | Pid to record and match.                                                                                  |
-| `GATE_LOCK_SLOT_OUT`          | per call   | File to receive the acquired slot path.                                                                   |
-| `GATE_LOCK_SLOT_PATH`         | per call   | Pin.                                                                                                      |
-| `GATE_LOCK_TEST_*`            | tests only | Section 8.                                                                                                |
+| Variable | Scope | Meaning |
+|----------|-------|---------|
+| `GATE_LOCK_DIR` | host | Pool directory. Unset or empty means pool-less mode. |
+| `GATE_HOST_SLOTS` | host | Number of slots in the pool. Optional. |
+| `GATE_HOST_WORKERS` | host | Workers one test run may spawn. Optional. |
+| `GATE_LOCK_SLOTS` | project | A project's own view of the slot count (pool-less: the count; pool: must agree with the host). Default 1. |
+| `GATE_LOCK_WORKERS` | project | A project's own worker cap. Read by the worker-cap resolver; compared to the host's under a pool. |
+| `GATE_LOCK_STALE_SECONDS` | per call | Stale threshold seconds. Default 600; under a pool at least 600. |
+| `GATE_LOCK_HEARTBEAT_SECONDS` | per call | `run` heartbeat period. Default 60, at least 1. |
+| `GATE_LOCK_CALLER_PID` | per call | Pid to record and match. |
+| `GATE_LOCK_SLOT_OUT` | per call | File to receive the acquired slot path. |
+| `GATE_LOCK_SLOT_PATH` | per call | Pin. |
+| `GATE_LOCK_TEST_*` | tests only | Section 8. |
 
 **V1.** Host variables are set host-wide (for example in a system environment file for all sessions) and never in one seat's environment. The number of slots is a property of the host, and a seat's own view of it is the thing that is wrong. A seat that caps its own workers below the host's gets a lane whose timeout budget nobody else runs under.
 
@@ -449,7 +450,7 @@ A small function a test-runner configuration calls to learn the per-run worker c
 
 **V22.** Source selection: `GATE_LOCK_WORKERS` if present in the environment (including present but empty), else `GATE_HOST_WORKERS` unless empty (empty means unset), else no cap. A project variable that is set but empty or unusable is REFUSED and never falls through to the host's value. An operator who typed it deserves to be told, not to have it vanish and another value take its place. The asymmetry is deliberate: a project variable is the operator's own hand; a host variable is a wrapper's.
 
-**V23.** Validation of whichever variable supplied the value: it MUST match all digits (no sign, no point, no spaces, no hex or exponent form) and be at least 1. Refused examples: `0`, `-1`, `4.5`, empty, `x`, `4`, `0x4`. The error message names the variable that actually supplied the value (not the other one) and says the value must be a positive whole number, and that it is set host-wide beside the slot variable (the project slot variable when the project variable supplied it, the host slot variable when the host one did).
+**V23.** Validation of whichever variable supplied the value: it MUST match all digits (no sign, no point, no spaces, no hex or exponent form) and be at least 1. Refused examples: `0`, `-1`, `4.5`, empty, `x`, a value with surrounding spaces such as space-4-space, `0x4`. The error message names the variable that actually supplied the value (not the other one) and says the value must be a positive whole number, and that it is set host-wide beside the slot variable (the project slot variable when the project variable supplied it, the host slot variable when the host one did).
 
 **V24.** A value above the processor count is refused with a message naming the variable, the value and the processor count, and saying that a cap above the thread count is not a cap. It is refused rather than clamped. The processor count here is the runtime's own (the thread count the process can see), which on a container or cpuset can differ from the host's reading; this is the layer that enforces it.
 
@@ -725,7 +726,7 @@ Every test in the original suite, restated as a numbered requirement in neutral 
 
 **T95.** A whole number passes through (4 gives 4); a count equal to the CPU count (24) is accepted.
 
-**T96.** Refused with the project variable's name: `0`, `-1`, `4.5`, empty, `x`, `4`, `0x4`.
+**T96.** Refused with the project variable's name: `0`, `-1`, `4.5`, empty, `x`, a value with surrounding spaces such as space-4-space, `0x4`.
 
 **T97.** A count above the CPU count (25 versus 24) is refused with a message saying the variable and value are above this host's available parallelism (24).
 

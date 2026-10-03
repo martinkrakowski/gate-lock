@@ -1,8 +1,9 @@
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { FORMAT } from '../src/index.js';
-import { BIN, REPO_ROOT, freshPool, runBin, scratchOf } from './harness.js';
+import { BIN, REPO_ROOT, buildEnv, freshPool, runBin, scratchOf } from './harness.js';
 
 const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
 
@@ -61,5 +62,67 @@ describe('bin/gate-lock stub', () => {
     expect(text.startsWith('#!/bin/sh\n')).toBe(true);
     expect(text).toMatch(/^set -u$/m);
     expect(text).toMatch(/^LC_ALL=C$/m);
+  });
+
+  describe('--version tolerates package.json formatting', () => {
+    // A copy of the stub in <scratch>/bin with its own package.json beside it.
+    const versionFor = (packageJson) => {
+      const scratch = scratchOf(freshPool());
+      fs.mkdirSync(path.join(scratch, 'bin'));
+      const copy = path.join(scratch, 'bin', 'gate-lock');
+      fs.copyFileSync(BIN, copy);
+      fs.chmodSync(copy, 0o755);
+      fs.writeFileSync(path.join(scratch, 'package.json'), packageJson);
+      return runBin(['--version'], { bin: copy });
+    };
+    const cases = {
+      'four-space indent':
+        '{\n    "name": "x",\n    "version": "1.2.3",\n    "license": "MIT"\n}\n',
+      'tab indent': '{\n\t"name": "x",\n\t"version": "1.2.3",\n\t"license": "MIT"\n}\n',
+      'no space around the colon': '{\n  "version":"1.2.3",\n  "x": 1\n}\n',
+      'spaces on both sides of the colon': '{\n  "version" : "1.2.3",\n  "x": 1\n}\n',
+      'no trailing comma': '{\n  "name": "x",\n  "version": "1.2.3"\n}\n',
+      'CRLF line endings': '{\r\n  "name": "x",\r\n  "version": "1.2.3",\r\n  "x": 1\r\n}\r\n',
+      'only the first version line counts': '{\n  "version": "1.2.3",\n  "version": "9.9.9"\n}\n',
+    };
+    for (const [title, json] of Object.entries(cases)) {
+      it(title, () => {
+        expect(versionFor(json)).toMatchObject({ status: 0, stdout: '1.2.3\n', stderr: '' });
+      });
+    }
+    it('a package.json without a version exits 2 with the prefix', () => {
+      const r = versionFor('{ "name": "x" }\n');
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/^gate-lock: /);
+    });
+  });
+
+  it('a symlink cycle exits 2 instead of looping (cap of 40)', () => {
+    // sh -c makes $0 the operand, so the cycle is never opened by the kernel.
+    const scratch = scratchOf(freshPool());
+    fs.symlinkSync('loop-b', path.join(scratch, 'loop-a'));
+    fs.symlinkSync('loop-a', path.join(scratch, 'loop-b'));
+    const r = spawnSync(
+      'sh',
+      ['-c', fs.readFileSync(BIN, 'utf8'), path.join(scratch, 'loop-a'), '--format'],
+      {
+        env: buildEnv(),
+        encoding: 'utf8',
+        timeout: 15000,
+      },
+    );
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/^gate-lock: .*symbolic link/);
+  });
+
+  it('a chain of 30 links still resolves', () => {
+    const scratch = scratchOf(freshPool());
+    let prev = BIN;
+    for (let i = 0; i < 30; i++) {
+      const link = path.join(scratch, `l${i}`);
+      fs.symlinkSync(prev, link);
+      prev = link;
+    }
+    expect(runBin(['--version'], { bin: prev }).stdout).toBe(`${pkg.version}\n`);
   });
 });

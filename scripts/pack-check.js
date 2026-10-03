@@ -1,5 +1,7 @@
 // Asserts that `npm pack` would publish exactly the expected files.
 import { spawnSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const EXPECTED_FILES = [
   'LICENSE',
@@ -21,7 +23,7 @@ export function checkPack(json, expected = EXPECTED_FILES) {
   return { ok: missing.length === 0 && extra.length === 0, missing, extra };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   const run = spawnSync('npm', ['pack', '--dry-run', '--json'], { encoding: 'utf8' });
   if (run.status !== 0) {
     console.error(run.stderr);
