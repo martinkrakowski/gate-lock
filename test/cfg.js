@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { freshPool, runBin, scratchOf } from './harness.js';
 
-/** What every subcommand still prints once configuration has resolved (GL2a replaces it). */
+/** What `clean` and `run` still print once configuration has resolved (GL2b and GL3 replace it). */
 export const NOT_IMPL = 'gate-lock: not implemented yet\n';
 
 export const UID = process.getuid();
@@ -23,11 +23,19 @@ export function cfg(env = {}, args = ['status']) {
 let lastPool;
 
 /**
- * Configuration was accepted: exit 2 only because the subcommand is not built
- * yet, and (for an explicit pool) the pool now holds its .format marker.
+ * Configuration was accepted: the subcommand then ran (`status` exits 0 with
+ * nothing on stderr), or was refused on its own terms (a usage error, the
+ * missing caller pid), or is not built yet (`clean`, `run`); and, for an
+ * explicit pool, the pool now holds its .format marker.
  */
 export function accepted(r) {
-  const said = r.status === 2 && r.stderr === NOT_IMPL && r.stdout === '';
+  const said =
+    (r.status === 0 && r.stderr === '' && /^(free|\/)/.test(r.stdout)) ||
+    (r.status === 2 &&
+      r.stdout === '' &&
+      (r.stderr === NOT_IMPL ||
+        /^gate-lock: [^\n]*\nusage: /.test(r.stderr) ||
+        /^gate-lock: [^\n]*GATE_LOCK_CALLER_PID[^\n]*\n$/.test(r.stderr)));
   if (!said || lastPool === undefined) return said;
   return fs.existsSync(path.join(lastPool, '.format'));
 }
@@ -38,6 +46,7 @@ export function refusal(r, ...needles) {
   expect2(r.stdout === '', `stdout ${JSON.stringify(r.stdout)}`);
   expect2(/^gate-lock: [^\n]*\n$/.test(r.stderr), `stderr ${JSON.stringify(r.stderr)}`);
   expect2(r.stderr !== NOT_IMPL, 'configuration was accepted');
+  expect2(!/\nusage: /.test(r.stderr), 'configuration was accepted (usage error)');
   for (const n of needles) {
     expect2(r.stderr.includes(n), `stderr ${JSON.stringify(r.stderr)} lacks ${JSON.stringify(n)}`);
   }

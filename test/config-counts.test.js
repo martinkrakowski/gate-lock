@@ -478,7 +478,7 @@ describe('C1/D9 configuration is resolved once, for every subcommand, before the
     }
   });
 
-  it('after configuration resolves every other subcommand still exits 2 "not implemented yet"', () => {
+  it('after configuration resolves every subcommand runs on its own terms (usage, caller pid, status, not built yet)', () => {
     for (const args of [
       [],
       ['acquire', 'x'],

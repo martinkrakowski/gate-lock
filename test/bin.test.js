@@ -22,18 +22,20 @@ describe('bin/gate-lock preamble and dispatch', () => {
     expect(r).toMatchObject({ status: 0, stdout: `${pkg.version}\n`, stderr: '' });
   });
 
-  it('an unknown subcommand exits 2 with the gate-lock: prefix on stderr', () => {
-    const r = runBin(['frobnicate'], { env: { GATE_LOCK_DIR: freshPool() } });
-    expect(r.status).toBe(2);
-    expect(r.stdout).toBe('');
-    expect(r.stderr).toBe('gate-lock: not implemented yet\n');
-  });
-
-  it('no arguments, and the real subcommands, are not implemented yet (exit 2)', () => {
-    for (const args of [[], ['acquire', 'x'], ['status'], ['run', 'x', '--', 'true']]) {
+  it('an unknown subcommand, and no subcommand, exit 2 with the gate-lock: prefix and a usage line', () => {
+    for (const args of [['frobnicate'], []]) {
       const r = runBin(args, { env: { GATE_LOCK_DIR: freshPool() } });
       expect(r.status).toBe(2);
-      expect(r.stderr).toMatch(/^gate-lock: /);
+      expect(r.stdout).toBe('');
+      expect(r.stderr).toMatch(/^gate-lock: [^\n]+\nusage: gate-lock /);
+    }
+  });
+
+  it('run and clean are not implemented yet (exit 2)', () => {
+    for (const args of [['clean'], ['run', 'x', '--', 'true']]) {
+      const r = runBin(args, { env: { GATE_LOCK_DIR: freshPool() } });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toBe('gate-lock: not implemented yet\n');
     }
   });
 

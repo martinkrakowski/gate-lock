@@ -294,7 +294,7 @@ describe('S2 processor sources for gate-lock workers', () => {
     const r = runBin(['status'], {
       env: { ...env, GATE_LOCK_DIR: pool, GATE_HOST_WORKERS: '1', GATE_LOCK_SLOTS: '8' },
     });
-    expect(r).toMatchObject({ status: 2, stderr: 'gate-lock: not implemented yet\n' });
+    expect(r).toMatchObject({ status: 0, stderr: '' });
     const budget = runBin(['status'], {
       env: {
         ...env,
@@ -304,7 +304,7 @@ describe('S2 processor sources for gate-lock workers', () => {
         GATE_LOCK_SLOTS: '8',
       },
     });
-    expect(budget.stderr).toBe('gate-lock: not implemented yet\n');
+    expect(budget).toMatchObject({ status: 0, stderr: '' });
   });
 
   it('S2 nproc runs with OMP_NUM_THREADS and OMP_THREAD_LIMIT unset (GNU nproc honours them)', () => {
