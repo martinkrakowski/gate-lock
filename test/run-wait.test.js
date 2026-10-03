@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { listing, scratchOf } from './harness.js';
-import { TM, livePid, names, readSlot, seed, wtDir } from './slots.js';
+import { TM, livePid, names, readSlot, seed, until, wtDir } from './slots.js';
 import { blocker, freshPool, runOnce, startRun, track, up, watchStderr } from './run.js';
 
 /** A path under the pool's scratch for an output file. */
@@ -217,6 +217,26 @@ describe('--wait', () => {
     expect(fs.readFileSync(file, 'utf8')).toBe('busy:host\n');
     expect(readSlot(pool, 'gate.lock').owner).toBe('holder');
   }, 30_000);
+
+  it('Waiting a signal ends the wait: the run exits 143 and the holder keeps the lock', async () => {
+    const pool = freshPool();
+    seed(pool, 'gate.lock', { owner: 'holder', pid: livePid() });
+    const file = out(pool, 'status-signalled');
+    // A deadline far beyond the test: what ends this run is the signal.
+    const gate = startRun(pool, 'lane', ['true'], {
+      args: ['--wait', '600', '--status-file', file],
+    });
+    const busy = watchStderr(gate.child);
+    const started = Date.now();
+    // The first answer is the busy one; the run is now waiting for the next try.
+    await until(() => busy().includes('busy'), 20000);
+    gate.child.kill('SIGTERM');
+    const r = await gate.done;
+    expect(r.status).toBe(143);
+    expect(Date.now() - started).toBeLessThan(30000);
+    expect(fs.readFileSync(file, 'utf8')).toBe('tool:143\n');
+    expect(readSlot(pool, 'gate.lock').owner).toBe('holder');
+  }, 60_000);
 
   it('Waiting --wait 0 makes exactly one attempt', () => {
     const pool = freshPool();

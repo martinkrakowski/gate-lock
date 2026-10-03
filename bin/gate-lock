@@ -2183,7 +2183,11 @@ run_record_status() {
   fi
   run_recorded=1
   [ -n "$run_status_file" ] || return 0
-  if [ -n "$run_busy_kind" ]; then
+  # A busy refusal keeps its own record only while nothing has changed the answer
+  # since: a run that was signalled while it waited for a slot is the tool's 143,
+  # not the busy it was told a moment before (D18).
+  if [ -n "$run_busy_kind" ] && [ -z "$run_sig" ] && [ "$run_sup_status" -eq 0 ] &&
+    [ "$run_verify_ok" = 1 ] && [ "$run_exit_code" = 75 ]; then
     run_status=busy:$run_busy_kind
   elif [ -n "$run_sig" ] || [ "$run_sup_status" -eq 1 ] || [ "$run_verify_ok" = 0 ] ||
     [ "$run_removed" = 0 ] || [ "$run_acq_status" != 0 ]; then
@@ -2474,6 +2478,12 @@ run_acquire() {
   fi
   run_attempts=0
   while :; do
+    # A signal while this run waits for a slot ends the wait: the caller asked it
+    # to stop, and there is nothing held to release yet (C38, R21).
+    if [ -n "$run_sig" ]; then
+      run_acq_status=$run_sig_code
+      return 0
+    fi
     if [ "$run_attempts" -gt 0 ]; then
       now_s
       [ "$((now + 1))" -le "$run_deadline" ] || break
