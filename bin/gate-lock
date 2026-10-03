@@ -2023,6 +2023,7 @@ run_wait_given=0
 run_dir=
 run_cmd_pid=
 run_sup_pid=
+run_escalator_pid=
 run_cmd_status=0
 run_sup_status=0
 run_acq_status=0
@@ -2053,9 +2054,51 @@ run_signal() {
   fi
   run_sig=$1
   run_sig_code=$2
-  if [ -n "$run_cmd_pid" ]; then
-    kill -TERM "$run_cmd_pid" 2>/dev/null
-  fi
+  run_forward_term
+}
+
+# run_forward_term (D15, C39, C40): TERM is what the command is stopped with, for
+# every signal this run handles - an asynchronous command starts with INT and QUIT
+# ignored, so a forwarded INT would be a no-op for a plain shell command.
+#
+# It also arms the escalator, once: a command that ignores TERM would otherwise
+# hold this run for ever in the cleanup that waits for it, and the only thing that
+# can break that wait is a KILL on the command (C40). The supervisor escalates for
+# a lost lock (D10); this is the same grace for the signal path, and only this
+# process can escalate, because only it can wait for the command.
+run_forward_term() {
+  [ -n "$run_cmd_pid" ] || return 0
+  kill -TERM "$run_cmd_pid" 2>/dev/null
+  [ -n "$run_escalator_pid" ] && return 0
+  run_escalator() {
+    # A one-shot watchdog, in a subshell of this run: it keeps none of run's stdio
+    # (`exec` first), so the caller's streams close the moment run exits, and it is
+    # cancelled by run_reap_command as soon as the command is really gone.
+    trap '' TERM INT HUP QUIT
+    (
+      exec >/dev/null 2>&1
+      run_escalator_grace
+      sleep "$run_escalator_grace"
+      kill -KILL "$run_escalator_cmd" 2>/dev/null
+    ) &
+  }
+  run_escalator_grace=$run_kill_grace
+  seam GATE_LOCK_TEST_KILL_GRACE
+  case ${seam_value:-} in
+  '' | *[!0-9]*) ;;
+  *) run_escalator_grace=$seam_value ;;
+  esac
+  run_escalator_cmd=$run_cmd_pid
+  run_escalator
+  run_escalator_pid=$!
+}
+
+# run_cancel_escalator: the command is gone, so the watchdog has nothing left to
+# do. A KILL is what stops it: a TERM would only be noticed after its own sleep.
+run_cancel_escalator() {
+  [ -n "$run_escalator_pid" ] || return 0
+  kill -KILL "$run_escalator_pid" 2>/dev/null
+  run_escalator_pid=
 }
 
 # run_wait_pid PID: wait for a child, waiting again when our own handler
@@ -2106,6 +2149,7 @@ run_reap_command() {
   run_wait_pid "$run_last_cmd_pid"
   run_cmd_status=$wp_status
   run_cmd_pid=
+  run_cancel_escalator
 }
 
 # run_stop_supervisor (C41, R7, R8d): TERM the supervisor, which stops its loop
@@ -2638,6 +2682,15 @@ do_run() {
   # unchanged (no capture, no buffering) and its stdin null.
   "$@" </dev/null &
   run_cmd_pid=$!
+  # A shell runs a pending signal between two commands, so a signal can arrive
+  # between the fork above and the assignment, when the handler had no pid to
+  # forward TERM to. The handler has already recorded that it was signalled, so
+  # the same forwarding is made here, where the pid is known (C40: nothing but
+  # SIGKILL ends this run's wait, and a command that is never told to stop would
+  # never end it).
+  if [ -n "$run_sig" ]; then
+    run_forward_term
+  fi
   run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" &
   run_sup_pid=$!
   # C31: the heartbeat is started before the command is waited for, and the

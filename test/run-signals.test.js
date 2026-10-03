@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { listing, scratchOf, waitForFile } from './harness.js';
-import { livePid, names, readSlot } from './slots.js';
+import { TM, livePid, names, readSlot } from './slots.js';
 import {
   beatPids,
   blocker,
@@ -141,6 +141,32 @@ describe('T26 / T27 / D15 one signal', () => {
       await waitForDead(pid);
     }
   });
+});
+
+describe('C40 a command that will not stop', () => {
+  it('D15 a command that ignores TERM is KILLed after the grace, so a signalled run always ends', async () => {
+    const pool = freshPool();
+    // The command deafens itself to TERM. Only the KILL the run escalates to can
+    // stop it, and without that escalation this run waits for ever - which is
+    // what a review probe of this shape caught.
+    const block = blocker(pool, 'deaf', { ignoreTerm: true });
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '1', GATE_LOCK_TEST_KILL_GRACE: '2' },
+    });
+    await up(block);
+    const victim = track(block.pid());
+    gate.child.kill('SIGTERM');
+    const started = Date.now();
+    const r = await gate.done;
+    expect(r.status).toBe(143);
+    expect(Date.now() - started).toBeLessThan(30000);
+    // The command is stopped, and the lock comes back.
+    await waitForDead(victim, 10000);
+    expect(fs.existsSync(block.done)).toBe(false);
+    expect(r.stderr).toBe('');
+    expect(r.stdout).toContain('released by lane');
+    expect(names(pool)).toEqual(['.format']);
+  }, 60_000);
 });
 
 describe('T28 / T29 a second signal', () => {
