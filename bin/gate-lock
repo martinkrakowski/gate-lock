@@ -2049,6 +2049,29 @@ run_kill_grace=10
 # and QUIT ignored: a forwarded INT would be a no-op for a plain shell command
 # (C39). A second signal, of any kind, is ignored - re-entering is the one thing
 # worse than ignoring it, because it can skip the release (C40).
+# run_await_ready MARKER PID: wait until one of our subshells has installed its
+# traps before signalling it. A TERM that arrives before the `trap` line inside a
+# subshell meets a default disposition, and bash 3.2 answers that with its own
+# "run_pending_traps" warning and a resend of the signal to itself: noise on the
+# caller's stderr, from a process that has done nothing wrong, which is not what a
+# caller of a gate should see. The wait is bounded, and the signal is skipped
+# entirely when the subshell has already gone - nothing here waits for ever.
+run_await_ready() {
+  ra_waited=0
+  while :; do
+    [ -e "$1" ] && return 0
+    kill -0 "$2" 2>/dev/null || return 0
+    ra_spin=$((ra_spin + 1))
+    if [ "$ra_spin" -lt 200 ]; then
+      continue
+    fi
+    ra_waited=$((ra_waited + 1))
+    [ "$ra_waited" -lt 3 ] || return 0
+    ra_spin=0
+    sleep 1
+  done
+}
+
 run_signal() {
   run_sig_seen=$((run_sig_seen + 1))
   if [ -n "$run_sig" ]; then
@@ -2111,6 +2134,8 @@ run_escalator() {
     esc_cmd=$2
     esc_dir=$3
     esc_run=$4
+    # The traps are in: a caller may now stop this watchdog.
+    : >"$esc_dir/escalator.ready" 2>/dev/null
     while [ "$esc_grace" -gt 0 ]; do
       [ -e "$esc_dir/escalator.stop" ] && exit 0
       sleep 1
@@ -2141,10 +2166,11 @@ run_escalator() {
 run_cancel_escalator() {
   [ -n "$run_escalator_pid" ] || return 0
   : >"$run_dir/escalator.stop" 2>/dev/null
+  run_await_ready "$run_dir/escalator.ready" "$run_escalator_pid"
   kill -KILL "$run_escalator_pid" 2>/dev/null
   wait "$run_escalator_pid" 2>/dev/null
   run_escalator_pid=
-  rm -f "$run_dir/escalator.pid" "$run_dir/escalator.stop" 2>/dev/null
+  rm -f "$run_dir/escalator.pid" "$run_dir/escalator.stop" "$run_dir/escalator.ready" 2>/dev/null
 }
 
 # run_wait_pid PID: wait for a child, waiting again when our own handler
@@ -2219,6 +2245,9 @@ run_stop_supervisor() {
   fi
   run_sup=$run_sup_pid
   run_sup_pid=
+  # Only once the supervisor has its traps: a TERM into a subshell that has not
+  # reached its `trap` line yet is the window bash 3.2 answers with noise.
+  run_await_ready "$run_dir/supervisor.ready" "$run_sup"
   kill -TERM "$run_sup" 2>/dev/null
   run_wait_supervisor "$run_sup"
 }
@@ -2391,6 +2420,12 @@ run_beat_loop() {
   rb_tick=0
   trap 'rb_stop=1' TERM INT HUP QUIT
   trap '{ printf "%s\n" "$?" >"$rb_status"; } 2>/dev/null' EXIT
+  # The traps are in: the supervisor may now stop this loop without meeting a
+  # default disposition in a half-built shell (bash 3.2's `run_pending_traps`).
+  # The marker is named for this loop by the supervisor, which is the only process
+  # that knows the loop's pid, so a marker left by an earlier loop cannot pass for
+  # this one's.
+  : >"$5" 2>/dev/null
   while [ "$rb_stop" = 0 ]; do
     rb_tick=$((rb_tick + 1))
     { printf '%s\n' "$rb_tick" >"$rb_alive"; } 2>/dev/null
@@ -2459,10 +2494,21 @@ run_supervise() {
   sv_stop=0
   sv_seen=0
   sv_restart=0
+  sv_gen=0
+  sv_ready=$sv_dir/loop.0.ready
   trap 'sv_stop=1; sv_seen=$((sv_seen + 1))' TERM INT HUP QUIT
+  # The traps are in: `run` may now stop this supervisor without meeting a
+  # default disposition in a half-built shell (bash 3.2's `run_pending_traps`).
+  : >"$sv_dir/supervisor.ready" 2>/dev/null
   while :; do
     rm -f "$sv_status" 2>/dev/null
-    run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" &
+    # A fresh loop is given a marker of its own, named by a counter rather than by
+    # its pid: a subshell cannot portably name itself, and a marker left by an
+    # earlier loop must not pass for this one's.
+    sv_gen=$((sv_gen + 1))
+    sv_ready=$sv_dir/loop.$sv_gen.ready
+    rm -f "$sv_ready" 2>/dev/null
+    run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" "$sv_ready" &
     sv_loop=$!
     # C31: the heartbeat's pid is announced on stdout, and published to this run's
     # private directory straight after, so `run` cannot tear the supervisor down
@@ -2493,6 +2539,7 @@ run_supervise() {
       # between its fork and its trap) or wedged, and both are answered by the
       # KILL below - so the cleanup never waits a whole heartbeat period.
       if [ "$sv_stop" = 1 ]; then
+        run_await_ready "$sv_ready" "$sv_loop"
         kill -TERM "$sv_loop" 2>/dev/null
         sv_asked=$((sv_asked + 1))
         if [ "$sv_asked" -ge 3 ]; then
@@ -2530,7 +2577,9 @@ run_supervise() {
         continue
       fi
       # Our signal arrived while we watched: the loop is told now, and the sleeper
-      # this poll started is stopped and reaped, never orphaned (C42).
+      # this poll started is stopped and reaped, never orphaned (C42). Its
+      # traps first: the same window the supervisor has, one level down.
+      run_await_ready "$sv_ready" "$sv_loop"
       kill -TERM "$sv_loop" 2>/dev/null
       kill "$sv_nap" 2>/dev/null
       wait "$sv_nap" 2>/dev/null

@@ -534,6 +534,32 @@ describe('T46 three runs at slot count 3', () => {
   });
 });
 
+describe('a signal into a half-built subshell', () => {
+  it('D10 thirty normal runs with slots to spare print nothing but the worker warning on stderr', () => {
+    // `run` tears its supervisor down as soon as a command that exits at once is
+    // over, which can land inside the supervisor's or the loop's own `trap` line.
+    // bash 3.2 answers a signal that meets a default disposition in a subshell it
+    // is still building with its own `run_pending_traps` warning and a resend of
+    // the signal to itself - noise from a process that has done nothing wrong, on
+    // the stderr a caller reads. On dash and bash this passes either way; the
+    // macOS leg (`/bin/sh` = bash 3.2) is the real check, and the tool now waits
+    // for each subshell's ready marker before signalling it.
+    const pool = freshPool();
+    const seen = [];
+    for (let round = 0; round < 30; round += 1) {
+      const r = runOnce(pool, 'lane', ['sh', '-c', 'exit 3'], {
+        env: { GATE_LOCK_SLOTS: '2' },
+        timeout: 60000,
+      });
+      expect(r.status, `round ${round}: ${r.stderr}`).toBe(3);
+      expect(r.stderr.split('\n').filter(Boolean), `round ${round}`).toHaveLength(1);
+      seen.push(r.stderr);
+    }
+    expect(seen.every((s) => /workers?/.test(s))).toBe(true);
+    expect(names(pool)).toEqual(['.format']);
+  }, 120_000);
+});
+
 describe('the worker cap warning', () => {
   it('with more than one slot and no worker cap anywhere, run warns once on stderr and the exit status is unchanged', () => {
     const pool = freshPool();
