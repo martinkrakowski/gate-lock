@@ -17,7 +17,9 @@ function stripZeros(digits) {
  * A bad project value is refused, never answered from the host (D22). The two
  * variables are not compared here; that belongs to the lock tool (V26).
  *
- * `gate-lock workers` applies the same rules and prints the same messages.
+ * `gate-lock workers` applies the same rules and prints the same messages. The
+ * processor count is this process's own (os.availableParallelism(); the CLI asks
+ * nproc, then getconf), not the host's online count the lock tool uses (V11, V13).
  *
  * @param {Record<string, string | undefined>} [env]
  * @param {number} [cpus] the processor count; defaults to os.availableParallelism()

@@ -1,17 +1,21 @@
 // GL1: the worker-cap resolver (spec 6.J, V21-V28, D22), as the JS export and
 // as `gate-lock workers`, checked against one shared table.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { resolveMaxWorkers } from '../src/index.js';
-import { REPO_ROOT, runBin } from './harness.js';
+import { REPO_ROOT, freshPool, runBin, scratchOf } from './harness.js';
 import { TM } from './cfg.js';
 
 const W = 'GATE_LOCK_WORKERS';
 const H = 'GATE_HOST_WORKERS';
 
 // cap: a number, undefined for "no cap", or { refused: [substrings] }.
-// Every row runs with 24 processors, through the library and the CLI.
+// A row runs with 24 processors unless its fourth element says otherwise (a
+// digit string), through the library and the CLI. The CLI compares digit
+// strings without any clamp, so it must agree with the library at every size.
 const TABLE = [
   ['T94 nothing set: no cap', {}, undefined],
   ['T95 4 passes through', { [W]: '4' }, 4],
@@ -84,34 +88,90 @@ const TABLE = [
     { refused: ['GATE_HOST_SLOTS', 'host-wide'] },
   ],
   ['V24 project above cpus with a valid host', { [W]: '25', [H]: '4' }, { refused: [`${W}=25`] }],
+  [
+    'V24 9-digit cpus: a larger 9-digit value is above (no clamp)',
+    { [W]: '200000000' },
+    { refused: [W, 'above this host', '(100000000)'] },
+    '100000000',
+  ],
+  ['V24 9-digit cpus: equal is accepted', { [W]: '100000000' }, 100000000, '100000000'],
+  [
+    'V24 9-digit cpus: a smaller one is accepted, compared lexically',
+    { [W]: '099999999' },
+    99999999,
+    '100000000',
+  ],
+  [
+    'V24 9-digit cpus, same length, differing digit mid-string',
+    { [W]: '123456790' },
+    { refused: [W, '(123456789)'] },
+    '123456789',
+  ],
+  ['V24 10-digit cpus accepts 999999999', { [W]: '999999999' }, 999999999, '1000000000'],
+  ['V24 10-digit cpus accepts the equal value', { [W]: '1000000000' }, 1000000000, '1000000000'],
+  [
+    'V24 10-digit cpus refuses one more',
+    { [W]: '1000000001' },
+    { refused: [W, '(1000000000)'] },
+    '1000000000',
+  ],
+  [
+    'V24 10-digit value above 9-digit cpus',
+    { [W]: '1000000000' },
+    { refused: [W, '(999999999)'] },
+    '999999999',
+  ],
+  [
+    'V24 20-digit cpus accepts the equal value',
+    { [W]: '100000000000000000000' },
+    100000000000000000000,
+    '100000000000000000000',
+  ],
+  [
+    'V24 20-digit cpus refuses one more',
+    { [W]: '100000000000000000001' },
+    { refused: [W, '(100000000000000000000)'] },
+    '100000000000000000000',
+  ],
+  [
+    'V24 20-digit cpus accepts a smaller 20-digit value',
+    { [W]: '10000000000000000000' },
+    10000000000000000000,
+    '100000000000000000000',
+  ],
+  [
+    'V24 host variable against a 10-digit cpu count',
+    { [H]: '1000000001' },
+    { refused: [H, '(1000000000)'] },
+    '1000000000',
+  ],
 ];
 
-function viaLibrary(env) {
+function viaLibrary(env, cpus = '24') {
   try {
-    return { value: resolveMaxWorkers(env, 24) };
+    return { value: resolveMaxWorkers(env, Number(cpus)) };
   } catch (e) {
     return { error: e.message };
   }
 }
 
-function viaCli(env) {
-  const r = runBin(['workers'], {
+function viaCli(env, cpus = '24') {
+  return runBin(['workers'], {
     env: {
       ...TM,
-      GATE_LOCK_TEST_NPROC: '24',
+      GATE_LOCK_TEST_NPROC: cpus,
       GATE_LOCK_DIR: undefined,
       GATE_LOCK_SLOTS: undefined,
       ...env,
     },
   });
-  return r;
 }
 
 describe('T94-T101 resolveMaxWorkers and `gate-lock workers` share one table', () => {
-  for (const [title, env, want] of TABLE) {
+  for (const [title, env, want, cpus] of TABLE) {
     it(title, () => {
-      const lib = viaLibrary(env);
-      const cli = viaCli(env);
+      const lib = viaLibrary(env, cpus);
+      const cli = viaCli(env, cpus);
       if (want !== null && typeof want === 'object') {
         expect(lib.error, 'library refused').toBeTypeOf('string');
         for (const n of want.refused) {
@@ -194,6 +254,65 @@ describe('resolveMaxWorkers library behaviour', () => {
     expect(wire({})).toEqual({});
     expect(wire({ [H]: '7' })).toEqual({ maxWorkers: 7 });
     expect(wire({ [W]: '2', [H]: '7' })).toEqual({ maxWorkers: 2 });
+  });
+});
+
+describe('S2 processor sources for gate-lock workers', () => {
+  // Fake nproc and getconf first on PATH, so the two sources are told apart.
+  function shims({ nproc, getconf }) {
+    const dir = scratchOf(freshPool({ create: false }));
+    const write = (name, body) => {
+      if (body === undefined) return;
+      fs.writeFileSync(path.join(dir, name), `#!/bin/sh\n${body}\n`);
+      fs.chmodSync(path.join(dir, name), 0o755);
+    };
+    write('nproc', nproc);
+    write('getconf', getconf);
+    return { PATH: `${dir}:${process.env.PATH}` };
+  }
+  const workersWith = (env, cap) => runBin(['workers'], { env: { ...env, [W]: cap } });
+
+  it('S2 workers asks nproc first (affinity and cpusets), not the online host count', () => {
+    const env = shims({ nproc: 'echo 3', getconf: 'echo 8' });
+    expect(workersWith(env, '3')).toMatchObject({ status: 0, stdout: '3\n', stderr: '' });
+    const r = workersWith(env, '4');
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('available parallelism (3)');
+  });
+
+  it('S2 a failing, empty or non-numeric nproc falls back to getconf _NPROCESSORS_ONLN', () => {
+    for (const nproc of ['exit 1', 'exit 0', 'echo none']) {
+      const env = shims({ nproc, getconf: 'echo 8' });
+      expect(workersWith(env, '8')).toMatchObject({ status: 0, stdout: '8\n' });
+      expect(workersWith(env, '9').stderr).toContain('available parallelism (8)');
+    }
+  });
+
+  it('S2 the lock tool keeps the online host count (V11/V13), never nproc', () => {
+    const env = shims({ nproc: 'echo 3', getconf: 'echo 8' });
+    const pool = freshPool({ create: false });
+    const r = runBin(['status'], {
+      env: { ...env, GATE_LOCK_DIR: pool, GATE_HOST_WORKERS: '1', GATE_LOCK_SLOTS: '8' },
+    });
+    expect(r).toMatchObject({ status: 2, stderr: 'gate-lock: not implemented yet\n' });
+    const budget = runBin(['status'], {
+      env: {
+        ...env,
+        GATE_LOCK_DIR: freshPool({ create: false }),
+        GATE_HOST_SLOTS: '8',
+        GATE_HOST_WORKERS: '1',
+        GATE_LOCK_SLOTS: '8',
+      },
+    });
+    expect(budget.stderr).toBe('gate-lock: not implemented yet\n');
+  });
+
+  it('S2 with no seam, on Linux, the CLI processor count equals os.availableParallelism()', () => {
+    const haveNproc = spawnSync('nproc', { encoding: 'utf8' }).status === 0;
+    if (process.platform !== 'linux' || !haveNproc) return; // nproc is not everywhere
+    const p = os.availableParallelism();
+    expect(workersWith({}, String(p))).toMatchObject({ status: 0, stdout: `${p}\n` });
+    expect(workersWith({}, String(p + 1)).stderr).toContain(`available parallelism (${p})`);
   });
 });
 

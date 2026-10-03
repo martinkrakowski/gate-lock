@@ -500,7 +500,7 @@ describe('C1/D9 configuration is resolved once, for every subcommand, before the
     expect(fs.existsSync('/nonexistent-gate-lock-poison')).toBe(false);
   });
 
-  it('T110 the path of a pool refusal never leaves a marker behind', () => {
+  it('F17 a count refusal still leaves the correctly marked pool behind', () => {
     const { r, pool } = run({ GATE_HOST_SLOTS: '65' });
     expect(r.status).toBe(2);
     expect(fs.readFileSync(path.join(pool, '.format'), 'utf8')).toBe('1\n');

@@ -95,6 +95,35 @@ describe('T70 pool creation and the marker', () => {
     expect(fs.existsSync(path.join(scratchOf(pool), 'nowhere'))).toBe(false);
   });
 
+  it('F13 the bytes must be exactly 1 and newlines: a NUL anywhere is refused (command substitution drops NULs)', () => {
+    for (const bytes of ['1\0\n', '\0', '1\0', '\0\n1\n', '\x001\n', '1\n\0\n']) {
+      const pool = freshPool();
+      fs.writeFileSync(path.join(pool, '.format'), Buffer.from(bytes, 'latin1'));
+      refusal(cfg({ GATE_LOCK_DIR: pool }), 'lock format', 'this gate speaks 1');
+    }
+  });
+
+  it('F13 a FIFO at .format is refused without hanging (the type is checked before any read)', () => {
+    const pool = freshPool();
+    const made = spawnSync('mkfifo', [path.join(pool, '.format')]);
+    expect(made.status).toBe(0);
+    const r = runBin(['status'], { env: { GATE_LOCK_DIR: pool }, timeout: 10000 });
+    refusal(r, 'lock format', 'nothing');
+  });
+
+  it('N1 a pool we cannot write to reports the failed publish, not a wrong format', () => {
+    if (UID === 0) return;
+    const pool = freshPool();
+    fs.chmodSync(pool, 0o500);
+    try {
+      const r = refusal(cfg({ GATE_LOCK_DIR: pool }), 'could not publish the .format marker', pool);
+      expect(r.stderr).toContain('temp write or hard link failed');
+      expect(r.stderr).not.toContain('lock format');
+    } finally {
+      fs.chmodSync(pool, 0o700);
+    }
+  });
+
   it('F13 a symlink to a valid marker is refused: only a regular file can say 1', () => {
     const pool = freshPool();
     const real = path.join(scratchOf(pool), 'real-marker');
@@ -370,6 +399,21 @@ describe('T73-T80 pool directory refusals', () => {
   });
 });
 
+// Non-recursive cleanup: marker, pool, intermediate; ENOENT and ENOTEMPTY are fine.
+function removeSmokePool(pool, inter) {
+  for (const undo of [
+    () => fs.unlinkSync(path.join(pool, '.format')),
+    () => fs.rmdirSync(pool),
+    () => fs.rmdirSync(inter),
+  ]) {
+    try {
+      undo();
+    } catch (err) {
+      if (err.code !== 'ENOENT' && err.code !== 'ENOTEMPTY') throw err;
+    }
+  }
+}
+
 describe('D1 pool resolution when GATE_LOCK_DIR is unset or empty', () => {
   const bareEnv = (extra) => ({
     GATE_LOCK_DIR: undefined,
@@ -378,16 +422,8 @@ describe('D1 pool resolution when GATE_LOCK_DIR is unset or empty', () => {
     ...extra,
   });
 
-  // The pool under the real /tmp: remove what a test created, keep what was there.
-  function withRealTmp(fn) {
-    const phys = path.join(fs.realpathSync('/tmp'), `gate-lock-${UID}`);
-    const existed = fs.existsSync(phys);
-    try {
-      fn(phys);
-    } finally {
-      if (!existed) fs.rmSync(phys, { recursive: true, force: true });
-    }
-  }
+  // Every test that needs the /tmp fallback root gives it a per-test scratch (S3).
+  const withRoot = (root, extra) => bareEnv({ ...TM, GATE_LOCK_TEST_TMP_ROOT: root, ...extra });
 
   it('D1 XDG_RUNTIME_DIR valid: the pool is $XDG_RUNTIME_DIR/gate-lock, TMPDIR is untouched', () => {
     const xdg = scratchOf(freshPool(ABSENT));
@@ -497,26 +533,81 @@ describe('D1 pool resolution when GATE_LOCK_DIR is unset or empty', () => {
     expect(fs.existsSync(path.join(tmp, `gate-lock-${UID}`, 'pool'))).toBe(true);
   });
 
-  it('D1 both unset: the pool is under the physical /tmp', () => {
-    withRealTmp((inter) => {
-      expect(accepted(cfg(bareEnv()))).toBe(true);
-      expect(modeOf(inter)).toBe('0700');
-      expect(modeOf(path.join(inter, 'pool'))).toBe('0700');
-      expect(fs.readFileSync(path.join(inter, 'pool', '.format'), 'utf8')).toBe('1\n');
-    });
+  it('D1 both unset: the pool is under the fallback root (a scratch, via GATE_LOCK_TEST_TMP_ROOT)', () => {
+    const root = scratchOf(freshPool(ABSENT));
+    expect(accepted(cfg(withRoot(root)))).toBe(true);
+    const inter = path.join(root, `gate-lock-${UID}`);
+    expect(modeOf(inter)).toBe('0700');
+    expect(modeOf(path.join(inter, 'pool'))).toBe('0700');
+    expect(fs.readFileSync(path.join(inter, 'pool', '.format'), 'utf8')).toBe('1\n');
   });
 
-  it('D1 an unusable TMPDIR (missing, relative, a file) falls back to /tmp', () => {
+  it('S3 the TMP_ROOT seam is inert outside test mode (warned and ignored)', () => {
+    const root = scratchOf(freshPool(ABSENT));
+    const tmp = scratchOf(freshPool(ABSENT));
+    const r = cfg(bareEnv({ GATE_LOCK_TEST_TMP_ROOT: root, TMPDIR: tmp }));
+    expect(r.stderr).toMatch(/^gate-lock: warning: .*GATE_LOCK_TEST_TMP_ROOT/);
+    expect(fs.readdirSync(root)).toEqual([]);
+    expect(fs.existsSync(path.join(tmp, `gate-lock-${UID}`, 'pool', '.format'))).toBe(true);
+  });
+
+  it('D1 an unusable TMPDIR (missing, relative, a file) falls back to the root', () => {
     const { scratch } = poolIn();
+    const root = mkdirMode(path.join(scratch, 'root'));
     fs.writeFileSync(path.join(scratch, 'file'), 'x');
-    withRealTmp((inter) => {
-      for (const tmp of [path.join(scratch, 'nope'), 'relative-tmp', path.join(scratch, 'file')]) {
-        const r = cfg(bareEnv({ TMPDIR: tmp }));
-        expect(accepted(r), `${tmp}: ${r.stderr}`).toBe(true);
-        expect(fs.existsSync(path.join(inter, 'pool', '.format'))).toBe(true);
+    for (const tmp of [path.join(scratch, 'nope'), 'relative-tmp', path.join(scratch, 'file')]) {
+      const r = cfg(withRoot(root, { TMPDIR: tmp }));
+      expect(accepted(r), `${tmp}: ${r.stderr}`).toBe(true);
+      expect(fs.existsSync(path.join(root, `gate-lock-${UID}`, 'pool', '.format'))).toBe(true);
+    }
+    expect(fs.readdirSync(scratch).sort()).toEqual(['file', 'root']);
+  });
+
+  it('S1 a TMPDIR that is neither ours nor sticky is not trusted: silent fallback to the root', () => {
+    if (UID === 0) return; // root owns everything
+    const root = scratchOf(freshPool(ABSENT));
+    for (const untrusted of ['/usr', '/etc']) {
+      if (!fs.existsSync(untrusted)) continue;
+      const r = cfg(withRoot(root, { TMPDIR: untrusted }));
+      expect(accepted(r), `${untrusted}: ${r.stderr}`).toBe(true);
+      expect(fs.existsSync(path.join(untrusted, `gate-lock-${UID}`))).toBe(false);
+      expect(fs.existsSync(path.join(root, `gate-lock-${UID}`, 'pool', '.format'))).toBe(true);
+    }
+  });
+
+  it('S1 a TMPDIR we own is trusted even at 0777 (owner is enough, sticky or not)', () => {
+    const { scratch } = poolIn();
+    const root = mkdirMode(path.join(scratch, 'root'));
+    const tmp = mkdirMode(path.join(scratch, 'open'), 0o777);
+    expect(accepted(cfg(withRoot(root, { TMPDIR: tmp })))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, `gate-lock-${UID}`, 'pool', '.format'))).toBe(true);
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+
+  it('S3 smoke: with no seam the default root is the real physical /tmp, and a sticky TMPDIR is trusted', () => {
+    // The only test that touches the real /tmp/gate-lock-<uid>. Cleanup is never
+    // recursive: marker, then pool, then the intermediate, only when this test
+    // created it; ENOENT and ENOTEMPTY (another run, another shell) are fine.
+    const inter = path.join(fs.realpathSync('/tmp'), `gate-lock-${UID}`);
+    const pool = path.join(inter, 'pool');
+    const existed = fs.existsSync(inter);
+    try {
+      expect(accepted(cfg(bareEnv()))).toBe(true);
+      // /tmp is sticky and not ours, so it is trusted as TMPDIR: the pool lands there,
+      // not in the (empty) fallback root.
+      const root = scratchOf(freshPool(ABSENT));
+      expect(accepted(cfg(withRoot(root, { TMPDIR: '/tmp' })))).toBe(true);
+      expect(fs.readdirSync(root)).toEqual([]);
+      expect(fs.existsSync(pool)).toBe(true);
+      try {
+        expect(fs.readFileSync(path.join(pool, '.format'), 'utf8')).toBe('1\n');
+      } catch (err) {
+        // only a concurrent run's cleanup may have removed it (the tool itself verified it)
+        if (err.code !== 'ENOENT' || !existed) throw err;
       }
-    });
-    expect(fs.readdirSync(scratch)).toEqual(['file']);
+    } finally {
+      if (!existed) removeSmokePool(pool, inter);
+    }
   });
 
   it('D1 an intermediate pre-created by someone else is refused with exit 2 naming GATE_LOCK_DIR', () => {
@@ -541,11 +632,14 @@ describe('D1 pool resolution when GATE_LOCK_DIR is unset or empty', () => {
     const tmp = scratchOf(freshPool(ABSENT));
     const inter = path.join(tmp, `gate-lock-${UID}`);
     mkdirMode(inter);
-    refusal(
+    const r = refusal(
       cfg(bareEnv({ ...TM, TMPDIR: tmp, GATE_LOCK_TEST_UID: '65534' })),
       'GATE_LOCK_DIR',
       'uid 65534',
+      'owned by another user',
+      'set GATE_LOCK_DIR to a directory you own',
     );
+    expect(r.stderr).not.toContain('remove');
     expect(fs.readdirSync(inter)).toEqual([]);
   });
 
@@ -631,17 +725,27 @@ describe('D20 test-mode gate', () => {
     expect(accepted(r)).toBe(true);
   });
 
-  it('D20 --format, --version and workers print no seam warning of their own on stdout', () => {
-    for (const args of [['--format'], ['--version'], ['workers']]) {
+  it('D20 --format and --version exit before the seam check: nothing on stderr', () => {
+    for (const args of [['--format'], ['--version']]) {
       const r = runBin(args, { env: { GATE_LOCK_TEST_UID: '65534' } });
       expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
       expect(r.stdout).not.toMatch(/warning/);
     }
+  });
+
+  it('D20 workers warns about an ignored seam on stderr only, in one line', () => {
+    const r = runBin(['workers'], { env: { GATE_LOCK_TEST_UID: '65534' } });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toBe(
+      'gate-lock: warning: ignoring GATE_LOCK_TEST_UID (test seams need GATE_LOCK_TEST_MODE=1)\n',
+    );
   });
 });
 
 describe('D23 umask and explicit modes', () => {
-  it('D23 the script sets umask 077 near its start', () => {
+  it('D23 source-level guard: the script text sets umask 077 (behaviour is covered by T70)', () => {
     const text = fs.readFileSync(BIN, 'utf8');
     expect(text).toMatch(/^umask 077$/m);
   });

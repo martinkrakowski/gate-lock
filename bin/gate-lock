@@ -173,13 +173,43 @@ cap_validate() {
   die "$1 must be a positive whole number, got '$2'; the worker cap is set host-wide, beside $3"
 }
 
-# get_procs (V19): read the online-processor count at most once. Sets $procs_ok
-# (1 when it is a number), $procs_raw and $procs_n (leading zeros stripped, nine
-# or more digits clamped so no arithmetic can wrap).
+# digits_gt A B: A > B, for digit strings without leading zeros, by length and
+# then digit by digit, so no shell arithmetic is involved and nothing can wrap.
+digits_gt() {
+  [ "${#1}" -eq "${#2}" ] || {
+    [ "${#1}" -gt "${#2}" ]
+    return
+  }
+  gt_a=$1
+  gt_b=$2
+  while [ -n "$gt_a" ]; do
+    gt_ca=${gt_a%"${gt_a#?}"}
+    gt_cb=${gt_b%"${gt_b#?}"}
+    if [ "$gt_ca" != "$gt_cb" ]; then
+      [ "$gt_ca" -gt "$gt_cb" ]
+      return
+    fi
+    gt_a=${gt_a#?}
+    gt_b=${gt_b#?}
+  done
+  return 1
+}
+
+# get_procs (V19): read the processor count at most once. Two sources:
+#  - the lock tool (V11 slot derivation, V13 budget) wants the host's online
+#    count: `getconf _NPROCESSORS_ONLN`;
+#  - `gate-lock workers` (procs_affinity=1) wants what this process may really
+#    use, so it tries `nproc` first (GNU and busybox honour CPU affinity and
+#    cpusets) and falls back to getconf where nproc is missing or fails.
+# Sets $procs_ok (1 when it is a number), $procs_raw, $procs_norm (leading zeros
+# stripped, as is) and $procs_n (the same, but nine or more digits clamped so
+# that arithmetic cannot wrap; only the lock tool divides by it).
+procs_affinity=0
 procs_done=0
 procs_ok=0
 procs_raw=
 procs_n=
+procs_norm=
 get_procs() {
   [ "$procs_done" = 0 ] || return 0
   procs_done=1
@@ -187,10 +217,15 @@ get_procs() {
   if [ -n "$seam_value" ]; then
     procs_raw=$seam_value
   else
-    procs_raw=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || procs_raw=
+    procs_raw=
+    if [ "$procs_affinity" = 1 ]; then
+      procs_raw=$(nproc 2>/dev/null) || procs_raw=
+    fi
+    is_digits "$procs_raw" || procs_raw=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || procs_raw=
   fi
   if is_digits "$procs_raw"; then
     strip_zeros "$procs_raw"
+    procs_norm=$norm
     case $norm in
     ?????????*) procs_n=999999999 ;;
     *) procs_n=$norm ;;
@@ -223,15 +258,12 @@ if [ "${1:-}" = workers ]; then
   fi
   cap_validate "$cap_name" "$cap_raw" "$cap_slotvar"
   cap_norm=$norm
+  procs_affinity=1
   get_procs
-  [ "$procs_ok" = 1 ] || die "cannot read the processor count: getconf _NPROCESSORS_ONLN gave '$procs_raw'"
-  cap_above=0
-  case $cap_norm in
-  ??????????*) cap_above=1 ;;
-  *) [ "$cap_norm" -le "$procs_n" ] || cap_above=1 ;;
-  esac
-  [ "$cap_above" = 0 ] ||
-    die "$cap_name=$cap_raw is above this host's available parallelism ($procs_n); a cap above the thread count is not a cap"
+  [ "$procs_ok" = 1 ] || die "cannot read the processor count: nproc and getconf _NPROCESSORS_ONLN gave '$procs_raw'"
+  # Same rule as resolveMaxWorkers: the real count, no clamp, compared as strings.
+  ! digits_gt "$cap_norm" "$procs_norm" ||
+    die "$cap_name=$cap_raw is above this host's available parallelism ($procs_norm); a cap above the thread count is not a cap"
   printf '%s\n' "$cap_norm"
   exit 0
 fi
@@ -313,14 +345,22 @@ else
     case ${TMPDIR:-} in
     /*) tmp_phys=$(CDPATH='' cd -- "$TMPDIR" 2>/dev/null && pwd -P) || tmp_phys= ;;
     esac
+    # A TMPDIR is only trusted when it is ours or sticky (like /tmp itself):
+    # somebody else's plain directory could be rigged. Silent fallback.
+    if [ -n "$tmp_phys" ] && ! owned_by "$tmp_phys" "$real_uid" &&
+      [ -z "$(find "$tmp_phys" -prune -perm -1000 -print 2>/dev/null)" ]; then
+      tmp_phys=
+    fi
     if [ -z "$tmp_phys" ]; then
-      tmp_phys=$(CDPATH='' cd -- /tmp 2>/dev/null && pwd -P) || die "cannot resolve /tmp"
+      seam GATE_LOCK_TEST_TMP_ROOT
+      fallback_root=${seam_value:-/tmp}
+      tmp_phys=$(CDPATH='' cd -- "$fallback_root" 2>/dev/null && pwd -P) || die "cannot resolve $fallback_root"
     fi
     [ "$tmp_phys" != / ] || tmp_phys=
     inter=$tmp_phys/gate-lock-$real_uid
     mkdir -m 0700 "$inter" 2>/dev/null
     if [ -h "$inter" ] || [ ! -d "$inter" ] || ! owned_by "$inter" "$leaf_uid" || ! mode_is_0700 "$inter"; then
-      die "GATE_LOCK_DIR is unset and the default directory $inter is not a private directory (mode 0700, owned by uid $leaf_uid, not a symlink); remove it or set GATE_LOCK_DIR to a pool under a directory you own"
+      die "GATE_LOCK_DIR is unset and the default directory $inter is not a private directory (mode 0700, owned by uid $leaf_uid, not a symlink); if it is owned by another user, set GATE_LOCK_DIR to a directory you own"
     fi
     pool=$inter/pool
   fi
@@ -370,14 +410,24 @@ if [ ! -e "$marker" ]; then
     rm -f "$marker_tmp"
   fi
 fi
+if [ ! -e "$marker" ] && [ ! -h "$marker" ]; then
+  die "could not publish the .format marker in $pool (temp write or hard link failed); no lock was taken"
+fi
 # Read back, trailing newlines trimmed by the command substitution; only a
-# regular file (never a symlink, a directory or a fifo) can say 1.
+# regular file (never a symlink, a directory or a fifo, so the -f test comes
+# before any read) can say 1. The substitution also drops NUL bytes, so the
+# bytes are counted too: after deleting newlines exactly one byte must remain.
 found=
+extra_bytes=0
 if [ -f "$marker" ] && [ ! -h "$marker" ]; then
   found=$(cat "$marker" 2>/dev/null) || found=
+  marker_bytes=$({ tr -d '\n' <"$marker" | wc -c; } 2>/dev/null) || marker_bytes=0
+  [ "$((marker_bytes + 0))" -eq 1 ] || extra_bytes=1
 fi
-if [ "$found" != 1 ]; then
-  if [ -z "$found" ]; then
+if [ "$found" != 1 ] || [ "$extra_bytes" = 1 ]; then
+  if [ "$found" = 1 ]; then
+    shown="'1' followed by unexpected bytes"
+  elif [ -z "$found" ]; then
     shown=nothing
   else
     shown="'$(printf '%s' "$found" | tr '\n' ' ' | cut -c1-64)'"
