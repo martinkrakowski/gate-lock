@@ -301,6 +301,65 @@ describe('F56a the same-worktree scan applies the liveness rule and nothing stri
     expect(listing(path.join(pool, 'gate.lock.1'))).toEqual(before);
   });
 
+  it('F56a a rival that turned over between the reads is not read as one (a confirmed snapshot)', async () => {
+    const pool = freshPool();
+    const wt = wt0(pool);
+    // A live, fresh holder in our worktree: exactly what the scan must catch.
+    seed(pool, 'gate.lock.1', { owner: 'rival', pid: livePid(), worktree: wt, project: 'wt0' });
+    const hook = path.join(scratchOf(pool), 'hook-confirm');
+    const { done } = startAcquire(pool, 'mine', livePid(), {
+      env: {
+        ...TM,
+        GATE_LOCK_SLOTS: '2',
+        GATE_LOCK_TEST_PAUSE_BEFORE_SAME_WORKTREE_CONFIRM: hook,
+      },
+    });
+    await waitForFile(hook);
+    // The scan has read slot 1's worktree and parked before it confirms. The
+    // holder releases and another worktree takes the name in that window.
+    const replacementPid = livePid();
+    fs.rmSync(path.join(pool, 'gate.lock.1'), { recursive: true });
+    seed(pool, 'gate.lock.1', {
+      owner: 'other-worktree',
+      pid: replacementPid,
+      worktree: wtDir(pool, 'elsewhere'),
+      project: 'elsewhere',
+    });
+    const replacement = readSlot(pool, 'gate.lock.1');
+    releaseHook(hook);
+    const r = await done;
+    // The rival is gone: the caller is not blocked by a half-read slot, and the
+    // slot it won is not given back.
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('acquired by mine');
+    expect(r.stderr).toBe('');
+    expect(readSlot(pool, 'gate.lock.1')).toEqual(replacement);
+    expect(names(pool).sort()).toEqual(['.format', 'gate.lock', 'gate.lock.1']);
+  });
+
+  it('F56a a rival that stayed is still caught after the confirming read', async () => {
+    const pool = freshPool();
+    const wt = wt0(pool);
+    seed(pool, 'gate.lock.1', { owner: 'rival', pid: livePid(), worktree: wt, project: 'wt0' });
+    const hook = path.join(scratchOf(pool), 'hook-confirm');
+    const { done } = startAcquire(pool, 'mine', livePid(), {
+      env: {
+        ...TM,
+        GATE_LOCK_SLOTS: '2',
+        GATE_LOCK_TEST_PAUSE_BEFORE_SAME_WORKTREE_CONFIRM: hook,
+      },
+    });
+    await waitForFile(hook);
+    const rival = readSlot(pool, 'gate.lock.1');
+    releaseHook(hook);
+    const r = await done;
+    expect(r.status).toBe(75);
+    expect(r.stderr).toContain('same worktree');
+    expect(r.stderr).toContain('rival');
+    expect(readSlot(pool, 'gate.lock.1')).toEqual(rival);
+    expect(names(pool)).toEqual(['.format', 'gate.lock.1']);
+  });
+
   it('T57 a holder with no worktree file (four files) never blocks', () => {
     const pool = freshPool();
     const now = nowS();

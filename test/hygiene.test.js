@@ -24,6 +24,7 @@ import {
   path,
   readSlot,
   seed,
+  startAcquire,
   sub,
   wtDir,
 } from './slots.js';
@@ -234,6 +235,229 @@ describe('D16 the janitor pass', () => {
     expect(names(pool)).toEqual(['.format']);
   });
 
+  it('D16 an aside whose holder is replaced while it is being read survives', async () => {
+    const pool = freshPool();
+    const name = `gate.lock.reclaim.${deadPid()}.1`;
+    // Judged not alive at first read: the holder is a corpse.
+    writeSlot(pool, name, {
+      owner: 'gone',
+      pid: deadPid(),
+      beat: nowS(),
+      worktree: '/x',
+      project: 'x',
+    });
+    setAge(path.join(pool, name), 3600);
+    const hook = path.join(scratchOf(pool), 'hook-contents');
+    const { done } = startBin(['clean'], {
+      env: {
+        GATE_LOCK_DIR: pool,
+        ...TM,
+        GATE_LOCK_TEST_PAUSE_AFTER_JANITOR_CONTENTS: hook,
+      },
+    });
+    await waitForFile(hook);
+    // While the janitor is deciding on the corpse, the holder at the aside name
+    // is replaced by a live, fresh one (a reclaimer restoring a slot, say).
+    fs.rmSync(path.join(pool, name), { recursive: true });
+    writeSlot(pool, name, {
+      owner: 'live',
+      pid: livePid(),
+      beat: nowS(),
+      worktree: '/x',
+      project: 'x',
+    });
+    setAge(path.join(pool, name), 3600);
+    const holder = readSlot(pool, name);
+    // Later entries park at the same seam; let them through.
+    const timer = setInterval(() => releaseHook(hook), 50);
+    const r = await done;
+    clearInterval(timer);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe('');
+    // Judged on the generation it read, twice: nothing was removed.
+    expect(readSlot(pool, name)).toEqual(holder);
+  });
+
+  it('D16 an aside replaced by a symlink while it is being read is not deleted through', async () => {
+    const pool = freshPool();
+    const name = `gate.lock.reclaim.${deadPid()}.1`;
+    writeSlot(pool, name, {
+      owner: 'gone',
+      pid: deadPid(),
+      beat: nowS(),
+      worktree: '/x',
+      project: 'x',
+    });
+    setAge(path.join(pool, name), 3600);
+    const victim = path.join(scratchOf(pool), 'victim');
+    fs.mkdirSync(victim, { mode: 0o700 });
+    fs.writeFileSync(path.join(victim, 'precious'), 'do not delete\n');
+    const hook = path.join(scratchOf(pool), 'hook-contents');
+    const { done } = startBin(['clean'], {
+      env: {
+        GATE_LOCK_DIR: pool,
+        ...TM,
+        GATE_LOCK_TEST_PAUSE_BEFORE_JANITOR_REMOVE: hook,
+      },
+    });
+    await waitForFile(hook);
+    // The name becomes a link to a directory of ours while the janitor is
+    // deciding: the provenance judged at the start of the entry no longer holds.
+    fs.rmSync(path.join(pool, name), { recursive: true });
+    fs.symlinkSync(victim, path.join(pool, name));
+    setAge(victim, 3600);
+    const timer = setInterval(() => releaseHook(hook), 50);
+    const r = await done;
+    clearInterval(timer);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe('');
+    expect(fs.lstatSync(path.join(pool, name)).isSymbolicLink()).toBe(true);
+    expect(names(victim)).toEqual(['precious']);
+  });
+
+  it('D16 an unusable TMPDIR falls back to the temp root, so the pass still runs', () => {
+    const pool = freshPool();
+    const cand = deadTransient(pool, 'gate.lock.cand.<pid>');
+    // TMPDIR names a regular file, so it cannot hold the age reference: the
+    // pass falls back to the temp root instead of giving up (the pool resolver
+    // makes the same move).
+    const notADir = path.join(scratchOf(pool), 'not-a-dir');
+    fs.writeFileSync(notADir, 'x\n');
+    const r = clean(pool, { TMPDIR: notADir, ...TM });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(r.stdout).toBe(`gate-lock: janitor: removed ${path.basename(cand)}\n`);
+    expect(fs.existsSync(cand)).toBe(false);
+  });
+
+  it('D16 a TMPDIR that is neither ours nor sticky is not trusted, and a trusted one is', () => {
+    const untrusted = freshPool();
+    const untrustedCand = deadTransient(untrusted, 'gate.lock.cand.<pid>');
+    const trusted = freshPool();
+    const trustedCand = deadTransient(trusted, 'gate.lock.cand.<pid>');
+    // A temp directory nobody can write in: the reference cannot be created
+    // there, so a pass that used it would remove nothing at all.
+    const readOnly = path.join(scratchOf(trusted), 'ro-tmp');
+    fs.mkdirSync(readOnly, { mode: 0o500 });
+    const fallback = path.join(scratchOf(trusted), 'fallback');
+    fs.mkdirSync(fallback, { mode: 0o700 });
+
+    // Trusted (ours): used as it is, the reference cannot be made, nothing goes.
+    expect(
+      clean(trusted, {
+        TMPDIR: readOnly,
+        GATE_LOCK_TEST_TMP_ROOT: fallback,
+        ...TM,
+      }),
+    ).toMatchObject({ status: 0, stdout: '' });
+    expect(fs.existsSync(trustedCand)).toBe(true);
+
+    // Not ours (the seam) and not sticky: not trusted, so the pass falls back
+    // to the temp root, where the reference can be made, and removes it. The
+    // directory it was pointed at cannot hold a reference either, so this
+    // cannot pass by having used it.
+    const loose = path.join(scratchOf(untrusted), 'loose');
+    fs.mkdirSync(loose, { mode: 0o500 });
+    const otherRoot = path.join(scratchOf(untrusted), 'fallback');
+    fs.mkdirSync(otherRoot, { mode: 0o700 });
+    const r = clean(untrusted, {
+      TMPDIR: loose,
+      GATE_LOCK_TEST_TMP_ROOT: otherRoot,
+      ...TM,
+      GATE_LOCK_TEST_TMP_UID: '65534',
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(`gate-lock: janitor: removed ${path.basename(untrustedCand)}\n`);
+    fs.chmodSync(readOnly, 0o700);
+    fs.chmodSync(loose, 0o700);
+  });
+
+  it('D16 a reference that is replaced before it is trusted removes nothing', async () => {
+    const pool = freshPool();
+    // Young: not a threshold old, so only a reference that lies about the age
+    // could take it.
+    const cand = deadTransient(pool, 'gate.lock.cand.<pid>', 100);
+    const tmp = path.join(scratchOf(pool), 'tmp');
+    fs.mkdirSync(tmp, { mode: 0o700 });
+    const hook = path.join(scratchOf(pool), 'hook-ref');
+    const victim = path.join(scratchOf(pool), 'old-file');
+    fs.writeFileSync(victim, 'x\n');
+    const old = new Date(Date.now() - 86400_000);
+    fs.utimesSync(victim, old, old);
+    for (const [title, replace, leftBehind] of [
+      [
+        'a symlink',
+        (ref) => {
+          fs.rmSync(ref, { force: true });
+          fs.symlinkSync(victim, ref);
+        },
+        false,
+      ],
+      [
+        'a directory',
+        (ref) => {
+          fs.rmSync(ref, { force: true });
+          fs.mkdirSync(ref, { mode: 0o700 });
+        },
+        // rm -f never removes a directory, so the plant is left where it is.
+        true,
+      ],
+    ]) {
+      // The creator is parked between creating and trusting its reference: the
+      // window a replaced reference would come through.
+      const { child, done } = startBin(['clean'], {
+        env: {
+          GATE_LOCK_DIR: pool,
+          TMPDIR: tmp,
+          ...TM,
+          GATE_LOCK_TEST_PAUSE_AFTER_JANITOR_REF: hook,
+        },
+      });
+      await waitForFile(hook);
+      const ref = path.join(tmp, `.gate-lock-janitor.${child.pid}`);
+      expect(fs.existsSync(ref)).toBe(true);
+      replace(ref);
+      releaseHook(hook);
+      const r = await done;
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe('');
+      expect(r.stdout, title).toBe('');
+      // The young transient is untouched, and the reference we did not create
+      // is gone when it is our own link, left alone when it is a directory.
+      expect(fs.existsSync(cand), title).toBe(true);
+      expect(fs.existsSync(ref), title).toBe(leftBehind);
+    }
+  });
+
+  it('D16 a candidate that vanishes mid-creation is retried, not reported as an unwritable pool', async () => {
+    const pool = freshPool();
+    const hook = path.join(scratchOf(pool), 'hook-cand');
+    const pid = livePid();
+    const { child, done } = startAcquire(pool, 'lane', pid, {
+      env: {
+        ...TM,
+        GATE_LOCK_SLOTS: '1',
+        GATE_LOCK_TEST_PAUSE_AFTER_CANDIDATE_MKDIR: hook,
+      },
+    });
+    await waitForFile(hook);
+    // The pid-recycle race the janitor note describes: another process judged
+    // this candidate's pid dead (a pid that was not yet this one) and removed
+    // it. The pool is perfectly writable.
+    const cand = path.join(pool, `gate.lock.cand.${child.pid}`);
+    expect(fs.existsSync(cand)).toBe(true);
+    fs.rmSync(cand, { recursive: true });
+    // Later passes park at the same seam; let them through.
+    const timer = setInterval(() => releaseHook(hook), 50);
+    const r = await done;
+    clearInterval(timer);
+    expect(r.stderr).toBe('');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('acquired by lane');
+    expect(readSlot(pool, 'gate.lock')).toMatchObject({ owner: 'lane', pid: String(pid) });
+    expect(names(pool)).toEqual(['.format', 'gate.lock']);
+  });
+
   it('D16 the pass runs at the start of acquire and never on status', () => {
     const pool = freshPool();
     const cand = deadTransient(pool, 'gate.lock.cand.<pid>');
@@ -254,16 +478,25 @@ describe('D16 the janitor pass', () => {
     expect(names(pool)).toEqual(['.format', 'gate.lock']);
   });
 
-  it('D16 when the age reference cannot be created, nothing is removed', () => {
+  it('D16 when no age reference can be made at all, nothing is removed', () => {
     const pool = freshPool();
     const cand = deadTransient(pool, 'gate.lock.cand.<pid>');
-    // TMPDIR names a regular file, so the reference file cannot be created:
-    // without an age to compare, the janitor removes nothing at all.
-    const notADir = path.join(scratchOf(pool), 'not-a-dir');
-    fs.writeFileSync(notADir, 'x\n');
-    const r = clean(pool, { TMPDIR: notADir });
+    // Neither the temp directory nor the fallback root can hold the reference:
+    // without an age to compare, the pass removes nothing at all, which is the
+    // safe answer.
+    const readOnly = path.join(scratchOf(pool), 'ro');
+    const alsoReadOnly = path.join(scratchOf(pool), 'ro-root');
+    fs.mkdirSync(readOnly, { mode: 0o500 });
+    fs.mkdirSync(alsoReadOnly, { mode: 0o500 });
+    const r = clean(pool, {
+      TMPDIR: readOnly,
+      GATE_LOCK_TEST_TMP_ROOT: alsoReadOnly,
+      ...TM,
+    });
     expect(r).toMatchObject({ status: 0, stdout: '', stderr: '' });
     expect(fs.existsSync(cand)).toBe(true);
+    fs.chmodSync(readOnly, 0o700);
+    fs.chmodSync(alsoReadOnly, 0o700);
   });
 
   it('clean takes no arguments', () => {

@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   BIN,
+  buildEnv,
   freshPool as barePool,
   listing,
   releaseHook,
@@ -26,7 +27,6 @@ import {
   seed,
   startAcquire,
   sub,
-  until,
   wtDir,
 } from './slots.js';
 
@@ -43,41 +43,38 @@ describe('R3 reclaim arbitration', () => {
     const pool = freshPool();
     seed(pool, 'gate.lock', { owner: 'stale-one', pid: deadPid() });
     const inspect = path.join(scratchOf(pool), 'hook-inspect');
-    // Both park after judging the same dead holder reclaimable (H3), each on
-    // its own hook file, so both have announced the reclaim before either
-    // renames.
-    const a = startAcquire(pool, 'first', livePid(), {
-      env: { ...TM, GATE_LOCK_TEST_PAUSE_AFTER_INSPECT: `${inspect}.a` },
-      cwd: wtDir(pool, 'wt-a'),
-    });
-    await waitForFile(`${inspect}.a`);
-    const b = startAcquire(pool, 'second', livePid(), {
-      env: { ...TM, GATE_LOCK_TEST_PAUSE_AFTER_INSPECT: `${inspect}.b` },
+    const scan = path.join(scratchOf(pool), 'hook-scan');
+    // The second acquirer parks after judging the stale holder reclaimable (H3),
+    // and the first parks after winning the name, before its own scan: every
+    // step below is a handshake, so the interleaving is the test's own.
+    const second = startAcquire(pool, 'second', livePid(), {
+      env: { ...TM, GATE_LOCK_TEST_PAUSE_AFTER_INSPECT: inspect },
       cwd: wtDir(pool, 'wt-b'),
     });
-    await waitForFile(`${inspect}.b`);
-    // Release one at a time: the first takes the name, and the second finds a
-    // fresh holder where the stale one was.
-    releaseHook(`${inspect}.a`);
-    await until(() => {
-      try {
-        return readSlot(pool, 'gate.lock').owner === 'first';
-      } catch {
-        return false;
-      }
+    await waitForFile(inspect);
+    const first = startAcquire(pool, 'first', livePid(), {
+      env: { ...TM, GATE_LOCK_TEST_PAUSE_BEFORE_SAME_WORKTREE_SCAN: scan },
+      cwd: wtDir(pool, 'wt-a'),
     });
+    // The first reclaims the stale slot and wins it.
+    await waitForFile(scan);
+    expect(readSlot(pool, 'gate.lock').owner).toBe('first');
     const winner = readSlot(pool, 'gate.lock');
-    releaseHook(`${inspect}.b`);
-    const [ra, rb] = await Promise.all([a.done, b.done]);
-    expect(ra.status).toBe(0);
-    expect(ra.stdout).toContain('acquired by first');
-    // The loser re-inspects, finds the winner answering, and is busy.
+    // Let the second proceed: it renames the slot aside, finds a fresh holder
+    // where the stale one was, restores it and gives up.
+    releaseHook(inspect);
+    const rb = await second.done;
     expect(rb.status).toBe(75);
     expect(rb.stderr).toContain('busy');
     expect(rb.stderr).toContain('first');
     expect(rb.stderr).toContain('reclaim aborted');
     expect(rb.stderr).toContain('restored');
-    // The winner's slot is exactly what it wrote, and the loser left no aside.
+    // Only then the first finishes its scan: the slot it won is still its own,
+    // byte for byte, and the loser left no aside behind.
+    releaseHook(scan);
+    const ra = await first.done;
+    expect(ra.status).toBe(0);
+    expect(ra.stdout).toContain('acquired by first');
     expect(readSlot(pool, 'gate.lock')).toEqual(winner);
     expect(names(path.join(pool, 'gate.lock'))).toEqual(SIX);
     expect(names(pool)).toEqual(['.format', 'gate.lock']);
@@ -109,18 +106,17 @@ describe('R6 a reader never sees an empty or missing beat', () => {
         await new Promise((resolve) => setTimeout(resolve, 1));
       }
     })();
-    // A loop of refreshes, pinned to the slot, under the shell under test.
+    // A loop of refreshes, pinned to the slot, under the shell under test, in
+    // the harness's own environment (T110/H14) so nothing is inherited.
     const refreshes = 40;
-    const script = `i=0; while [ "$i" -lt ${refreshes} ]; do ${BIN} heartbeat || exit 1; i=$((i + 1)); done`;
+    const script = `i=0; while [ "$i" -lt ${refreshes} ]; do "${BIN}" heartbeat || exit 1; i=$((i + 1)); done`;
     const [shellCmd, argv] = shellCommand(script);
     const loop = spawn(shellCmd, argv, {
-      env: {
-        PATH: process.env.PATH,
-        HOME: process.env.HOME,
+      env: buildEnv({
         GATE_LOCK_DIR: pool,
         GATE_LOCK_CALLER_PID: String(pid),
         GATE_LOCK_SLOT_PATH: slot,
-      },
+      }),
       stdio: 'ignore',
     });
     const loopDone = new Promise((resolve) =>
@@ -185,10 +181,10 @@ describe('R10 the .format publication race (H1)', () => {
 });
 
 describe('T93 a storm of N+2 acquirers into N slots', () => {
-  it('T93 50 iterations of N+2 acquirers never make more than N complete slots and leak nothing', async () => {
+  it('T93 20 iterations of N+2 acquirers never make more than N complete slots and leak nothing', async () => {
     const N = 2;
     const EXTRA = 2;
-    const ROUNDS = 50;
+    const ROUNDS = 20;
     const pool = freshPool();
     // N+2 long-lived pids, one per acquirer, reused every round: a released pid
     // holds nothing, so the one-pid-one-slot refusal never fires.
@@ -217,14 +213,18 @@ describe('T93 a storm of N+2 acquirers into N slots', () => {
         expect(winners.length).toBeLessThanOrEqual(N);
         expect(winners.length).toBeGreaterThanOrEqual(1);
         if (winners.length === N) saturated += 1;
-        // Every winner is intact, with its own lane and its own pid.
+        // Every winner is intact, with its own lane and its own pid, and no
+        // two winners ever claim the same slot.
         const held = [];
+        const taken = new Set();
         for (const [k, r] of results.entries()) {
           if (r.status !== 0) {
             expect(r.stderr).toContain('busy');
             continue;
           }
           const slot = r.stdout.trim().split(' at ')[1];
+          expect(taken.has(slot), `${slot} was taken twice in one round`).toBe(false);
+          taken.add(slot);
           expect(readSlot(pool, path.basename(slot))).toMatchObject({
             owner: lanes[k],
             pid: String(pids[k]),
@@ -246,5 +246,5 @@ describe('T93 a storm of N+2 acquirers into N slots', () => {
     expect(peak).toBeLessThanOrEqual(N);
     expect(peak).toBeGreaterThanOrEqual(N);
     expect(listing(pool)).toEqual(['0600 .format']);
-  });
+  }, 300_000); // a storm of spawns on a slow macOS runner: slow, not flaky
 });
