@@ -410,6 +410,35 @@ describe('T20-T22 release', () => {
     expect(listing(pool)).toEqual(before);
   });
 
+  it('D7 an unpinned release with the right pid but another lane has nothing to release; the slot stays', () => {
+    const pool = freshPool();
+    const pid = livePid();
+    seed(pool, 'gate.lock', { owner: 'theirs', pid });
+    const before = listing(pool);
+    const r = sub(pool, ['release', 'mine'], pid);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('nothing to release');
+    expect(listing(pool)).toEqual(before);
+  });
+
+  it('D12 a removal that fails half way puts the slot back: exit 1 release failed, nothing left aside', () => {
+    const pool = freshPool();
+    const pid = livePid();
+    expect(acquire(pool, 'lane', pid).status).toBe(0);
+    const inner = path.join(pool, 'gate.lock', 'inner');
+    fs.mkdirSync(inner);
+    fs.writeFileSync(path.join(inner, 'f'), 'x');
+    fs.chmodSync(inner, 0o500);
+    try {
+      const r = sub(pool, ['release', 'lane'], pid);
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('release failed');
+      expect(names(pool)).toEqual(['.format', 'gate.lock']);
+    } finally {
+      fs.chmodSync(inner, 0o700);
+    }
+  });
+
   it('T22 a release that cannot remove the slot (read-only slot directory) is exit 1 "release failed"; the slot remains', () => {
     const pool = freshPool();
     const pid = livePid();

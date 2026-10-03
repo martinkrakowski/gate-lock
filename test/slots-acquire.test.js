@@ -324,7 +324,13 @@ describe('T6-T10 reclaim of dead, stale and abandoned slots', () => {
   });
 
   it('D4 a beat in the future is never stale; D5 neither is one with more than 10 digits', () => {
-    for (const beat of [nowS() + 100000, '99999999999999999999']) {
+    for (const beat of [
+      nowS() + 100000,
+      '99999999999999999999',
+      '18446744073709551616',
+      '18446744073709551617',
+      '36893488147419103232',
+    ]) {
       const pool = freshPool();
       seed(pool, 'gate.lock', { owner: 'future', beat });
       const r = acquire(pool, 'x', livePid());
@@ -946,7 +952,8 @@ describe('D21 the slot-output file', () => {
     const pool = freshPool();
     const r = acquire(pool, 'lane', livePid(), { env: { GATE_LOCK_SLOT_OUT: foreign } });
     expect(r.status).toBe(2);
-    expect(r.stderr).toContain('GATE_LOCK_SLOT_OUT');
+    expect(r.stderr).toContain('is not a regular file owned by');
+    expect(r.stderr).not.toContain('given back');
     expect(names(pool)).toEqual(['.format']);
   });
 
