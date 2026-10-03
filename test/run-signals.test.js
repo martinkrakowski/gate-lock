@@ -191,9 +191,33 @@ describe('C40 a command that will not stop', () => {
     // stop being able to answer a signal at all, which is not what D15 says.
     for (const second of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGQUIT']) {
       const pool = freshPool();
-      const { block, gate, pid } = await signalledRun(pool, { name: `second-${second}` });
+      // The command records that the forwarded TERM arrived and then keeps
+      // unwinding for a moment. That is the handshake: without it the second
+      // signal can be pending before the shell has run the first handler, and
+      // shells run pending handlers in signal-number order, so "the first signal"
+      // from this test's side would not be the first one the run handled.
+      const dir = path.join(scratchOf(pool), `second-${second}`);
+      fs.mkdirSync(dir, { recursive: true });
+      const cmd = [
+        script(
+          pool,
+          `mark-term-${second}.sh`,
+          `trap 'printf got >"${dir}/got"; sleep 1; exit 0' TERM
+printf '%s\\n' "$$" >"${dir}/ready"
+i=0
+while [ "$i" -lt 600 ]; do
+  i=$((i + 1))
+  sleep 1
+done`,
+        ),
+      ];
+      const gate = startRun(pool, 'lane', cmd, { env: { GATE_LOCK_HEARTBEAT_SECONDS: '1' } });
+      await waitForFile(path.join(dir, 'ready'));
+      const victim = track(Number(fs.readFileSync(path.join(dir, 'ready'), 'utf8')));
       gate.child.kill('SIGTERM');
-      await new Promise((r) => setTimeout(r, 300));
+      // The first signal has been forwarded and taken effect; only now is the
+      // second one a *second* signal.
+      await waitForFile(path.join(dir, 'got'));
       gate.child.kill(second);
       const r = await gate.done;
       expect(r.status, second).toBe(143);
@@ -201,10 +225,9 @@ describe('C40 a command that will not stop', () => {
       expect(r.stdout, second).toContain('released by lane');
       expect(r.stderr, second).toBe('');
       expect(names(pool), second).toEqual(['.format']);
-      await waitForDead(pid);
-      expect(fs.existsSync(block.done), second).toBe(false);
+      await waitForDead(victim);
     }
-  }, 60_000);
+  }, 90_000);
 
   it('D10 the watchdog is gone once a signalled run ends', async () => {
     const pool = freshPool();

@@ -314,7 +314,11 @@ describe('T38 / R20 a nested run', () => {
     const inner = blocker(pool, 'inner');
     const a = startRun(pool, 'outer-lane', outer.cmd);
     await up(outer);
-    const b = runOnce(pool, 'inner-lane', inner.cmd);
+    // Sound but slow: the inner run spawns the tool twice (its own acquire and the
+    // release it does not do), and under CPU stress that can outlast the
+    // harness's spawn timeout - which would signal the run and turn this into a
+    // test of the harness. Everything else here is a handshake.
+    const b = runOnce(pool, 'inner-lane', inner.cmd, { timeout: 120000 });
     expect(b.status).toBe(75);
     expect(b.stderr).toContain('busy');
     expect(b.stderr).toContain('outer-lane');

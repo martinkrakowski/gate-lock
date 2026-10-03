@@ -173,14 +173,35 @@ describe('R10 the .format publication race (H1)', () => {
     const owners = [readSlot(pool, 'gate.lock').owner, readSlot(pool, 'gate.lock.1').owner].sort();
     expect(owners).toEqual(['lane-a', 'lane-b']);
     // Both release their own slot (C13) and leave the pool marked and empty.
+    //
+    // This has failed on the GitHub macOS runner (and not locally, even under
+    // stress), with both releases answering 0 and the slots still there. The
+    // failure carries everything needed to say why: what each release answered,
+    // who each remaining slot names, and what each release was called with. Read
+    // down the file: neither `find_slot owner` nor `resolve_pin` looks at the
+    // caller's worktree, its cwd or TMPDIR - both take the pool from
+    // GATE_LOCK_DIR, which the harness hands over as one realpath'd string for the
+    // acquire and every release alike - so the platform-dependent step left in
+    // that path is `owned_by`, i.e. `find <path> -prune -user <uid> -print`.
+    const releases = [];
     for (const [lane, holder] of [
       ['lane-a', readSlot(pool, 'gate.lock').pid],
       ['lane-b', readSlot(pool, 'gate.lock.1').pid],
     ]) {
-      const r = sub(pool, ['release', lane], holder, { cwd: wtDir(pool, 'wt-a') });
-      expect(r.status).toBe(0);
+      const cwd = wtDir(pool, 'wt-a');
+      const r = sub(pool, ['release', lane], holder, { cwd });
+      const left = names(pool)
+        .filter((n) => /^gate\.lock(\.\d+)?$/.test(n))
+        .map(
+          (n) =>
+            `${n} owner=${readSlot(pool, n).owner} pid=${readSlot(pool, n).pid} worktree=${readSlot(pool, n).worktree}`,
+        );
+      releases.push(
+        `${lane} caller pid=${holder} cwd=${cwd} -> status ${r.status} stdout ${JSON.stringify(r.stdout.trim())} stderr ${JSON.stringify(r.stderr.trim())} left ${JSON.stringify(left)}`,
+      );
+      expect(r.status, `${lane}: ${r.stderr}`).toBe(0);
     }
-    expect(names(pool)).toEqual(['.format']);
+    expect(names(pool), releases.join('; ')).toEqual(['.format']);
   });
 });
 

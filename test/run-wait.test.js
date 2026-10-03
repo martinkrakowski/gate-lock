@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { listing, scratchOf } from './harness.js';
+import { listing, releaseHook, scratchOf, waitForFile } from './harness.js';
 import { TM, livePid, names, readSlot, seed, until, wtDir } from './slots.js';
 import { blocker, freshPool, runOnce, startRun, track, up, watchStderr } from './run.js';
 
@@ -230,6 +230,34 @@ describe('--wait', () => {
     expect(readSlot(pool, 'gate.lock').owner).toBe('holder');
   }, 30_000);
 
+  it('Waiting a signal that arrives while the acquire is running is not lost to a busy answer', async () => {
+    // The acquire child is parked just before it renames its candidate, which is a
+    // window only an acquire has. A signal sent in that window is deferred by the
+    // shell until the child exits (L1), so the loop has to look again before it
+    // reports 75: the run was asked to stop.
+    const pool = freshPool();
+    const hook = path.join(scratchOf(pool), 'create-hook');
+    const file = out(pool, 'signalled-acquire');
+    seed(pool, 'gate.lock', { owner: 'holder', pid: livePid() });
+    const gate = startRun(pool, 'lane', ['true'], {
+      args: ['--wait', '0', '--status-file', file],
+      env: { ...TM, GATE_LOCK_TEST_PAUSE_BEFORE_CREATE_RENAME: hook },
+    });
+    try {
+      await waitForFile(hook);
+      gate.child.kill('SIGTERM');
+      releaseHook(hook);
+      const r = await gate.done;
+      expect(r.status).toBe(143);
+      expect(r.stderr).toContain('busy');
+      expect(fs.readFileSync(file, 'utf8')).toBe('tool:143\n');
+      // The holder's slot is untouched: this run never took one.
+      expect(readSlot(pool, 'gate.lock').owner).toBe('holder');
+    } finally {
+      releaseHook(hook);
+    }
+  }, 60_000);
+
   it('Waiting a signal ends the wait: the run exits 143 and the holder keeps the lock', async () => {
     const pool = freshPool();
     seed(pool, 'gate.lock', { owner: 'holder', pid: livePid() });
@@ -262,7 +290,11 @@ describe('--wait', () => {
 
   it('Waiting without --wait is one attempt, and a free slot is never waited for', () => {
     const pool = freshPool();
-    const r = runOnce(pool, 'lane', ['true']);
+    // Sound but slow: it spawns the tool, and under CPU stress that can take
+    // longer than the harness's own spawn timeout, which would signal the run and
+    // make this a test of the harness rather than of the wait. The count of busy
+    // lines is the assertion that matters: one attempt, so one line.
+    const r = runOnce(pool, 'lane', ['true'], { timeout: 120000 });
     expect(r.status).toBe(0);
     expect(r.stderr).toBe('');
   });

@@ -2622,17 +2622,36 @@ run_acquire() {
     if grep -q 'same worktree' "$run_dir/acq.err" 2>/dev/null; then
       run_busy_kind=worktree
     fi
-    [ -n "$run_deadline" ] || return 0
+    [ -n "$run_deadline" ] || {
+      run_acquire_done
+      return 0
+    }
     now_s
-    [ "$now" -lt "$run_deadline" ] || return 0
+    [ "$now" -lt "$run_deadline" ] || {
+      run_acquire_done
+      return 0
+    }
     run_pause=$(((now % 5 + $$ % 5) % 5 + 1))
     [ "$((now + run_pause))" -le "$run_deadline" ] || run_pause=$((run_deadline - now))
-    [ "$run_pause" -ge 1 ] || return 0
+    [ "$run_pause" -ge 1 ] || {
+      run_acquire_done
+      return 0
+    }
     sleep "$run_pause"
   done
+  run_acquire_done
   return 0
 }
 
+# run_acquire_done: every way out of the retry loop answers the signal the caller
+# sent before it reports a busy host. A signal that arrives while the acquire
+# child is running is deferred by the shell until that child exits (L1), so by the
+# time the loop looks at `run_sig` again the handler has run - and without this
+# the run would answer 75 instead of the signal's own code.
+run_acquire_done() {
+  [ -n "$run_sig" ] || return 0
+  run_acq_status=$run_sig_code
+}
 # run_finish: everything that happens once the command has ended, in the order the
 # specification gives: reap the heartbeat, then the verdict, then the release.
 run_finish() {
