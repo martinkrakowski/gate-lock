@@ -434,6 +434,9 @@ describe('T20-T22 release', () => {
       expect(r.status).toBe(1);
       expect(r.stderr).toContain('release failed');
       expect(names(pool)).toEqual(['.format', 'gate.lock']);
+      // The slot was put back as the failed removal left it: the undeletable part is intact.
+      expect(fs.readdirSync(path.join(pool, 'gate.lock'))).toContain('inner');
+      expect(fs.readFileSync(path.join(inner, 'f'), 'utf8')).toBe('x');
     } finally {
       fs.chmodSync(inner, 0o700);
     }

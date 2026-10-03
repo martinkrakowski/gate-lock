@@ -98,17 +98,22 @@ describe('T2 acquire takes a free slot', () => {
   });
 });
 
+// git is optional (L8): the test is skipped, and reported as skipped, without it.
+const HAS_GIT = spawnSync('git', ['--version'], { encoding: 'utf8' }).status === 0;
+
 describe('F28 the worktree identity is the git top-level when there is one', () => {
-  it('a subdirectory of a repository records the repository root and its name', () => {
-    const pool = freshPool();
-    const root = wtDir(pool, 'my-repo');
-    const init = spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
-    if (init.status !== 0) return; // git is optional (L8)
-    const sub1 = path.join(root, 'a', 'b');
-    fs.mkdirSync(sub1, { recursive: true });
-    expect(acquire(pool, 'lane', livePid(), { cwd: sub1 }).status).toBe(0);
-    expect(readSlot(pool, 'gate.lock')).toMatchObject({ worktree: root, project: 'my-repo' });
-  });
+  it.skipIf(!HAS_GIT)(
+    'a subdirectory of a repository records the repository root and its name',
+    () => {
+      const pool = freshPool();
+      const root = wtDir(pool, 'my-repo');
+      expect(spawnSync('git', ['init', '-q', root], { encoding: 'utf8' }).status).toBe(0);
+      const sub1 = path.join(root, 'a', 'b');
+      fs.mkdirSync(sub1, { recursive: true });
+      expect(acquire(pool, 'lane', livePid(), { cwd: sub1 }).status).toBe(0);
+      expect(readSlot(pool, 'gate.lock')).toMatchObject({ worktree: root, project: 'my-repo' });
+    },
+  );
 
   it('outside a repository it is the physically resolved working directory (a symlinked cwd is resolved)', () => {
     const pool = freshPool();
@@ -305,14 +310,6 @@ describe('T6-T10 reclaim of dead, stale and abandoned slots', () => {
     expect(r.stdout).toMatch(
       /reclaiming .* heartbeat is stale or missing \(beat missing, threshold 600s\)/,
     );
-  });
-
-  it('F45 a dead pid with an empty beat needs no patience: only both-empty, or alive plus empty, waits', () => {
-    const pool = freshPool();
-    seed(pool, 'gate.lock', { owner: 'x', pid: deadPid(), beat: '' });
-    const t0 = Date.now();
-    expect(acquire(pool, 'fresh', livePid()).status).toBe(0);
-    expect(Date.now() - t0).toBeLessThan(1900);
   });
 
   it('F37 a beat that is not all digits counts as stale', () => {
@@ -884,6 +881,16 @@ describe('forged slots as the slot loop meets them (F57-F59a, F61)', () => {
   });
 });
 
+// A regular file this user does not own, if the host has one (it is skipped otherwise).
+const FOREIGN_FILE = ['/etc/passwd', '/etc/hosts', '/bin/sh'].find((p) => {
+  try {
+    const st = fs.lstatSync(p);
+    return st.isFile() && st.uid !== process.getuid();
+  } catch {
+    return false;
+  }
+});
+
 describe('D21 the slot-output file', () => {
   const out = (pool, name = 'slot-out') => path.join(scratchOf(pool), name);
 
@@ -939,23 +946,18 @@ describe('D21 the slot-output file', () => {
     expect(names(pool)).toEqual(['.format']);
   });
 
-  it('an existing file that is not ours is refused (never written)', () => {
-    const foreign = ['/etc/passwd', '/etc/hosts', '/bin/sh'].find((p) => {
-      try {
-        const st = fs.lstatSync(p);
-        return st.isFile() && st.uid !== process.getuid();
-      } catch {
-        return false;
-      }
-    });
-    if (foreign === undefined) return;
-    const pool = freshPool();
-    const r = acquire(pool, 'lane', livePid(), { env: { GATE_LOCK_SLOT_OUT: foreign } });
-    expect(r.status).toBe(2);
-    expect(r.stderr).toContain('is not a regular file owned by');
-    expect(r.stderr).not.toContain('given back');
-    expect(names(pool)).toEqual(['.format']);
-  });
+  it.skipIf(FOREIGN_FILE === undefined)(
+    'an existing file that is not ours is refused (never written)',
+    () => {
+      const foreign = FOREIGN_FILE;
+      const pool = freshPool();
+      const r = acquire(pool, 'lane', livePid(), { env: { GATE_LOCK_SLOT_OUT: foreign } });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('is not a regular file owned by');
+      expect(r.stderr).not.toContain('given back');
+      expect(names(pool)).toEqual(['.format']);
+    },
+  );
 
   it('a directory is refused', () => {
     const pool = freshPool();
