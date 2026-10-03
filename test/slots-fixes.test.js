@@ -51,7 +51,7 @@ function forgeFrom(pool, slot, link) {
   return target;
 }
 
-describe('caller pid (qodo Am6, CodeRabbit CML)', () => {
+describe('caller pid (zero and dead pids)', () => {
   it('a caller pid of zero, in any spelling, is refused by every subcommand with exit 2', () => {
     for (const pid of ['0', '00', '0000000000']) {
       for (const args of [
@@ -90,7 +90,7 @@ describe('caller pid (qodo Am6, CodeRabbit CML)', () => {
   });
 });
 
-describe('heartbeat after the rename (qodo Amm)', () => {
+describe('heartbeat after the rename (D12 takeover)', () => {
   it('a slot taken over between the pid check and the rename is reported as no lock, exit 1', async () => {
     const pool = freshPool();
     const pid = livePid();
@@ -114,7 +114,7 @@ describe('heartbeat after the rename (qodo Amm)', () => {
   });
 });
 
-describe('never delete through a symlink or a foreign directory (qodo Amo)', () => {
+describe('never delete through a symlink or a foreign directory', () => {
   it('release: a symlink swapped in before the rename-aside is put back, never deleted', async () => {
     const pool = freshPool();
     const pid = livePid();
@@ -154,7 +154,7 @@ describe('never delete through a symlink or a foreign directory (qodo Amo)', () 
   });
 });
 
-describe('verify re-checks provenance at the final read (qodo Ams)', () => {
+describe('verify re-checks provenance at the final read', () => {
   it('a slot replaced by a symlink to a matching directory does not verify', async () => {
     const pool = freshPool();
     const pid = livePid();
@@ -173,7 +173,7 @@ describe('verify re-checks provenance at the final read (qodo Ams)', () => {
   });
 });
 
-describe('create_slot cleanup (qodo Amv)', () => {
+describe('create_slot cleanup', () => {
   it('a symlink at the slot name is never created through: the target stays untouched', () => {
     const pool = freshPool();
     const target = path.join(scratchOf(pool), 'elsewhere');
@@ -206,7 +206,7 @@ describe('create_slot cleanup (qodo Amv)', () => {
   });
 });
 
-describe('a slot with an entry named like itself (qodo Amy)', () => {
+describe('a slot with an entry named like itself', () => {
   it('is not reclaimable: it is left alone and reported busy', () => {
     const pool = freshPool();
     const dir = seed(pool, 'gate.lock', { owner: 'odd', pid: deadPid() });
@@ -232,7 +232,7 @@ describe('a slot with an entry named like itself (qodo Amy)', () => {
   });
 });
 
-describe('the slot-output temp file (qodo Am2)', () => {
+describe('the slot-output temp file', () => {
   it('never removes a pre-existing sibling named like the temp file', async () => {
     const pool = freshPool();
     const out = path.join(scratchOf(pool), 'slot-out');
@@ -255,7 +255,7 @@ describe('the slot-output temp file (qodo Am2)', () => {
   });
 });
 
-describe('put_back and the recovery rename (Fable S1, CodeRabbit CMP)', () => {
+describe('put_back and the recovery rename (D12 restore window)', () => {
   it('S1 a name taken between the free-name test and the restore rename: the moved slot is moved back out, never nested', async () => {
     const pool = freshPool();
     seed(pool, 'gate.lock', { owner: 'stale-one', pid: deadPid() });
@@ -367,7 +367,7 @@ describe('put_back and the recovery rename (Fable S1, CodeRabbit CMP)', () => {
   });
 });
 
-describe('give-back result (CodeRabbit CMR)', () => {
+describe('give-back result', () => {
   const unwritableOut = (pool) => {
     const out = path.join(scratchOf(pool), 'slot-out');
     writeRaw(scratchOf(pool), 'slot-out', 'x\n', 0o400);
