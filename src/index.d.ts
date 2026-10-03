@@ -12,6 +12,9 @@ export declare const FORMAT: 1;
  * count the runner can really spend (affinity, cpusets). The lock tool's own
  * slot derivation and budget check (V11, V13) use the host's online count,
  * `getconf _NPROCESSORS_ONLN`.
+ *
+ * On a host with a cgroup CPU quota the library may report fewer CPUs than the
+ * CLI (libuv honours the quota, nproc does not); the library is the stricter.
  */
 export declare function resolveMaxWorkers(
   env?: Record<string, string | undefined>,

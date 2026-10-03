@@ -199,7 +199,8 @@ digits_gt() {
 #  - the lock tool (V11 slot derivation, V13 budget) wants the host's online
 #    count: `getconf _NPROCESSORS_ONLN`;
 #  - `gate-lock workers` (procs_affinity=1) wants what this process may really
-#    use, so it tries `nproc` first (GNU and busybox honour CPU affinity and
+#    use, so it tries `nproc` (with OMP_NUM_THREADS and OMP_THREAD_LIMIT unset,
+#    which GNU nproc honours) first (GNU and busybox honour CPU affinity and
 #    cpusets) and falls back to getconf where nproc is missing or fails.
 # Sets $procs_ok (1 when it is a number), $procs_raw, $procs_norm (leading zeros
 # stripped, as is) and $procs_n (the same, but nine or more digits clamped so
@@ -219,7 +220,7 @@ get_procs() {
   else
     procs_raw=
     if [ "$procs_affinity" = 1 ]; then
-      procs_raw=$(nproc 2>/dev/null) || procs_raw=
+      procs_raw=$(unset OMP_NUM_THREADS OMP_THREAD_LIMIT; nproc 2>/dev/null) || procs_raw=
     fi
     is_digits "$procs_raw" || procs_raw=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || procs_raw=
   fi
@@ -420,7 +421,8 @@ fi
 found=
 extra_bytes=0
 if [ -f "$marker" ] && [ ! -h "$marker" ]; then
-  found=$(cat "$marker" 2>/dev/null) || found=
+  # NULs are deleted first: bash warns on stderr about a NUL in a substitution.
+  found=$({ tr -d '\000' <"$marker" | cat; } 2>/dev/null) || found=
   marker_bytes=$({ tr -d '\n' <"$marker" | wc -c; } 2>/dev/null) || marker_bytes=0
   [ "$((marker_bytes + 0))" -eq 1 ] || extra_bytes=1
 fi

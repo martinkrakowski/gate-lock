@@ -20,6 +20,8 @@ function stripZeros(digits) {
  * `gate-lock workers` applies the same rules and prints the same messages. The
  * processor count is this process's own (os.availableParallelism(); the CLI asks
  * nproc, then getconf), not the host's online count the lock tool uses (V11, V13).
+ * On a host with a cgroup CPU quota, os.availableParallelism() (libuv 1.49+) can be
+ * lower than the CLI's nproc: the library is the stricter of the two.
  *
  * @param {Record<string, string | undefined>} [env]
  * @param {number} [cpus] the processor count; defaults to os.availableParallelism()

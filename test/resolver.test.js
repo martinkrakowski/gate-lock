@@ -307,12 +307,34 @@ describe('S2 processor sources for gate-lock workers', () => {
     expect(budget.stderr).toBe('gate-lock: not implemented yet\n');
   });
 
-  it('S2 with no seam, on Linux, the CLI processor count equals os.availableParallelism()', () => {
+  it('S2 nproc runs with OMP_NUM_THREADS and OMP_THREAD_LIMIT unset (GNU nproc honours them)', () => {
+    const env = shims({
+      nproc: 'echo ${OMP_NUM_THREADS:-${OMP_THREAD_LIMIT:-8}}',
+      getconf: 'echo 16',
+    });
+    const withOmp = { ...env, OMP_NUM_THREADS: '2', OMP_THREAD_LIMIT: '2' };
+    expect(workersWith(withOmp, '8')).toMatchObject({ status: 0, stdout: '8\n', stderr: '' });
+    expect(workersWith(withOmp, '9').stderr).toContain('available parallelism (8)');
+  });
+
+  it('S2 with no seam, on Linux, the CLI count matches os.availableParallelism() (a cgroup quota aside)', () => {
     const haveNproc = spawnSync('nproc', { encoding: 'utf8' }).status === 0;
     if (process.platform !== 'linux' || !haveNproc) return; // nproc is not everywhere
     const p = os.availableParallelism();
-    expect(workersWith({}, String(p))).toMatchObject({ status: 0, stdout: `${p}\n` });
-    expect(workersWith({}, String(p + 1)).stderr).toContain(`available parallelism (${p})`);
+    let quota;
+    try {
+      // cgroup v2: "max 100000" means no quota; libuv 1.49+ honours a quota, nproc does not
+      quota = fs.readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').split(/\s+/)[0] !== 'max';
+    } catch {
+      quota = false;
+    }
+    const huge = workersWith({}, '999999999');
+    const cli = Number(/available parallelism \((\d+)\)/.exec(huge.stderr)?.[1]);
+    expect(Number.isInteger(cli), huge.stderr).toBe(true);
+    if (quota)
+      expect(cli).toBeGreaterThanOrEqual(p); // the library is the stricter one
+    else expect(cli).toBe(p);
+    expect(workersWith({}, String(cli))).toMatchObject({ status: 0, stdout: `${cli}\n` });
   });
 });
 
