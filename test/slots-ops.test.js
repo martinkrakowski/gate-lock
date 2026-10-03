@@ -95,6 +95,37 @@ describe('T17-T18 heartbeat', () => {
     expect(names(pool)).toEqual(['.format']);
   });
 
+  it('D24 a slot given away while this beat was staged is not refreshed: nothing of the old holder is written', async () => {
+    const pool = freshPool();
+    const pid = livePid();
+    seedOld(pool, 'gate.lock', { owner: 'lane', pid });
+    const hook = path.join(scratchOf(pool), 'hook-beat');
+    const { child, done } = startBin(['heartbeat'], {
+      env: {
+        ...TM,
+        GATE_LOCK_DIR: pool,
+        GATE_LOCK_CALLER_PID: String(pid),
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook,
+      },
+      cwd: wtDir(pool),
+    });
+    await waitForFile(hook);
+    expect(names(pool)).toContain(`gate.lock.beatnew.${child.pid}`);
+    // The beat is staged, and the slot is gone to somebody else before the
+    // rename. That holder's beat is a record of that holder, so a refresh from the
+    // pid that used to hold it must not touch it - the ownership is re-read
+    // immediately before the rename, not only before anything was staged.
+    const stranger = livePid();
+    fs.writeFileSync(path.join(pool, 'gate.lock', 'pid'), `${stranger}\n`);
+    const beat = fs.readFileSync(path.join(pool, 'gate.lock', 'beat'), 'utf8');
+    releaseHook(hook);
+    const r = await done;
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('now held by another holder');
+    expect(fs.readFileSync(path.join(pool, 'gate.lock', 'beat'), 'utf8'), 'the beat').toBe(beat);
+    expect(names(pool), 'nothing staged is left beside the slot').toEqual(['.format', 'gate.lock']);
+  });
+
   it('C23 a beat that is a directory cannot be replaced: exit 1, nothing staged is left, nothing nested', () => {
     const pool = freshPool();
     const pid = livePid();

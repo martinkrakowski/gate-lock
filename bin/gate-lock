@@ -1786,14 +1786,29 @@ do_heartbeat() {
   fi
   chmod 0600 "$hb_stage" 2>/dev/null
   pause_at GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME
+  # Verified again here, immediately before the rename, because that is the last
+  # moment it can be: the holder was read once, before anything was staged, and a
+  # slot given away in between is somebody else's beat to write. Without this the
+  # only complaint would come after the rename had already landed, which is a
+  # complaint about a file this caller has just overwritten (D24).
+  #
+  # A slot that is not there at all is left to the rename below, which refuses it
+  # by name (H8); this check is about a slot that is there and is not ours.
+  if [ -d "$target" ]; then
+    rdf "$target/pid"
+    if ! pid_eq "$rd" "$caller"; then
+      rm -f "$hb_stage" 2>/dev/null
+      fail1 "heartbeat: no lock: $target is now held by another holder (pid ${rd:-none}); nothing of this caller's was refreshed"
+    fi
+  fi
   if [ -d "$target/beat" ] || ! mv -f "$hb_stage" "$target/beat" 2>/dev/null; then
     rm -f "$hb_stage" 2>/dev/null
     fail1 "heartbeat: cannot replace the beat in $target (the lock may be gone)"
   fi
-  # The pid was checked before the beat was staged, so a holder that took the
-  # name in between had its beat refreshed by this rename. That is harmless (a
-  # beat only says "alive", and that holder is no less alive for it), but this
-  # caller no longer holds the lock, and must be told so.
+  # And once more after it: between the check above and the rename a holder can
+  # still have taken the name. That is harmless to the file - a beat only says
+  # "alive", and that holder is no less alive for it - but this caller no longer
+  # holds the lock, and must be told so.
   rdf "$target/pid"
   if ! pid_eq "$rd" "$caller"; then
     fail1 "heartbeat: no lock: $target is now held by another holder (pid ${rd:-none}); nothing of this caller's was refreshed"
@@ -2049,33 +2064,55 @@ run_kill_grace=10
 # and QUIT ignored: a forwarded INT would be a no-op for a plain shell command
 # (C39). A second signal, of any kind, is ignored - re-entering is the one thing
 # worse than ignoring it, because it can skip the release (C40).
-# run_stop_helper MARKER PID: stop one of our helper subshells the way that does
-# not involve a signal. The caller has written MARKER; the subshell takes it away
-# and exits at its next step, which is a second away. This wait is bounded - 200
-# spins, then five one-second rounds, which is more than the supervisor's own
-# three asks (it will not cut a refresh short, C41/R7) and is only reached when a
-# helper really is wedged. The only signal it falls back to is KILL, which cannot
-# be trapped and so cannot reach bash 3.2's `run_pending_traps` defect: sending
-# TERM to a subshell that may still be installing its own traps makes that shell
-# print two lines of its own on the caller's stderr and resend the signal to
-# itself, which is how a signalled run came to answer 0 on macOS.
+# run_stop_helper MARKER GONE PID: stop one of our helper subshells the way that
+# does not involve a signal. The file MARKER is written here and the subshell
+# takes it away as it goes, at its next step, which is a second away; GONE is the
+# file that subshell leaves behind when it has finished, on every one of its exits.
+#
+# Both of those are checked before the wait and during it, which is what keeps a
+# helper that had already ended from costing anything: it has left GONE, so the
+# marker written after it cannot be taken away by anybody and waiting for that
+# would be five seconds of nothing (the escalator's grace completing on its own,
+# the supervisor's lost-lock exit). A pid that is not a process at all is the same
+# answer without a file.
+#
+# The wait is bounded - 200 spins, then eight one-second rounds, which is more than
+# the supervisor's own three asks (it will not cut a refresh short, C41/R7) and is
+# only reached when a helper really is wedged. The only signal it falls back to is
+# KILL, which cannot be trapped and so cannot reach bash 3.2's `run_pending_traps`
+# defect: sending TERM to a subshell that may still be installing its own traps
+# makes that shell print two lines of its own on the caller's stderr and resend
+# the signal to itself, which is how a signalled run came to answer 0 on macOS.
 run_stop_helper() {
-  run_stop_waited=0
-  run_stop_spin=0
-  while [ -e "$1" ]; do
-    run_stop_spin=$((run_stop_spin + 1))
-    if [ "$run_stop_spin" -lt 200 ]; then
-      continue
-    fi
-    run_stop_waited=$((run_stop_waited + 1))
-    [ "$run_stop_waited" -lt 5 ] || break
+  # The same redirection as run_wait_pid, for the same reason: this is a command
+  # boundary after a child of this shell's has died of a signal, and it is where
+  # bash flushes the line it wants to put on the caller's stderr. Nothing is
+  # printed from here.
+  {
+    [ -e "$2" ] && return 0
+    kill -0 "$3" 2>/dev/null || return 0
+    : >"$1" 2>/dev/null
+    run_stop_waited=0
     run_stop_spin=0
-    sleep 1
-  done
-  # Last resort: the subshell has not noticed. KILL cannot be trapped, so this is
-  # the one signal that cannot make a shell print anything about itself. It is
-  # harmless when the subshell has already exited and merely waits to be reaped.
-  kill -KILL "$2" 2>/dev/null
+    while [ -e "$1" ] && [ ! -e "$2" ]; do
+      run_stop_spin=$((run_stop_spin + 1))
+      if [ "$run_stop_spin" -lt 200 ]; then
+        continue
+      fi
+      run_stop_waited=$((run_stop_waited + 1))
+      [ "$run_stop_waited" -lt 8 ] || break
+      run_stop_spin=0
+      sleep 1
+    done
+    # Last resort: the subshell has neither taken the file away nor said it went.
+    # KILL cannot be trapped, so this is the one signal that cannot make a shell
+    # print anything about itself. It is not sent to a subshell that has finished:
+    # that one is only waiting to be reaped, and its pid is about to be a stranger's.
+    if [ -e "$1" ] && [ ! -e "$2" ]; then
+      kill -KILL "$3" 2>/dev/null
+    fi
+    return 0
+  } 2>/dev/null
 }
 
 run_signal() {
@@ -2131,7 +2168,9 @@ run_forward_term() {
 #
 # RUNPID is this run's own pid, passed in rather than read from `$PPID`: inside a
 # subshell `$PPID` is not reliably the process that forked it, and a watchdog that
-# watches the wrong process would keep a KILL armed for a run that is gone.
+# watches the wrong process would keep a KILL armed for a run that is gone. It is
+# checked at every step, not only before the KILL: a run that was KILLed itself
+# takes its helpers with it, or they would keep the lock alive for ever.
 run_escalator() {
   (
     exec >/dev/null 2>&1
@@ -2140,7 +2179,29 @@ run_escalator() {
     esc_cmd=$2
     esc_dir=$3
     esc_run=$4
+    # Every exit takes the stop file away and says it has gone, so the cleanup
+    # that stops it is never left waiting on a marker nobody will remove.
+    trap 'rm -f "$esc_dir/escalator.stop" 2>/dev/null; : >"$esc_dir/escalator.gone" 2>/dev/null' EXIT
+    esc_kill() {
+      # The grace is up, so the KILL is due - but only while this run is still here
+      # to want it. A run that was KILLed itself is gone, its command may have been
+      # reaped, and that pid may since have been given to somebody else, so a KILL
+      # from here could land on a stranger. `kill -0` on the run is the only thing
+      # that tells the two apart; the residual window is the one command this
+      # subshell still has to run, so it is microseconds, and a pid would have to be
+      # recycled inside it.
+      kill -0 "$esc_run" 2>/dev/null || exit 0
+      kill -KILL "$esc_cmd" 2>/dev/null
+    }
+    # A test seam that retires this watchdog the moment it is armed, which is the
+    # state the cleanup finds when the grace ran out on its own: the watchdog is
+    # gone, its stop file can never be taken away, and a cancel that waited for that
+    # file would wait for nothing. A test that needs this waits for the gone file
+    # before it lets the command end, so the watchdog is certainly finished first.
+    seam GATE_LOCK_TEST_ESC_GONE
+    [ -z "$seam_value" ] || exit 0
     while [ "$esc_grace" -gt 0 ]; do
+      kill -0 "$esc_run" 2>/dev/null || exit 0
       if [ -e "$esc_dir/escalator.stop" ]; then
         rm -f "$esc_dir/escalator.stop"
         exit 0
@@ -2152,15 +2213,7 @@ run_escalator() {
       rm -f "$esc_dir/escalator.stop"
       exit 0
     fi
-    # The grace is up, so the KILL is due - but only while this run is still here
-    # to want it. A run that was KILLed itself is gone, its command may have been
-    # reaped, and that pid may since have been given to somebody else, so a KILL
-    # from here could land on a stranger. `kill -0` on the run is the only thing
-    # that tells the two apart; the residual window is the one command this
-    # subshell still has to run, so it is microseconds, and a pid would have to be
-    # recycled inside it.
-    kill -0 "$esc_run" 2>/dev/null || exit 0
-    kill -KILL "$esc_cmd" 2>/dev/null
+    esc_kill
   ) &
   run_escalator_pid=$!
   # The watchdog's own pid, published by the only process that knows it: a
@@ -2170,16 +2223,17 @@ run_escalator() {
 }
 
 # run_cancel_escalator: the command is gone, so the watchdog has nothing left to
-# do - and nothing of ours may outlive this run. It is told to stop, so the step it
-# is in ends with it, and then it is killed and reaped: a step that is already
-# running would otherwise be reparented and live for up to a second.
+# do - and nothing of ours may outlive this run. It is asked to stop, so the step it
+# is in ends with it, and then it is reaped: a step that is already running would
+# otherwise be reparented and live for up to a second. It may already be gone - its
+# own grace completed while the command was being stopped - and then the wait is
+# skipped rather than spent on a marker no live process is going to remove.
 run_cancel_escalator() {
   [ -n "$run_escalator_pid" ] || return 0
-  : >"$run_dir/escalator.stop" 2>/dev/null
-  run_stop_helper "$run_dir/escalator.stop" "$run_escalator_pid"
+  run_stop_helper "$run_dir/escalator.stop" "$run_dir/escalator.gone" "$run_escalator_pid"
   wait "$run_escalator_pid" 2>/dev/null
   run_escalator_pid=
-  rm -f "$run_dir/escalator.pid" "$run_dir/escalator.stop" 2>/dev/null
+  rm -f "$run_dir/escalator.pid" "$run_dir/escalator.stop" "$run_dir/escalator.gone" 2>/dev/null
 }
 
 # run_wait_pid PID: wait for a child, waiting again when our own handler
@@ -2190,20 +2244,42 @@ run_cancel_escalator() {
 # only a signal that arrives *during* a wait can have interrupted it, and a wait
 # for an already reaped child answers with the status it reaped - 143 for a
 # command we stopped - which is above 128 but is not an interruption (D10).
+#
+# This shell's own stderr is out of the way for the length of this function, and
+# that is deliberate. A shell reports the death of a job of its own on its own
+# stderr - bash writes `$0: line N: <pid> Killed <the job's command line>` - and a
+# command stopped by a KILL, which is the whole point of a watchdog, is such a job.
+# The line is the shell talking about its own bookkeeping rather than about
+# anything the tool or the command said, and D15 wants a signalled run's stderr
+# empty. It is also reported late: bash flushes it at a command boundary after the
+# wait, so redirecting the wait alone is not enough, which is why the redirection
+# is on the function. Nothing is lost by it - the command opened this shell's
+# stderr when it was forked and writes through its own copy of it, and this
+# function prints nothing.
 run_wait_pid() {
-  wp_pid=$1
-  while :; do
-    wp_before=$run_sig_seen
-    wait "$wp_pid" 2>/dev/null
-    wp_status=$?
-    if [ "$run_sig_seen" = "$wp_before" ]; then
-      break
-    fi
-  done
+  {
+    wp_pid=$1
+    while :; do
+      wp_before=$run_sig_seen
+      wait "$wp_pid" 2>/dev/null
+      wp_status=$?
+      if [ "$run_sig_seen" = "$wp_before" ]; then
+        break
+      fi
+    done
+  } 2>/dev/null
 }
 
 # run_wait_supervisor PID: as run_wait_pid, keeping the supervisor's status in
 # $run_sup_status.
+#
+# This wait has the shell's stderr out of the way. A shell reports the death of a
+# job of its own on its own stderr - bash says `$0: line N: pid Killed ...` - and a
+# helper that had to be KILLed is such a job; the line is the shell talking about
+# itself, not this tool, and D15 wants a signalled run's stderr empty. Nothing of
+# ours is lost by that: the supervisor writes only to stdout (C31), and the
+# heartbeat's own complaints are written by a process that opened this shell's
+# stderr before this redirection and still has it.
 run_wait_supervisor() {
   run_sup_status=0
   while :; do
@@ -2259,15 +2335,42 @@ run_stop_supervisor() {
   # exited already - a lost lock ends the run before the cleanup does - so the files
   # are removed once the pids are reaped.
   : >"$run_dir/loop.stop" 2>/dev/null
-  : >"$run_dir/supervisor.stop" 2>/dev/null
-  run_stop_helper "$run_dir/supervisor.stop" "$run_sup"
+  run_stop_helper "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" "$run_sup"
   run_wait_supervisor "$run_sup"
-  rm -f "$run_dir/loop.stop" "$run_dir/supervisor.stop" 2>/dev/null
+  rm -f "$run_dir/loop.stop" "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" 2>/dev/null
 }
 
-# run_lost_lock: what a supervisor status of 1 means (C37, D6, D10).
+# run_sup_verdict: what the supervisor's own status means for this run's answer
+# (C37, D6, D10). The supervisor ends with 0 or 1, or with a status that says how
+# it was stopped, and the table is followed exactly - nothing here may answer 0
+# for a lock this run cannot show it still held.
+#
+#   supervisor  loop      what happened                         the run answers
+#   0           0         stopped as asked, nothing wrong      the command's status
+#   1           1         a refresh failed: the lock is gone    2, lock lost
+#   1           2 or more the loop died twice, or was KILLed     2, lock lost
+#                        on request (D10's second death)
+#   3           any       this supervisor found its run gone;    nothing is reading
+#                        it never touched the command
+#   137, 143, any other   the supervisor was KILLed or signalled 2, lock lost
+#                        while stopping, so the last thing it
+#                        established about the lock is nothing
+#
+# The last row is the one round 9 got wrong: `run_stop_helper`'s KILL, a signal
+# from a terminal's process group, or a wedged supervisor that had to be stopped
+# the hard way all end up here, and a run that treats "not 1" as "not lost"
+# answers 0 for a lock nobody can account for.
+run_sup_lost=0
+run_sup_verdict() {
+  run_sup_lost=0
+  [ "$run_sup_status" -eq 0 ] && return 0
+  run_sup_lost=1
+  return 0
+}
+
+# run_lost_lock: what the table above says (C37, D6, D10).
 run_lost_lock() {
-  [ "$run_sup_status" -eq 1 ] || return 0
+  [ "$run_sup_lost" = 1 ] || return 0
   printf 'gate-lock: the lock was lost while the command ran; the command was stopped (pid %s)\n' "${run_last_cmd_pid:-none}" >&2
   printf 'gate-lock: lock lost: exiting 2; %s is not this run to release, and whatever is there is left as it is\n' "${run_slot:-the slot}" >&2
 }
@@ -2352,10 +2455,10 @@ run_record_status() {
   # A busy refusal keeps its own record only while nothing has changed the answer
   # since: a run that was signalled while it waited for a slot is the tool's 143,
   # not the busy it was told a moment before (D18).
-  if [ -n "$run_busy_kind" ] && [ -z "$run_sig" ] && [ "$run_sup_status" -eq 0 ] &&
+  if [ -n "$run_busy_kind" ] && [ -z "$run_sig" ] && [ "$run_sup_lost" = 0 ] &&
     [ "$run_verify_ok" = 1 ] && [ "$run_exit_code" = 75 ]; then
     run_status=busy:$run_busy_kind
-  elif [ -n "$run_sig" ] || [ "$run_sup_status" -eq 1 ] || [ "$run_verify_ok" = 0 ] ||
+  elif [ -n "$run_sig" ] || [ "$run_sup_lost" = 1 ] || [ "$run_verify_ok" = 0 ] ||
     [ "$run_removed" = 0 ] || [ "$run_acq_status" != 0 ]; then
     run_status=tool:$run_exit_code
   else
@@ -2424,22 +2527,43 @@ run_scratch() {
 # not guaranteed to notice a signal that arrived just before it, so a single long
 # sleep could keep this loop - and with it the whole cleanup - deaf for a whole
 # period (C42, R8d).
+#
+# RUNPID is this run's own pid, passed in rather than read from `$PPID`, and it is
+# checked at every step: a loop that outlived a run that was KILLed would keep
+# refreshing a beat for a holder nobody is watching, which is the one way a lock
+# can stay alive for ever. It leaves with 3 - neither a clean stop nor a lost lock,
+# so nothing restarts it and nothing reports it.
 run_beat_loop() {
   rb_slot=$1
   rb_period=$2
   rb_alive=$3
   rb_status=$4
   rb_stop=$5
+  rb_run=$6
   rb_tick=0
   # Nothing to catch: these four signals are ignored for this subshell's whole
   # life, so one from a terminal's process group is never pending against a trap
   # list here - the state bash 3.2 mishandles. The loop is stopped by being asked,
-  # through the file it checks once a second.
+  # through the file it checks once a second, and by finding that its run has gone.
   trap '' TERM INT HUP QUIT
-  trap '{ printf "%s\n" "$?" >"$rb_status"; } 2>/dev/null' EXIT
+  # The status is taken first: everything else in this trap is a command, and
+  # what the supervisor is told must be how this loop ended, not how it tidied up.
+  trap 'rb_exit=$?; rm -f "$rb_stop" 2>/dev/null; printf "%s\n" "$rb_exit" >"$rb_status"' 2>/dev/null EXIT
   while [ ! -e "$rb_stop" ]; do
+    kill -0 "$rb_run" 2>/dev/null || exit 3
     rb_tick=$((rb_tick + 1))
     { printf '%s\n' "$rb_tick" >"$rb_alive"; } 2>/dev/null
+    # A test seam that parks this loop where it reads no stop file, so the
+    # supervisor's KILL of a wedged loop - and its verdict on the result - can be
+    # driven rather than waited for.
+    seam GATE_LOCK_TEST_LOOP_WEDGE
+    rb_wedge=$seam_value
+    # The sleep is redirected because a parked helper must not hold the
+    # caller's own stdout and stderr open: a test harness waits for those pipes,
+    # and a helper parked for an hour would keep it waiting for an hour.
+    if [ -n "$rb_wedge" ] && [ -e "$rb_wedge" ]; then
+      sleep 3600 >/dev/null 2>&1
+    fi
     # A test seam that kills this loop with a status other than 0 or 1, as many
     # times as the file says, so the supervisor's restart-once rule is provable.
     seam GATE_LOCK_TEST_LOOP_DIE
@@ -2455,7 +2579,7 @@ run_beat_loop() {
       fi
     fi
     # The refresh is a foreground child on purpose: the loop only ends when no
-    # refresh of its own is running (C41), so a TERM that arrives mid-refresh
+    # refresh of its own is running (C41), so a stop that arrives mid-refresh
     # waits for it rather than cutting it short.
     if ! GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$rb_slot" "$self" heartbeat; then
       exit 1
@@ -2465,6 +2589,7 @@ run_beat_loop() {
       rb_tick=$((rb_tick + 1))
       { printf '%s\n' "$rb_tick" >"$rb_alive"; } 2>/dev/null
       sleep 1
+      kill -0 "$rb_run" 2>/dev/null || exit 3
       # Asked, not signalled: the supervisor writes this file, and a loop in its
       # pause sees it within a second and takes it away as it goes.
       if [ -e "$rb_stop" ]; then
@@ -2477,8 +2602,8 @@ run_beat_loop() {
   exit 0
 }
 
-# run_supervise SLOT PERIOD LANE CMDPID DIR (D10): the heartbeat supervisor. It
-# owns the loop as its own child, restarts it once if it dies with a status
+# run_supervise SLOT PERIOD LANE CMDPID DIR RUNPID (D10): the heartbeat supervisor.
+# It owns the loop as its own child, restarts it once if it dies with a status
 # neither 0 nor 1, and stops the command when the loop is gone for good.
 #
 # It watches the loop a second at a time rather than in one wait, for the same
@@ -2486,12 +2611,19 @@ run_beat_loop() {
 # is not guaranteed to interrupt it, and the cleanup must not depend on that.
 # Three seconds without a trace of the loop is where `wait` is asked instead: a
 # loop killed outright leaves no status file, and only wait can say it is gone.
+#
+# RUNPID is this run's own pid, passed in rather than read from `$PPID`, and it is
+# checked at every step: nothing here may outlive the run, and a supervisor that
+# did would keep a lock alive with nobody holding it. Every exit takes the stop
+# file away and leaves the gone file, so the cleanup that stops it waits for
+# nothing that a dead process would have had to remove.
 run_supervise() {
   sv_slot=$1
   sv_period=$2
   sv_lane=$3
   sv_cmd=$4
   sv_dir=$5
+  sv_run=$6
   sv_alive=$sv_dir/beat-alive
   sv_status=$sv_dir/beat-status
   sv_beat=$sv_dir/beat.pid
@@ -2502,6 +2634,7 @@ run_supervise() {
   # life, so one from a terminal's process group is never pending against a trap
   # list here. `run` stops this supervisor and the loop by writing the two files.
   trap '' TERM INT HUP QUIT
+  trap 'rm -f "$sv_stop" 2>/dev/null; : >"$sv_dir/supervisor.gone" 2>/dev/null' EXIT
   while :; do
     rm -f "$sv_status" 2>/dev/null
     # One stop file for every loop this supervisor owns: the supervisor may be
@@ -2509,7 +2642,7 @@ run_supervise() {
     # file has to be one `run` can write once. A file left by an earlier loop is
     # removed before the next one starts.
     rm -f "$sv_ready" 2>/dev/null
-    run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" "$sv_ready" &
+    run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" "$sv_ready" "$sv_run" &
     sv_loop=$!
     # C31: the heartbeat's pid is announced on stdout, and published to this run's
     # private directory straight after, so `run` cannot tear the supervisor down
@@ -2522,6 +2655,16 @@ run_supervise() {
     while :; do
       if [ -e "$sv_status" ]; then
         break
+      fi
+      # A test seam that parks this supervisor where it hears nothing at all - not
+      # its own stop file, not its loop's, not the loop going quiet - so the KILL
+      # that ends a helper which will not be asked has a verdict to give.
+      seam GATE_LOCK_TEST_SUP_WEDGE
+      sv_wedge=$seam_value
+      # Redirected for the same reason as the loop's wedge above: a helper
+      # parked here must not hold the caller's stdout and stderr open.
+      if [ -n "$sv_wedge" ] && [ -e "$sv_wedge" ]; then
+        sleep 3600 >/dev/null 2>&1
       fi
       sv_now=
       {
@@ -2563,6 +2706,7 @@ run_supervise() {
       fi
       sleep 1
     done
+    kill -0 "$sv_run" 2>/dev/null || exit 3
     wait "$sv_loop" 2>/dev/null
     sv_st=$?
     if [ -e "$sv_status" ]; then
@@ -2573,12 +2717,15 @@ run_supervise() {
     fi
     rm -f "$sv_alive" "$sv_status" 2>/dev/null
     # The verdict is the loop's own status, never the stop request: 1 means a
-    # refresh failed and the lock is gone; anything else that is not a clean stop
-    # means the loop itself died, which is restarted exactly once (D10). A stop
-    # request only makes this supervisor prompt below - it must never turn one of
-    # those into a quiet exit, or a run cleaning up would answer 0 for a lost lock.
+    # refresh failed and the lock is gone; 3 means this loop found its run gone;
+    # anything else that is not a clean stop means the loop itself died, which is
+    # restarted exactly once (D10) - but only when nobody asked it to stop, since a
+    # KILL because a cleanup's request was not honoured is not a reason to start
+    # another loop that will be KILLed again. A stop request only makes this
+    # supervisor prompt below; it must never turn one of those into a quiet exit, or
+    # a run cleaning up would answer 0 for a lost lock.
     if [ "$sv_st" -ne 0 ]; then
-      if [ "$sv_st" -eq 1 ]; then
+      if [ "$sv_st" -eq 1 ] || [ "$sv_st" -eq 3 ] || [ -e "$sv_stop" ]; then
         break
       fi
       if [ "$sv_restart" -eq 0 ]; then
@@ -2602,17 +2749,18 @@ run_supervise() {
   # The lock is gone and the command is still running: TERM it, then KILL it after
   # the grace period, so nothing outlives the run without a lock (D10). `run`'s
   # cleanup may ask this supervisor to stop while it waits out that grace - the
-  # command is already gone by then and run is waiting for this supervisor - so
-  # the wait is cut short. The status stays 1: the lock was lost either way.
+  # command is already gone by then and run is waiting for this supervisor - so the
+  # wait is cut short. The status stays 1: the lock was lost either way.
   kill -TERM "$sv_cmd" 2>/dev/null
   sv_n=0
   while [ "$sv_n" -lt "$sv_grace" ]; do
-    sleep 1
-    sv_n=$((sv_n + 1))
     if [ -e "$sv_stop" ]; then
       rm -f "$sv_stop" 2>/dev/null
       exit 1
     fi
+    kill -0 "$sv_run" 2>/dev/null || exit 3
+    sleep 1
+    sv_n=$((sv_n + 1))
   done
   kill -KILL "$sv_cmd" 2>/dev/null
   exit 1
@@ -2702,6 +2850,7 @@ run_acquire_done() {
 run_finish() {
   run_stop_supervisor
   run_reap_command
+  run_sup_verdict
   run_lost_lock
   run_verify_lock
   run_release_lock
@@ -2712,7 +2861,7 @@ run_finish() {
   # command's status, unchanged (C34).
   if [ -n "$run_sig" ]; then
     run_exit_code=$run_sig_code
-  elif [ "$run_sup_status" -eq 1 ]; then
+  elif [ "$run_sup_lost" = 1 ]; then
     run_exit_code=2
   elif [ "$run_verify_ok" = 0 ] || [ "$run_removed" = 0 ]; then
     if [ "$run_cmd_status" -eq 0 ]; then
@@ -2735,6 +2884,14 @@ run_cleanup() {
   if [ "$run_finished" != 1 ]; then
     run_stop_supervisor
     run_reap_command
+    run_sup_verdict
+    # The same table as run_finish, and for the same reason: a helper that ended
+    # in any way but a clean stop means this run cannot show the lock was its own.
+    # A signal still outranks that (C38).
+    if [ -z "$run_sig" ] && [ "$run_sup_lost" = 1 ]; then
+      run_lost_lock
+      run_exit_code=2
+    fi
     run_verify_lock
     run_release_lock
     if [ "$run_exit_code" -eq 0 ] && [ "$run_removed" = 0 ]; then
@@ -2839,7 +2996,7 @@ do_run() {
   if [ -n "$run_sig" ]; then
     run_forward_term
   fi
-  run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" &
+  run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" "$$" &
   run_sup_pid=$!
   # C31: the heartbeat is started before the command is waited for, and the
   # supervisor's announcement is waited for here - before anything can tear it

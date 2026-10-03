@@ -31,6 +31,7 @@ import {
   script,
   slotsReported,
   startRun,
+  stopped,
   track,
   up,
   waitForDead,
@@ -38,11 +39,14 @@ import {
 
 const SIX = ['beat', 'owner', 'pid', 'project', 'started', 'worktree'];
 
-/** The slot names in a pool: a transient beside one is the janitor's to remove (D16). */
-const slotNames = (pool) =>
-  names(pool)
-    .filter((n) => /^gate\.lock(\.\d+)?$/.test(n))
-    .sort();
+/**
+ * The staged beats in a pool, by the tool's own name pattern: `<slot>.beatnew.<pid>`
+ * beside the slot (F39). A staging file that survives a run means a refresh was cut
+ * off between staging and the rename, which is a leak of ours and not the janitor's
+ * (D16), so the tests that assert an exact pool listing also assert this is empty.
+ */
+const stagedBeats = (pool) =>
+  names(pool).filter((n) => /^gate\.lock(\.\d+)?\.beatnew\.\d+$/.test(n));
 
 /** A path under the pool's scratch, for a file a run writes. */
 const out = (pool, name) => path.join(scratchOf(pool), name);
@@ -562,7 +566,8 @@ describe('a signal into a half-built subshell', () => {
       seen.push(r.stderr);
     }
     expect(seen.every((s) => /workers?/.test(s))).toBe(true);
-    expect(slotNames(pool)).toEqual([]);
+    expect(names(pool), `pool: ${names(pool)}`).toEqual(['.format']);
+    expect(stagedBeats(pool)).toEqual([]);
   }, 60_000);
 });
 
@@ -648,6 +653,55 @@ describe('D10 the supervisor stops a command that ignores TERM', () => {
     expect(Date.now() - started).toBeGreaterThan(9000);
     await waitForDead(victim, 20000);
     expect(fs.existsSync(block.done)).toBe(false);
+    expect(names(pool)).toEqual(['.format']);
+  }, 60_000);
+});
+
+describe('D10 a helper that has already ended is not waited for', () => {
+  it('D10 a watchdog that is gone before the command ends is not waited for: its stop file costs nothing', async () => {
+    const pool = freshPool();
+    const scratch = scratchOf(pool);
+    // The command deafens itself to TERM, so the only thing that can stop it is
+    // the KILL the watchdog escalates to. The seam retires that watchdog as soon as
+    // it is armed - the state the cleanup finds when the grace ran out on its own -
+    // so the run is about to write a stop file into the void: nothing is left to
+    // take that file away, and a wait that watches it would spend its whole bound
+    // before giving up. The gone file the watchdog leaves on every exit is what
+    // tells the cancel not to.
+    const block = blocker(pool, 'deaf', { ignoreTerm: true });
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        TMPDIR: scratch,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '30',
+        GATE_LOCK_TEST_ESC_GONE: '1',
+      },
+    });
+    await up(block);
+    const victim = track(block.pid());
+    gate.child.kill('SIGTERM');
+    // The watchdog publishes its own pid, so the test can wait for it to be gone
+    // rather than hope it is: the cancel below is only worth anything once the
+    // helper it stops has certainly ended.
+    const dir = path.join(scratch, `gate-lock-run.${gate.child.pid}`);
+    await waitForFile(path.join(dir, 'escalator.pid'), 10000);
+    const watchdog = Number(fs.readFileSync(path.join(dir, 'escalator.pid'), 'utf8'));
+    await until(() => stopped(watchdog), 10000);
+    expect(stopped(watchdog), 'the watchdog is gone before the command ends').toBe(true);
+    block.release();
+    const started = Date.now();
+    const r = await gate.done;
+    // The stop-file wait is bounded at eight one-second rounds, so a teardown that
+    // waited on a watchdog which had already gone could not answer inside five of
+    // these; a run that ends by itself spends nothing on it.
+    expect(Date.now() - started, 'the teardown waited on a watchdog that was gone').toBeLessThan(
+      5000,
+    );
+    expect(r.status).toBe(143);
+    await waitForDead(victim, 10000);
+    expect(fs.existsSync(block.done)).toBe(true);
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(names(pool)).toEqual(['.format']);
   }, 60_000);
 });
@@ -753,6 +807,56 @@ describe('D10 a loop that keeps dying', () => {
     await waitForDead(victim);
     expect(fs.existsSync(block.done)).toBe(false);
   });
+  it('D10 a wedged loop is KILLed on request, is not restarted for it, and the run answers 2 with "lock lost"', async () => {
+    const pool = freshPool();
+    const wedge = path.join(scratchOf(pool), 'loop-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_TEST_LOOP_WEDGE: wedge,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '2',
+      },
+    });
+    await up(block);
+    // The loop is parked where it reads no stop file, so the cleanup's three
+    // asks are not enough and the supervisor has to KILL it. Restart-once (D10)
+    // is for an unrequested death: a KILL during the cleanup must not start a
+    // second loop that would be KILLed again, and a run that cannot show the lock
+    // was its own says so instead of answering 0.
+    block.release();
+    const r = await gate.done;
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('lock lost');
+    expect(beatPids(r.stdout), 'one loop, not a restart and a second loop').toHaveLength(1);
+    expect(names(pool)).toEqual(['.format']);
+  });
+
+  it('D10 a supervisor that will not be stopped at all is KILLed, and the run answers 2 rather than 0', async () => {
+    const pool = freshPool();
+    const wedge = path.join(scratchOf(pool), 'sup-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: { ...TM, GATE_LOCK_TEST_SUP_WEDGE: wedge, GATE_LOCK_HEARTBEAT_SECONDS: '1' },
+    });
+    await up(block);
+    block.release();
+    // The supervisor is parked where it hears nothing, so the only way to stop it
+    // is the KILL the stop-file protocol falls back to. Its status is then 137 and
+    // not 1, and the verdict table says that is a lost lock like any other: the
+    // last thing such a supervisor established about the lock is nothing.
+    const r = await gate.done;
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('lock lost');
+    expect(r.stdout).toContain('released by lane');
+    expect(names(pool)).toEqual(['.format']);
+    // Nothing of the run's outlives it, and the KILLed supervisor's loop is gone
+    // too: a loop that outlived the run would keep refreshing the beat.
+    await waitForDead(block.pid(), 5000);
+  }, 60_000);
 });
 
 describe('D21 the file recording the slot path', () => {
@@ -763,12 +867,15 @@ describe('D21 the file recording the slot path', () => {
     await up(block);
     // Nothing of run's own is published in the pool: the slot path was recorded
     // in a private directory, which the acquire wrote through D21's own rules.
-    // A staged beat may be beside the slot while a refresh is in flight, and it
-    // is the janitor's to remove (D16), so the pool is judged on slots.
-    expect(slotNames(pool), `pool: ${names(pool)}`).toEqual(['gate.lock']);
+    expect(names(pool), `pool: ${names(pool)}`).toEqual(['.format', 'gate.lock']);
     block.release();
     expect((await gate.done).status).toBe(0);
-    expect(slotNames(pool), `pool: ${names(pool)}`).toEqual([]);
+    // The exact listing, `.format` included. A staged beat is the tool's own name
+    // pattern beside the slot and would mean a refresh was cut off mid-rename -
+    // which the cleanup no longer does, because the loop is asked to stop and
+    // waits for its own refresh (C41) instead of being KILLed through it.
+    expect(names(pool), `pool: ${names(pool)}`).toEqual(['.format']);
+    expect(stagedBeats(pool), 'no staged beat is left in the pool').toEqual([]);
     expect(names(scratchOf(pool)).filter((n) => n.startsWith('gate-lock-run'))).toEqual([]);
   });
 });
