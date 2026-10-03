@@ -318,6 +318,24 @@ done`,
     await new Promise((r) => setTimeout(r, 5000));
     expect(alive(victim), 'the watchdog killed the command after run was gone').toBe(true);
   }, 90_000);
+  it('D15 a run signalled while its helpers are still starting still answers with the signal code', async () => {
+    // The macOS regression: a run that was signalled came to answer 0, because a
+    // TERM into a helper subshell that was still building itself reached bash 3.2's
+    // `run_pending_traps` defect. Nothing here signals a helper any more, and this
+    // says the part that matters whatever the shell: the exit status is the
+    // signal's own, the lock comes back, and nothing of the run is left behind.
+    const pool = freshPool();
+    const { gate, pid } = await signalledRun(pool, { name: 'starting' });
+    gate.child.kill('SIGTERM');
+    const r = await gate.done;
+    expect(r.status).toBe(143);
+    expect(r.signal).toBe(null);
+    expect(r.stdout).toContain('released by lane');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
+    expect(names(pool)).toEqual(['.format']);
+    await waitForDead(pid);
+    expect(beatPids(r.stdout).every((loop) => gone(loop))).toBe(true);
+  }, 60_000);
 });
 
 describe('C49 a signal aimed at a child of run', () => {

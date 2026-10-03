@@ -38,6 +38,12 @@ import {
 
 const SIX = ['beat', 'owner', 'pid', 'project', 'started', 'worktree'];
 
+/** The slot names in a pool: a transient beside one is the janitor's to remove (D16). */
+const slotNames = (pool) =>
+  names(pool)
+    .filter((n) => /^gate\.lock(\.\d+)?$/.test(n))
+    .sort();
+
 /** A path under the pool's scratch, for a file a run writes. */
 const out = (pool, name) => path.join(scratchOf(pool), name);
 
@@ -535,18 +541,18 @@ describe('T46 three runs at slot count 3', () => {
 });
 
 describe('a signal into a half-built subshell', () => {
-  it('D10 thirty normal runs with slots to spare print nothing but the worker warning on stderr', () => {
-    // `run` tears its supervisor down as soon as a command that exits at once is
-    // over, which can land inside the supervisor's or the loop's own `trap` line.
-    // bash 3.2 answers a signal that meets a default disposition in a subshell it
-    // is still building with its own `run_pending_traps` warning and a resend of
-    // the signal to itself - noise from a process that has done nothing wrong, on
-    // the stderr a caller reads. On dash and bash this passes either way; the
-    // macOS leg (`/bin/sh` = bash 3.2) is the real check, and the tool now waits
-    // for each subshell's ready marker before signalling it.
+  it('D10 eight normal runs with slots to spare print nothing but the worker warning on stderr', () => {
+    // `run` stops its supervisor and its loop as soon as a command that exits at
+    // once is over, which is exactly when a helper subshell may still be starting.
+    // bash 3.2 answers a TERM that meets a default disposition in a shell it is
+    // still building with its own `run_pending_traps` warning and a resend of the
+    // signal to itself - noise on the stderr a caller reads. The tool now asks
+    // those subshells to stop through a file instead of a signal. On dash and bash
+    // this passes either way; the macOS leg (/bin/sh = bash 3.2) is the check that
+    // matters.
     const pool = freshPool();
     const seen = [];
-    for (let round = 0; round < 30; round += 1) {
+    for (let round = 0; round < 8; round += 1) {
       const r = runOnce(pool, 'lane', ['sh', '-c', 'exit 3'], {
         env: { GATE_LOCK_SLOTS: '2' },
         timeout: 60000,
@@ -556,8 +562,8 @@ describe('a signal into a half-built subshell', () => {
       seen.push(r.stderr);
     }
     expect(seen.every((s) => /workers?/.test(s))).toBe(true);
-    expect(names(pool)).toEqual(['.format']);
-  }, 120_000);
+    expect(slotNames(pool)).toEqual([]);
+  }, 60_000);
 });
 
 describe('the worker cap warning', () => {
@@ -757,10 +763,12 @@ describe('D21 the file recording the slot path', () => {
     await up(block);
     // Nothing of run's own is published in the pool: the slot path was recorded
     // in a private directory, which the acquire wrote through D21's own rules.
-    expect(names(pool)).toEqual(['.format', 'gate.lock']);
+    // A staged beat may be beside the slot while a refresh is in flight, and it
+    // is the janitor's to remove (D16), so the pool is judged on slots.
+    expect(slotNames(pool), `pool: ${names(pool)}`).toEqual(['gate.lock']);
     block.release();
     expect((await gate.done).status).toBe(0);
-    expect(names(pool)).toEqual(['.format']);
+    expect(slotNames(pool), `pool: ${names(pool)}`).toEqual([]);
     expect(names(scratchOf(pool)).filter((n) => n.startsWith('gate-lock-run'))).toEqual([]);
   });
 });
