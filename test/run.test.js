@@ -6,10 +6,11 @@
 // runner.test.js. Every window here is a file handshake: a wrapped command
 // announces itself and then blocks reading a fifo, so no test sleeps to
 // synchronise.
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { listing, releaseHook, scratchOf, waitForFile } from './harness.js';
+import { BIN, listing, releaseHook, scratchOf, waitForFile } from './harness.js';
 import {
   TM,
   acquire,
@@ -24,6 +25,7 @@ import {
 } from './slots.js';
 import {
   beatPids,
+  alive,
   blocker,
   freshPool,
   runOnce,
@@ -37,6 +39,9 @@ import {
 } from './run.js';
 
 const SIX = ['beat', 'owner', 'pid', 'project', 'started', 'worktree'];
+
+/** A path under the pool's scratch, for a file a run writes. */
+const out = (pool, name) => path.join(scratchOf(pool), name);
 
 /** Shell code a wrapped command uses to give its slot to another holder, atomically. */
 const stealSlot = `replace() {
@@ -560,6 +565,51 @@ describe('D10 the supervisor stops a command that ignores TERM', () => {
     await waitForDead(victim, 20000);
     expect(fs.existsSync(block.done)).toBe(false);
     expect(names(pool)).toEqual(['.format']);
+  }, 60_000);
+});
+
+describe('a probe like the one that hung for 77 minutes', () => {
+  it('D10 under `timeout`, a run around a command that ignores TERM ends by itself: it exits inside the grace, and no lock outlives it', () => {
+    const pool = freshPool();
+    const slot = path.join(pool, 'gate.lock');
+    // The shape that hung: `timeout 30 gate-lock run lane -- <a command that
+    // ignores TERM>`, with the command taking its own slot away so the loop
+    // stops it. Which internal path answers depends on whether the loop or the
+    // command is first to notice, so the test says what must always be true: the
+    // run ends by itself, well inside the probe's own budget, says the lock was
+    // lost or that it could not give it back, kills the command and leaves the
+    // pool as it found it.
+    const block = blocker(pool, 'deaf', { ignoreTerm: true, pre: 'rm -rf "$2"', args: [slot] });
+    const status = out(pool, 'probe-status');
+    const probe = spawnSync(
+      'timeout',
+      ['30', BIN, 'run', '--status-file', status, 'lane', '--', ...block.cmd],
+      {
+        env: {
+          PATH: process.env.PATH,
+          HOME: process.env.HOME,
+          GATE_LOCK_DIR: pool,
+          GATE_LOCK_HEARTBEAT_SECONDS: '1',
+          GATE_LOCK_TEST_MODE: '1',
+          GATE_LOCK_TEST_KILL_GRACE: '2',
+        },
+        encoding: 'utf8',
+        timeout: 40000,
+      },
+    );
+    // `timeout` answers 124 when its child overran it: this is the whole point
+    // of the test, and the run's own status is what it should be instead.
+    expect(probe.status).not.toBe(124);
+    expect(probe.status).toBe(2);
+    expect(probe.stderr).toMatch(/lock lost|FAILED to release the lock/);
+    expect(fs.readFileSync(status, 'utf8')).toBe('tool:2\n');
+    // The command is dead and the pool is as it was: no slot for the next
+    // caller to reclaim, and no transient left in the pool.
+    expect(fs.existsSync(`${block.dir}/done`)).toBe(false);
+    expect(names(pool)).toEqual(['.format']);
+    const pid = Number(fs.readFileSync(`${block.dir}/ready`, 'utf8'));
+    expect(track(pid)).toBe(pid);
+    expect(alive(pid)).toBe(false);
   }, 60_000);
 });
 
