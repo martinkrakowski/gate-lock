@@ -32,13 +32,18 @@ export GATE_HOST_WORKERS=4                    # four test workers each: 6 x 4 = 
 gate-lock run unit -- npm test
 ```
 
-`GATE_LOCK_SLOTS` and `GATE_HOST_WORKERS` are one decision: slots times workers
+`GATE_HOST_SLOTS` and `GATE_HOST_WORKERS` are one decision: slots times workers
 must not exceed the host's processor count, and the tool refuses a combination
 that does not (`GATE_HOST_SLOTS=7` with `GATE_HOST_WORKERS=4` on 24 processors is
-refused, exit 2).
+refused, exit 2). Both are the host's, set host-wide: a seat count belongs to the
+machine, not to one project.
 
-Without `GATE_HOST_WORKERS`, a slot count may still be given as
-`GATE_LOCK_SLOTS`, and a host with no variables at all gets a pool of one slot.
+`GATE_LOCK_SLOTS` is a project's own view of that count, for a pool-less host or
+as a way to assert the host's: beside a pool it must agree with the host's count,
+and a disagreement is refused (exit 2) rather than obeyed, because a seat that
+believes the host has fewer gates than it does takes one beside a holder it
+cannot see. With no `GATE_HOST_WORKERS` a count may still be given, and a host
+with no variables at all gets a pool of one slot.
 
 ## Usage
 
@@ -93,6 +98,13 @@ gate-lock run docs --status-file /tmp/gate.status -- make docs
   QUIT and TERM are forwarded to the command as TERM and answer 129, 131 and 143,
   and INT answers 130. A second signal is ignored, because re-entering the handler
   is how a cleanup gets skipped.
+
+`run` stops **the command it started** and waits for that command to be gone; it
+does not signal the command's children, because a portable `sh` cannot reach them
+(the command is not a process-group leader in a non-interactive shell, and joining
+one would put the run in it too). A command that leaves work behind must reap it
+itself - `exec` a test runner instead of backgrounding it - or the workers keep
+running after the lock has gone back, with nothing refreshing their beat.
 
 `run` supervises its heartbeat rather than trusting it. The supervisor owns the
 loop as its own child, restarts it once if it dies with a status that is neither
