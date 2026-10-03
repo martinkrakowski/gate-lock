@@ -278,6 +278,39 @@ describe('--wait', () => {
     }
   });
 
+  it('Waiting a leading zero is a spelling, not an octal digit, and ten digits are allowed', async () => {
+    const pool = freshPool();
+    seed(pool, 'gate.lock', { owner: 'holder', pid: livePid() });
+    // `--wait 010` used to be read as eight by the arithmetic, and `--wait 08`
+    // was an arithmetic error; both are a spelling of 10 and 8. A ten-digit value
+    // is within the limit the message states, so it is accepted (and refused as
+    // far away as the pool is concerned, by the deadline itself).
+    for (const [given, seconds] of [
+      ['010', 10],
+      ['08', 8],
+    ]) {
+      const started = Date.now();
+      const r = runOnce(pool, 'lane', ['true'], { args: ['--wait', given] });
+      const elapsed = Date.now() - started;
+      expect(r.status, given).toBe(75);
+      expect(r.stderr, given).toContain('busy');
+      // It waited the number of seconds it was asked for, not the octal reading of
+      // it, and not none at all.
+      expect(elapsed, `${given} waited ${elapsed}ms`).toBeGreaterThanOrEqual((seconds - 1) * 1000);
+      expect(elapsed, given).toBeLessThan(seconds * 1000 + 6000);
+    }
+    // A ten-digit value is inside the limit the message states, so it is accepted
+    // rather than refused: it is checked by letting the run answer its first busy
+    // line, which says nothing about the usage, and then stopping the wait.
+    const gate = startRun(pool, 'lane', ['true'], { args: ['--wait', '9999999999'] });
+    const busy = watchStderr(gate.child);
+    await until(() => busy().includes('busy'), 20000);
+    expect(busy()).not.toContain('usage');
+    gate.child.kill('SIGTERM');
+    const stopped = await gate.done;
+    expect(stopped.status).toBe(143);
+  }, 90_000);
+
   it('R20 a nested run with --wait still loses: it retries, then exits 75 without starting its command', () => {
     const pool = freshPool();
     seed(pool, 'gate.lock', { owner: 'outer', pid: livePid() });

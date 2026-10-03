@@ -266,5 +266,4 @@ export function childrenMatching(pid, needle) {
 }
 
 /** Is `pgrep` available here? The tests that aim a signal at a grandchild need it. */
-export const HAS_PGREP =
-  spawnSync('pgrep', ['-P', '$$'], { stdio: 'ignore', shell: true }).error === undefined;
+export const HAS_PGREP = spawnSync('pgrep', ['--version'], { stdio: 'ignore' }).error === undefined;

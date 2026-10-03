@@ -316,7 +316,7 @@ product is whatever the defaults happen to be. The exit status is unchanged.
 `--wait`, which needs no state at all:
 
 ```sh
-gate-lock run "$lane" --wait "${GATE_LOCK_WAIT:-600}" -- npm test
+gate-lock run --wait "${GATE_LOCK_WAIT:-600}" "$lane" -- npm test
 ```
 
 **A runner that holds one slot across several steps**, when `run` does not fit:
@@ -359,9 +359,9 @@ pin=$(cat "$out")
 beat=$!
 trap 'kill "$beat" 2>/dev/null; wait "$beat" 2>/dev/null; release_lock; exit 143' TERM INT HUP QUIT
 
-GATE_LOCK_SLOT_PATH=$pin "$GATE_LOCK" verify "$lane" || release_lock
+GATE_LOCK_SLOT_PATH=$pin "$GATE_LOCK" verify "$lane" || { release_lock; exit 1; }
 npm run lint
-GATE_LOCK_SLOT_PATH=$pin "$GATE_LOCK" verify "$lane" || release_lock
+GATE_LOCK_SLOT_PATH=$pin "$GATE_LOCK" verify "$lane" || { release_lock; exit 1; }
 npm run build
 
 kill "$beat" 2>/dev/null; wait "$beat" 2>/dev/null

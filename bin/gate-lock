@@ -2027,6 +2027,7 @@ run_escalator_pid=
 run_cmd_status=0
 run_sup_status=0
 run_acq_status=0
+run_attempts=0
 run_verify_ok=1
 run_removed=0
 run_sig=
@@ -2262,7 +2263,10 @@ run_release_lock() {
   fi
   run_release_done=1
   if [ -z "$run_slot" ]; then
-    if [ "$run_acq_status" -lt 128 ]; then
+    # The fallback is for an acquire child that was killed after winning a name, so
+    # it needs an attempt that really ran: a signal that ended a *wait* never
+    # started one, and there is then nothing of ours to release.
+    if [ "$run_acq_status" -lt 128 ] || [ "$run_attempts" -eq 0 ]; then
       return 0
     fi
     printf 'gate-lock: the acquire was stopped before it recorded the slot; releasing by lane %s and pid %s\n' "$run_lane" "$$" >&2
@@ -2715,9 +2719,14 @@ do_run() {
   # --wait is an operator's slip, not a request to wait for ever.
   if [ "$run_wait_given" = 1 ]; then
     is_digits "$run_wait" || usage_error "--wait must be a whole number of seconds, got '$run_wait'"
-    case $run_wait in
-    ??????????*) usage_error "--wait must be a whole number of seconds (at most 10 digits), got '$run_wait'" ;;
+    # A leading zero is a spelling, not an octal digit: run_wait is used in
+    # arithmetic below, and a shell reads 010 as eight and 08 as an error. The
+    # heartbeat period strips its zeros for the same reason (D5).
+    strip_zeros "$run_wait"
+    case $norm in
+    ???????????*) usage_error "--wait must be a whole number of seconds (at most 10 digits), got '$run_wait'" ;;
     esac
+    run_wait=$norm
   fi
   # D21: the status file is judged before the slot loop, so a refusal takes nothing.
   [ -n "$run_status_file" ] && out_check "$run_status_file" "--status-file"
