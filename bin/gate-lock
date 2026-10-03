@@ -1,0 +1,53 @@
+#!/bin/sh
+# gate-lock: host-wide gate lock (on-disk format 1). Stub: only --format and
+# --version are implemented so far.
+set -u
+LC_ALL=C
+export LC_ALL
+
+# Resolve $0 to an absolute, physical path once (no realpath): follow symlinks
+# (npm's .bin links to this file), then canonicalise the directory with
+# `cd ... && pwd -P`. readlink and dirname exist on GNU, BSD/macOS and busybox.
+self=$0
+case $self in
+*/*) ;;
+*) self=$(command -v -- "$self") || self=$0 ;;
+esac
+hops=0
+while [ -h "$self" ]; do
+  hops=$((hops + 1))
+  if [ "$hops" -gt 40 ]; then
+    echo "gate-lock: too many levels of symbolic links" >&2
+    exit 2
+  fi
+  target=$(readlink -- "$self") || break
+  case $target in
+  /*) self=$target ;;
+  *) self=$(dirname -- "$self")/$target ;;
+  esac
+done
+self_dir=$(CDPATH='' cd -- "$(dirname -- "$self")" && pwd -P) || {
+  echo "gate-lock: cannot resolve the script directory" >&2
+  exit 2
+}
+
+if [ "$#" -eq 1 ]; then
+  case $1 in
+  --format)
+    echo 1
+    exit 0
+    ;;
+  --version)
+    version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*$/\1/p' "$self_dir/../package.json" | head -n 1) || version=
+    if [ -z "$version" ]; then
+      echo "gate-lock: cannot read the package version" >&2
+      exit 2
+    fi
+    echo "$version"
+    exit 0
+    ;;
+  esac
+fi
+
+echo "gate-lock: not implemented yet" >&2
+exit 2
