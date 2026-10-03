@@ -201,19 +201,31 @@ describe('--wait', () => {
     expect(names(pool)).toEqual(['.format']);
   });
 
-  it('Waiting a run that is still busy at the deadline exits 75, and holds the lock for the whole wait', () => {
+  it('Waiting a run that is still busy at the deadline exits 75, and holds the lock for the whole wait', async () => {
     const pool = freshPool();
     seed(pool, 'gate.lock', { owner: 'holder', pid: livePid() });
     const file = out(pool, 'status-wait');
+    const wait = 4;
+    // The clock the tool reads is whole seconds, so a run that starts early in a
+    // second is the case that catches a deadline computed without the rounding
+    // slack. Start it just after a second boundary for that reason.
+    while (Date.now() % 1000 > 150) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     const started = Date.now();
-    const r = runOnce(pool, 'lane', ['true'], { args: ['--wait', '4', '--status-file', file] });
+    const r = runOnce(pool, 'lane', ['true'], {
+      args: ['--wait', String(wait), '--status-file', file],
+    });
     const elapsed = Date.now() - started;
     expect(r.status).toBe(75);
     // The command never started and no lock was taken.
     expect(r.stdout).not.toContain('acquired');
     expect(r.stderr).toContain('busy');
-    // It waited: the deadline is honoured and it did not come back early.
-    expect(elapsed).toBeGreaterThanOrEqual(4000);
+    // Both bounds: never before the deadline, and at most one backoff step (the
+    // longest pause the loop may take) plus the whole second the clock's rounding
+    // is allowed to cost.
+    expect(elapsed).toBeGreaterThanOrEqual(wait * 1000);
+    expect(elapsed).toBeLessThanOrEqual(wait * 1000 + 5000 + 1000);
     expect(fs.readFileSync(file, 'utf8')).toBe('busy:host\n');
     expect(readSlot(pool, 'gate.lock').owner).toBe('holder');
   }, 30_000);

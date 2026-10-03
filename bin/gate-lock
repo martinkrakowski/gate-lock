@@ -2377,9 +2377,8 @@ run_beat_loop() {
   rb_alive=$3
   rb_status=$4
   rb_stop=0
-  rb_seen=0
   rb_tick=0
-  trap 'rb_stop=1; rb_seen=$((rb_seen + 1))' TERM INT HUP QUIT
+  trap 'rb_stop=1' TERM INT HUP QUIT
   trap '{ printf "%s\n" "$?" >"$rb_status"; } 2>/dev/null' EXIT
   while [ "$rb_stop" = 0 ]; do
     rb_tick=$((rb_tick + 1))
@@ -2408,7 +2407,6 @@ run_beat_loop() {
     while [ "$rb_left" -gt 0 ]; do
       rb_tick=$((rb_tick + 1))
       { printf '%s\n' "$rb_tick" >"$rb_alive"; } 2>/dev/null
-      rb_before=$rb_seen
       sleep 1 &
       rb_sleeper=$!
       # Both windows of the stop flag are covered: a signal that arrived before
@@ -2587,7 +2585,11 @@ run_acquire() {
   run_deadline=
   if [ -n "$run_wait" ]; then
     now_s
-    run_deadline=$((now + run_wait))
+    # The clock this reads is whole seconds, so it names the second the run started
+    # in and not the instant: without the extra second a wait can end up to one
+    # second early, and a `--wait` that gives up before its deadline is not a wait.
+    # The extra second is well inside the one backoff step the pause below may add.
+    run_deadline=$((now + run_wait + 1))
   fi
   run_attempts=0
   while :; do
