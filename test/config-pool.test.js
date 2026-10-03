@@ -18,7 +18,7 @@ describe('T70 pool creation and the marker', () => {
       env: buildEnv({ GATE_LOCK_DIR: pool }),
       encoding: 'utf8',
     });
-    expect(r.stderr).toBe('gate-lock: not implemented yet\n');
+    expect(r).toMatchObject({ status: 0, stderr: '' });
     expect(modeOf(pool)).toBe('0700');
     expect(fs.readFileSync(path.join(pool, '.format'), 'utf8')).toBe('1\n');
     expect(listing(pool, { modes: true })).toEqual(['0600 .format']);
@@ -152,7 +152,7 @@ describe('T70 pool creation and the marker', () => {
         startBin(['status'], { env: { GATE_LOCK_DIR: pool } }),
       );
       const results = await Promise.all(runs.map((x) => x.done));
-      for (const r of results) expect(r.stderr).toBe('gate-lock: not implemented yet\n');
+      for (const r of results) expect(r).toMatchObject({ status: 0, stderr: '' });
       expect(listing(pool, { modes: false })).toEqual(['.format']);
       expect(fs.readFileSync(path.join(pool, '.format'), 'utf8')).toBe('1\n');
     }
@@ -675,10 +675,9 @@ describe('D20 test-mode gate', () => {
     const pool = freshPool();
     const r = cfg({ GATE_LOCK_DIR: pool, GATE_LOCK_TEST_UID: '65534' });
     const lines = r.stderr.trimEnd().split('\n');
-    expect(lines).toHaveLength(2);
+    expect(lines).toHaveLength(1);
     expect(lines[0]).toMatch(/^gate-lock: warning: .*GATE_LOCK_TEST_UID.*GATE_LOCK_TEST_MODE=1/);
-    expect(`${lines[1]}\n`).toBe('gate-lock: not implemented yet\n');
-    expect(r.status).toBe(2);
+    expect(r.status).toBe(0);
   });
 
   it('D20 only the value 1 enables test mode', () => {
@@ -691,7 +690,7 @@ describe('D20 test-mode gate', () => {
         GATE_LOCK_TEST_PARENT_UID: '65534',
       });
       expect(r.stderr, `mode ${JSON.stringify(mode)}`).toMatch(/^gate-lock: warning: /);
-      expect(r.stderr).toContain('not implemented yet');
+      expect(r.status).toBe(0);
       expect(fs.readFileSync(path.join(pool, '.format'), 'utf8')).toBe('1\n');
     }
   });

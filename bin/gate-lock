@@ -1,8 +1,8 @@
 #!/bin/sh
-# shellcheck disable=SC2034 # the resolved configuration is read by later subcommands
-# gate-lock: host-wide gate lock (on-disk format 1). So far: configuration,
-# the pool and the .format marker, and `workers`; the lock subcommands are
-# not built yet.
+# shellcheck disable=SC2034 # heartbeat_seconds is read by `run` (GL3)
+# gate-lock: host-wide gate lock (on-disk format 1). Built so far: configuration,
+# the pool and the .format marker, `workers`, and the slot subcommands acquire,
+# heartbeat, verify, release and status. `clean` and `run` are not built yet.
 set -u
 LC_ALL=C
 export LC_ALL
@@ -521,8 +521,840 @@ if [ -n "$project_slots" ] && [ -n "$slot_source" ] && [ "$project_slots" -ne "$
   die "GATE_LOCK_SLOTS=$GATE_LOCK_SLOTS does not match $slot_source, which gives $slot_count slots, for pool $pool; the host's count wins in a pool"
 fi
 
-# The resolved configuration, for the subcommands GL2a builds:
-# $pool $slot_count $stale_seconds $heartbeat_seconds $real_uid.
+# The resolved configuration, read by the subcommands below: $pool $slot_count
+# $stale_seconds $heartbeat_seconds $real_uid $leaf_uid.
 
-echo "gate-lock: not implemented yet" >&2
-exit 2
+# ---------------------------------------------------------------------------
+# Slot helpers
+# ---------------------------------------------------------------------------
+
+base=$pool/gate.lock
+
+# The uid a slot must be owned by (F59a). The pool leaf shares the expected-uid
+# seam (H10), so a test cannot make a slot foreign without making the pool
+# foreign too; GATE_LOCK_TEST_SLOT_UID judges slots alone. Empty is inert.
+slot_uid=$leaf_uid
+seam GATE_LOCK_TEST_SLOT_UID
+[ -z "$seam_value" ] || slot_uid=$seam_value
+is_digits "$slot_uid" || die "GATE_LOCK_TEST_SLOT_UID must be a numeric user id"
+
+fail1() {
+  printf 'gate-lock: %s\n' "$*" >&2
+  exit 1
+}
+
+usage_error() {
+  printf 'gate-lock: %s\nusage: gate-lock acquire <lane> | release <lane> | verify <lane> | heartbeat | status [--json] | clean | run [options] <lane> -- <command...> | workers\n' "$1" >&2
+  exit 2
+}
+
+# now_s: the clock in epoch seconds, as digits, in $now. The test seam
+# GATE_LOCK_TEST_NOW fixes it, so the threshold boundary can be hit exactly.
+now_s() {
+  seam GATE_LOCK_TEST_NOW
+  if [ -n "$seam_value" ]; then
+    now=$seam_value
+  else
+    now=$(date +%s 2>/dev/null) || now=
+  fi
+  is_digits "$now" || die "cannot read the clock (date +%s gave '$now')"
+}
+
+# pause_at SEAM (H1-H8, D20): in test mode, when the seam names a file, create
+# it, then wait (whole seconds, L10) for as long as it exists.
+pause_at() {
+  seam "$1"
+  [ -n "$seam_value" ] || return 0
+  : >"$seam_value" 2>/dev/null
+  while [ -e "$seam_value" ]; do
+    sleep 1
+  done
+}
+
+# rdf FILE: the first line of a regular file (not a symlink), without its
+# newline, in $rd; empty on any failure.
+rdf() {
+  rd=
+  if [ -f "$1" ] && [ ! -h "$1" ]; then
+    IFS= read -r rd <"$1" 2>/dev/null || :
+  fi
+}
+
+# pid_alive PID (F41, D3): signal zero on a digits-only, non-zero pid of at most
+# ten digits. Any failure, EPERM included, is "not alive".
+pid_alive() {
+  is_digits "$1" || return 1
+  case $1 in
+  ???????????*) return 1 ;;
+  esac
+  strip_zeros "$1"
+  [ "$norm" != 0 ] || return 1
+  kill -0 "$norm" 2>/dev/null
+}
+
+# pid_eq A B: both are pids and equal once leading zeros are a spelling.
+pid_eq() {
+  is_digits "$1" && is_digits "$2" || return 1
+  strip_zeros "$1"
+  pe_a=$norm
+  strip_zeros "$2"
+  [ "$pe_a" = "$norm" ]
+}
+
+# judge_beat BEAT (F35, F37, D4, D5): needs $now. Sets $beat_state (fresh, stale,
+# missing or future), $beat_fresh (1 for fresh and future) and $beat_delta
+# (seconds in the future, for a future beat of at most ten digits).
+judge_beat() {
+  beat_state=stale
+  beat_fresh=0
+  beat_delta=
+  if [ -z "$1" ]; then
+    beat_state=missing
+    return 0
+  fi
+  is_digits "$1" || return 0
+  case $1 in
+  ???????????*)
+    # More than ten digits: far in the future, never stale (D5).
+    beat_state=future
+    beat_fresh=1
+    return 0
+    ;;
+  esac
+  strip_zeros "$1"
+  if [ "$norm" -gt "$now" ]; then
+    beat_state=future
+    beat_fresh=1
+    beat_delta=$((norm - now))
+  elif [ "$((now - norm))" -ge "$stale_seconds" ]; then
+    beat_state=stale
+  else
+    beat_state=fresh
+    beat_fresh=1
+  fi
+}
+
+# slot_path N: sets $sp to the path of slot N (F18).
+slot_path() {
+  if [ "$1" -eq 0 ]; then
+    sp=$base
+  else
+    sp=$base.$1
+  fi
+}
+
+# canonical_slot PATH (F19, F57): the slot name, or the slot name plus a dot and
+# one or two digits with no leading zero, below 64. The spelling is judged as
+# given: a trailing slash or a ./.. component is never normalised away.
+canonical_slot() {
+  case $1 in
+  "$base") return 0 ;;
+  "$base".*) cs_n=${1#"$base".} ;;
+  *) return 1 ;;
+  esac
+  case $cs_n in
+  [1-9]) return 0 ;;
+  [1-9][0-9]) [ "$cs_n" -lt 64 ] ;;
+  *) return 1 ;;
+  esac
+}
+
+# slot_valid PATH (F57-F59a): the canonical and provenance filters, in order:
+# canonical name, not a symlink (first, and on its own, because an owner query
+# on a link reports the link's own owner), a directory, owned by the expected uid.
+slot_valid() {
+  canonical_slot "$1" || return 1
+  [ ! -h "$1" ] || return 1
+  [ -d "$1" ] || return 1
+  owned_by "$1" "$slot_uid"
+}
+
+# read_slot DIR: the slot's files in $s_owner $s_pid $s_started $s_beat
+# $s_worktree $s_project (empty on any read failure).
+read_slot() {
+  rdf "$1/owner"
+  s_owner=$rd
+  rdf "$1/pid"
+  s_pid=$rd
+  rdf "$1/started"
+  s_started=$rd
+  rdf "$1/beat"
+  s_beat=$rd
+  rdf "$1/worktree"
+  s_worktree=$rd
+  rdf "$1/project"
+  s_project=$rd
+}
+
+# need_caller WHAT: GATE_LOCK_CALLER_PID is required (C6) and must be a pid of
+# at most ten digits (D5). Sets $caller without leading zeros.
+need_caller() {
+  caller_raw=${GATE_LOCK_CALLER_PID:-}
+  if [ -z "$caller_raw" ]; then
+    if [ "$1" = acquire ]; then
+      die "acquire needs GATE_LOCK_CALLER_PID, the pid of the long-lived process the lock is for; a bare acquire would record this short-lived process and the lock would be reclaimable at once; use 'gate-lock run <lane> -- <command>' instead"
+    fi
+    die "$1 needs GATE_LOCK_CALLER_PID, the pid that holds the lock"
+  fi
+  is_digits "$caller_raw" || die "GATE_LOCK_CALLER_PID must be a process id (digits, at most 10), got '$caller_raw'"
+  case $caller_raw in
+  ???????????*) die "GATE_LOCK_CALLER_PID must be a process id (digits, at most 10), got '$caller_raw'" ;;
+  esac
+  strip_zeros "$caller_raw"
+  caller=$norm
+}
+
+# resolve_pin (F62-F65): GATE_LOCK_SLOT_PATH is a claim from the environment.
+# Sets $pin (empty when there is none). A bad pin is exit 2, never exit 1 (F65).
+resolve_pin() {
+  pin=${GATE_LOCK_SLOT_PATH:-}
+  [ -n "$pin" ] || return 0
+  canonical_slot "$pin" ||
+    die "GATE_LOCK_SLOT_PATH=$pin is not a slot on this host (the pool here is $pool); no action was taken"
+  if [ -e "$pin" ] || [ -h "$pin" ]; then
+    slot_valid "$pin" ||
+      die "GATE_LOCK_SLOT_PATH=$pin is not a valid slot (a symlink, not a directory, or not owned by uid $slot_uid); it was left alone"
+  fi
+}
+
+# find_slot MODE: the slot the caller means. Sets $target. A pin wins; without
+# one, the first filtered slot (slots 0..63, never a glob) whose pid equals the
+# caller's (MODE pid) or whose owner and pid both match $lane (MODE owner). With
+# no match $target is empty.
+find_slot() {
+  target=
+  if [ -n "$pin" ]; then
+    target=$pin
+    return 0
+  fi
+  fs_n=0
+  while [ "$fs_n" -lt 64 ]; do
+    slot_path "$fs_n"
+    if slot_valid "$sp"; then
+      rdf "$sp/pid"
+      if pid_eq "$rd" "$caller"; then
+        if [ "$1" = pid ]; then
+          target=$sp
+          return 0
+        fi
+        rdf "$sp/owner"
+        if [ "$rd" = "$lane" ]; then
+          target=$sp
+          return 0
+        fi
+      fi
+    fi
+    fs_n=$((fs_n + 1))
+  done
+}
+
+# take_aside SLOT TAG (D12): rename SLOT to a free aside name, SLOT.reclaim.<own
+# pid>.<TAG> (a numeric suffix is added while the name is taken), and detect
+# nesting. Sets $aside. Returns 0 when the slot is now at $aside, 1 when the
+# rename failed, 2 when the rename nested the slot inside something that already
+# existed at the aside name (it is moved back when the name is free, never
+# deleted; a message is printed).
+take_aside() {
+  ta_slot=$1
+  ta_base=${ta_slot##*/}
+  ta_k=0
+  while :; do
+    if [ "$ta_k" -eq 0 ]; then
+      aside=$ta_slot.reclaim.$$.$2
+    else
+      aside=$ta_slot.reclaim.$$.$2.$ta_k
+    fi
+    if [ ! -e "$aside" ] && [ ! -h "$aside" ]; then
+      break
+    fi
+    ta_k=$((ta_k + 1))
+    [ "$ta_k" -le 99 ] || return 1
+  done
+  pause_at GATE_LOCK_TEST_PAUSE_BEFORE_ASIDE
+  mv "$ta_slot" "$aside" 2>/dev/null || return 1
+  # mv onto an existing directory moves the source inside it and exits 0 (D11).
+  if [ -d "$aside/$ta_base" ]; then
+    if [ ! -e "$ta_slot" ] && [ ! -h "$ta_slot" ] && mv "$aside/$ta_base" "$ta_slot" 2>/dev/null; then
+      printf 'gate-lock: reclaim aborted: %s was moved inside %s, which already existed; the slot was restored\n' "$ta_slot" "$aside" >&2
+    else
+      printf 'gate-lock: reclaim aborted: %s was moved inside %s, which already existed; the moved copy is at %s/%s and is never deleted\n' "$ta_slot" "$aside" "$aside" "$ta_base" >&2
+    fi
+    return 2
+  fi
+  return 0
+}
+
+# put_back ASIDE SLOT: rename what was moved aside back to its name when the
+# name is free (return 0); otherwise leave it and say so (return 1). Never
+# deletes. A tiny window remains between the free-name test and the rename.
+put_back() {
+  pause_at GATE_LOCK_TEST_PAUSE_BEFORE_RESTORE
+  if [ ! -e "$2" ] && [ ! -h "$2" ] && mv "$1" "$2" 2>/dev/null; then
+    printf 'gate-lock: reclaim aborted: %s held a different slot than the one judged; it was restored\n' "$2" >&2
+    return 0
+  fi
+  printf 'gate-lock: reclaim aborted: %s held a different slot than the one judged; the moved copy was left at %s and is never deleted\n' "$2" "$1" >&2
+  return 1
+}
+
+# remove_if_ours SLOT OWNER PID (D12, F60): remove SLOT only if it still names
+# OWNER and PID, by renaming it aside first, verifying what moved, and then
+# deleting the aside. A different slot is put back. Returns 0 removed, 1 the
+# slot is not ours (nothing deleted; $found_owner and $found_pid are set), 2 it
+# could not be removed (it was put back when the name was free), 4 it was
+# already gone. put_back's own messages go to stderr: that is where a release
+# that left a copy aside must say so.
+remove_if_ours() {
+  ri_slot=$1
+  if [ ! -e "$ri_slot" ] && [ ! -h "$ri_slot" ]; then
+    return 4
+  fi
+  take_aside "$ri_slot" rel
+  ri_rc=$?
+  if [ "$ri_rc" -eq 2 ]; then
+    return 2
+  fi
+  if [ "$ri_rc" -ne 0 ]; then
+    if [ ! -e "$ri_slot" ] && [ ! -h "$ri_slot" ]; then
+      return 4
+    fi
+    return 2
+  fi
+  rdf "$aside/owner"
+  found_owner=$rd
+  rdf "$aside/pid"
+  found_pid=$rd
+  if [ "$found_owner" != "$2" ] || ! pid_eq "$found_pid" "$3"; then
+    put_back "$aside" "$ri_slot" || :
+    return 1
+  fi
+  # GL2b hook point: H7 (before-release), after the owner and pid check.
+  rm -rf "$aside" 2>/dev/null
+  if [ -e "$aside" ] || [ -h "$aside" ]; then
+    put_back "$aside" "$ri_slot" || :
+    return 2
+  fi
+  return 0
+}
+
+# json_str VALUE: a JSON string. Bytes outside printable ASCII become "?" (a
+# lossy but always valid encoding); backslash and double quote are escaped.
+json_str() {
+  printf '"%s"' "$(printf '%s' "$1" | tr -c ' -~' '?' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+# ---------------------------------------------------------------------------
+# acquire (C6-C12, F43-F67)
+# ---------------------------------------------------------------------------
+
+# resolve_identity (F28, F55): the git top-level of the working directory, else
+# the physical working directory; empty is refused.
+resolve_identity() {
+  pause_at GATE_LOCK_TEST_PAUSE_BEFORE_IDENTITY
+  wt=
+  if CDPATH='' cd -- . 2>/dev/null; then
+    wt=$(pwd -P 2>/dev/null) || wt=
+  fi
+  if [ -n "$wt" ] && command -v git >/dev/null 2>&1; then
+    top=$( (
+      unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+      git rev-parse --show-toplevel
+    ) 2>/dev/null) || top=
+    [ -z "$top" ] || wt=$top
+  fi
+  [ -n "$wt" ] ||
+    die "cannot determine the caller's worktree (the working directory is unreadable or was removed); no lock was taken"
+}
+
+# slot_out_check (D21): GATE_LOCK_SLOT_OUT is judged before the slot loop, so a
+# refusal takes nothing. Sets $out (empty: none), $out_mode (inplace or rename)
+# and, for rename, $out_final.
+out=
+out_mode=
+out_final=
+slot_out_check() {
+  out=${GATE_LOCK_SLOT_OUT:-}
+  [ -n "$out" ] || return 0
+  if [ -h "$out" ]; then
+    die "GATE_LOCK_SLOT_OUT=$out is a symlink; name a regular file you own or a new path; no lock was taken"
+  fi
+  if [ -e "$out" ]; then
+    if [ -f "$out" ] && owned_by "$out" "$real_uid"; then
+      out_mode=inplace
+      return 0
+    fi
+    die "GATE_LOCK_SLOT_OUT=$out exists but is not a regular file owned by uid $real_uid; no lock was taken"
+  fi
+  case $out in
+  */) die "GATE_LOCK_SLOT_OUT=$out ends with a slash; name a file; no lock was taken" ;;
+  esac
+  case $out in
+  */*) so_dir=${out%/*} ;;
+  *) so_dir=. ;;
+  esac
+  [ -n "$so_dir" ] || so_dir=/
+  so_phys=$(CDPATH='' cd -- "$so_dir" 2>/dev/null && pwd -P) ||
+    die "GATE_LOCK_SLOT_OUT=$out: the directory $so_dir does not exist; no lock was taken"
+  if ! owned_by "$so_phys" "$real_uid" || ! not_group_other_writable "$so_phys"; then
+    die "GATE_LOCK_SLOT_OUT=$out: its directory $so_phys must be owned by uid $real_uid and not writable by group or others; no lock was taken"
+  fi
+  if [ "$so_phys" = / ]; then
+    out_final=/${out##*/}
+  else
+    out_final=$so_phys/${out##*/}
+  fi
+  out_mode=rename
+}
+
+# write_slot_out SLOT: record the slot path (C9). Returns 1 on failure.
+write_slot_out() {
+  [ -n "$out" ] || return 0
+  case $out_mode in
+  inplace)
+    # Keep the caller's inode; re-check immediately before writing.
+    [ ! -h "$out" ] && [ -f "$out" ] || return 1
+    printf '%s\n' "$1" >"$out" 2>/dev/null
+    ;;
+  rename)
+    wo_tmp=$out_final.tmp.$$
+    rm -f "$wo_tmp" 2>/dev/null
+    (
+      set -C
+      printf '%s\n' "$1" >"$wo_tmp"
+    ) 2>/dev/null || return 1
+    chmod 0600 "$wo_tmp" 2>/dev/null
+    if [ -d "$out_final" ] || ! mv -f "$wo_tmp" "$out_final" 2>/dev/null; then
+      rm -f "$wo_tmp" 2>/dev/null
+      return 1
+    fi
+    ;;
+  esac
+}
+
+# self_held_check (F67): a caller pid that already holds an answering slot, in
+# any filtered slot (beyond the configured count too), is refused (exit 2).
+self_held_check() {
+  sh_n=0
+  while [ "$sh_n" -lt 64 ]; do
+    slot_path "$sh_n"
+    if slot_valid "$sp"; then
+      rdf "$sp/pid"
+      if pid_eq "$rd" "$caller" && pid_alive "$rd"; then
+        rdf "$sp/beat"
+        now_s
+        judge_beat "$rd"
+        if [ "$beat_fresh" = 1 ]; then
+          die "pid $caller already holds $sp; a holder that takes a second slot leaves the first with nothing refreshing it"
+        fi
+      fi
+    fi
+    sh_n=$((sh_n + 1))
+  done
+}
+
+# remember_holder OWNER PID BEAT SLOT: keep the first holder seen, for the busy
+# line (F54).
+h_owner=
+h_pid=
+h_beat=
+h_slot=
+remember_holder() {
+  [ -z "$h_slot" ] || return 0
+  h_owner=$1
+  h_pid=$2
+  h_beat=$3
+  h_slot=$4
+}
+
+# put_file NAME VALUE: one line into the candidate, mode 0600 (D23).
+put_file() {
+  printf '%s\n' "$2" >"$cs_cand/$1" 2>/dev/null && chmod 0600 "$cs_cand/$1" 2>/dev/null
+}
+
+# create_slot SLOT (F31-F32, R1, R2): fill a candidate with the six files, rename
+# it onto the slot name, detect nesting, read back. Returns 0 when the name was
+# won, 1 when not.
+create_slot() {
+  cs_slot=$1
+  cs_cand=$cs_slot.cand.$$
+  # A leftover of a dead process that had our pid (a pid-recycle race); ours now.
+  rm -rf "$cs_cand" 2>/dev/null
+  mkdir -m 0700 "$cs_cand" 2>/dev/null || return 1
+  now_s
+  if ! {
+    put_file owner "$lane" && put_file pid "$caller" && put_file started "$now" &&
+      put_file beat "$now" && put_file worktree "$wt" && put_file project "${wt##*/}"
+  }; then
+    rm -rf "$cs_cand" 2>/dev/null
+    return 1
+  fi
+  pause_at GATE_LOCK_TEST_PAUSE_BEFORE_CREATE_RENAME
+  if ! mv "$cs_cand" "$cs_slot" 2>/dev/null; then
+    rm -rf "$cs_cand" 2>/dev/null
+    return 1
+  fi
+  # mv onto an existing directory nests the candidate inside it and exits 0: it
+  # must be taken out again, and the name was not won (R2).
+  if [ -d "$cs_slot/${cs_cand##*/}" ]; then
+    rm -rf "${cs_slot:?}/${cs_cand##*/}" 2>/dev/null
+    return 1
+  fi
+  # F32: the pid at the final name must be ours.
+  rdf "$cs_slot/pid"
+  [ "$rd" = "$caller" ]
+}
+
+# acquire_one SLOT (F43-F51, F53): work one slot through its passes. Returns 0
+# when the slot was won, 1 when it is unavailable (held, or contended).
+acquire_one() {
+  ao_slot=$1
+  ao_pass=1
+  while :; do
+    # F43: every pass begins with an attempt to create.
+    if create_slot "$ao_slot"; then
+      return 0
+    fi
+    if ! slot_valid "$ao_slot"; then
+      if [ -e "$ao_slot" ] || [ -h "$ao_slot" ]; then
+        # Something is at the name that is not a real slot (a symlink, a file,
+        # a foreign directory): never reclaimed, never removed.
+        remember_holder unknown none none "$ao_slot"
+        return 1
+      fi
+      # Nothing is there: the name was released in the meantime, or the
+      # candidate could not be written. A bounded number of tries.
+      if [ "$ao_pass" -ge 5 ]; then
+        remember_holder unknown none none "$ao_slot"
+        return 1
+      fi
+      ao_pass=$((ao_pass + 1))
+      continue
+    fi
+    # F44: inspect.
+    read_slot "$ao_slot"
+    j_owner=$s_owner
+    j_pid=$s_pid
+    j_beat=$s_beat
+    now_s
+    j_alive=0
+    pid_alive "$j_pid" && j_alive=1
+    judge_beat "$j_beat"
+    # F45: bounded patience for a partial or abandoned slot.
+    if [ "$ao_pass" -lt 3 ]; then
+      if { [ -z "$j_pid" ] && [ -z "$j_beat" ]; } || { [ "$j_alive" = 1 ] && [ -z "$j_beat" ]; }; then
+        sleep 1
+        ao_pass=$((ao_pass + 1))
+        continue
+      fi
+    fi
+    # F46: busy.
+    if [ "$j_alive" = 1 ] && [ "$beat_fresh" = 1 ]; then
+      remember_holder "${j_owner:-unknown}" "$j_pid" "$j_beat" "$ao_slot"
+      return 1
+    fi
+    # F47: five passes without winning the name: someone else is reclaiming it.
+    if [ "$ao_pass" -ge 5 ]; then
+      remember_holder "${j_owner:-unknown}" "${j_pid:-none}" "${j_beat:-none}" "$ao_slot"
+      return 1
+    fi
+    # F48: announce, before moving anything.
+    if [ "$j_alive" = 0 ]; then
+      printf 'gate-lock: reclaiming %s: holder %s pid %s is not alive\n' "$ao_slot" "${j_owner:-unknown}" "${j_pid:-none}"
+    else
+      printf 'gate-lock: reclaiming %s: holder %s pid %s heartbeat is stale or missing (beat %s, threshold %ss)\n' "$ao_slot" "${j_owner:-unknown}" "$j_pid" "${j_beat:-missing}" "$stale_seconds"
+    fi
+    pause_at GATE_LOCK_TEST_PAUSE_AFTER_INSPECT
+    # F49: rename aside (D12: a free aside name, nesting detected).
+    take_aside "$ao_slot" "$ao_pass"
+    ao_rc=$?
+    if [ "$ao_rc" -eq 0 ]; then
+      # F50: verify what moved against what was judged.
+      rdf "$aside/owner"
+      v_owner=$rd
+      rdf "$aside/pid"
+      v_pid=$rd
+      rdf "$aside/beat"
+      v_beat=$rd
+      if [ "$v_owner" = "$j_owner" ] && [ "$v_pid" = "$j_pid" ] && [ "$v_beat" = "$j_beat" ]; then
+        rm -rf "$aside" 2>/dev/null
+      else
+        # F51: a different slot moved; it was never judged and is never deleted.
+        put_back "$aside" "$ao_slot" || :
+      fi
+    fi
+    ao_pass=$((ao_pass + 1))
+  done
+}
+
+do_acquire() {
+  lane=$1
+  need_caller acquire
+  self_held_check
+  resolve_identity
+  slot_out_check
+  # GL2b hooks: the janitor (D16) runs here, and the lane label is validated
+  # (D14) before this point.
+  n=0
+  while [ "$n" -lt "$slot_count" ]; do
+    slot_path "$n"
+    if acquire_one "$sp"; then
+      # GL2b hooks: the same-worktree scan (F56) runs here, with the F60
+      # give-back and the H5 pause; both come before anything is printed.
+      printf 'gate-lock: acquired by %s pid %s at %s\n' "$lane" "$caller" "$sp"
+      if ! write_slot_out "$sp"; then
+        remove_if_ours "$sp" "$lane" "$caller" || :
+        die "the slot path cannot be recorded in GATE_LOCK_SLOT_OUT=$out; the lock was given back"
+      fi
+      exit 0
+    fi
+    n=$((n + 1))
+  done
+  # F54: every slot is busy.
+  printf 'gate-lock: busy: %s is held by %s (pid %s, beat %s); sleep and retry, and never remove the lock by hand\n' "$h_slot" "$h_owner" "$h_pid" "$h_beat" >&2
+  exit 75
+}
+
+# ---------------------------------------------------------------------------
+# heartbeat (C21-C24), verify (C18-C20), release (C13-C17)
+# ---------------------------------------------------------------------------
+
+do_heartbeat() {
+  need_caller heartbeat
+  resolve_pin
+  lane=
+  find_slot pid
+  if [ -z "$target" ]; then
+    slot_path 0
+    if slot_valid "$sp"; then
+      target=$sp
+    else
+      fail1 "heartbeat: no lock for pid $caller at $sp; nothing to refresh"
+    fi
+  fi
+  if [ ! -e "$target" ]; then
+    fail1 "heartbeat: no lock for pid $caller at $target; nothing to refresh"
+  fi
+  rdf "$target/pid"
+  pid_eq "$rd" "$caller" ||
+    fail1 "heartbeat refused: $target is held by pid ${rd:-none}, not pid $caller"
+  now_s
+  hb_stage=$target.beatnew.$$
+  rm -f "$hb_stage" 2>/dev/null
+  # Staged beside the slot, never under $TMPDIR (F39): a rename across
+  # filesystems is copy-then-delete and the beat would be briefly absent.
+  if ! (
+    set -C
+    printf '%s\n' "$now" >"$hb_stage"
+  ) 2>/dev/null; then
+    rm -f "$hb_stage" 2>/dev/null
+    fail1 "heartbeat: cannot write the staged beat $hb_stage"
+  fi
+  chmod 0600 "$hb_stage" 2>/dev/null
+  pause_at GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME
+  if [ -d "$target/beat" ] || ! mv -f "$hb_stage" "$target/beat" 2>/dev/null; then
+    rm -f "$hb_stage" 2>/dev/null
+    fail1 "heartbeat: cannot replace the beat in $target (the lock may be gone)"
+  fi
+  exit 0
+}
+
+do_verify() {
+  lane=$1
+  need_caller verify
+  resolve_pin
+  find_slot owner
+  if [ -z "$target" ]; then
+    slot_path 0
+    if slot_valid "$sp"; then
+      target=$sp
+    else
+      fail1 "verify: no lock at $sp"
+    fi
+  fi
+  [ -e "$target" ] || fail1 "verify: no lock at $target"
+  rdf "$target/owner"
+  v_found_owner=$rd
+  rdf "$target/pid"
+  if [ "$v_found_owner" = "$lane" ] && pid_eq "$rd" "$caller"; then
+    exit 0
+  fi
+  fail1 "verify failed: $target is held by ${v_found_owner:-unknown} (pid ${rd:-none}), not $lane (pid $caller)"
+}
+
+do_release() {
+  lane=$1
+  need_caller release
+  resolve_pin
+  find_slot owner
+  if [ -z "$target" ]; then
+    # D7: a caller that holds nothing has nothing to release.
+    slot_path 0
+    printf 'gate-lock: nothing to release (%s)\n' "$sp"
+    exit 0
+  fi
+  if [ ! -e "$target" ]; then
+    printf 'gate-lock: nothing to release (%s)\n' "$target"
+    exit 0
+  fi
+  rdf "$target/owner"
+  r_owner=$rd
+  rdf "$target/pid"
+  r_pid=$rd
+  if [ "$r_owner" != "$lane" ] || ! pid_eq "$r_pid" "$caller"; then
+    fail1 "release refused: $target is held by ${r_owner:-unknown} (pid ${r_pid:-none}), not $lane (pid $caller); it was left alone"
+  fi
+  remove_if_ours "$target" "$lane" "$caller"
+  case $? in
+  0)
+    printf 'gate-lock: released by %s (%s)\n' "$lane" "$target"
+    exit 0
+    ;;
+  1) fail1 "release refused: $target changed hands before it could be removed (now held by ${found_owner:-unknown}, pid ${found_pid:-none}); it was left alone" ;;
+  4)
+    printf 'gate-lock: nothing to release (%s)\n' "$target"
+    exit 0
+    ;;
+  *) fail1 "release failed: $target could not be removed; the slot remains" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# status (C25-C27, D19)
+#
+# Text: one line per existing slot, or one `free:` line, then a capacity line
+# `slots: <live>/<N> live, <stale> stale, pool <path>, format 1`. live counts
+# slots whose pid is alive and whose beat is fresh; stale counts the rest; N is
+# the configured slot count. Slots beyond N are listed and counted.
+#
+# JSON (`status --json`, schema version 1), one object:
+#   { "version": 1, "format": 1, "pool": <string>, "slotCount": <number>,
+#     "live": <number>, "stale": <number>,
+#     "slots": [ { "path", "name", "owner", "project", "worktree", "started",
+#                  "pid", "beat",
+#                  "pidAlive": <bool>,
+#                  "beatState": "fresh" | "stale" | "missing" | "future",
+#                  "live": <bool> } ] }
+# Strings carry the raw file text (first line); bytes outside printable ASCII
+# become "?". owner, project, worktree, started, pid and beat are null when the
+# file is absent or empty. Slots are listed in slot order.
+# ---------------------------------------------------------------------------
+
+# st_line: append the text line for the slot in $sp (state in $s_*).
+st_line() {
+  if [ "$st_alive" = 1 ]; then
+    st_pid="pid $s_pid alive"
+  else
+    st_pid="pid ${s_pid:-none} not alive"
+  fi
+  case $beat_state in
+  fresh) st_beat="heartbeat fresh (beat $s_beat)" ;;
+  future)
+    if [ -z "$beat_delta" ]; then
+      st_beat="heartbeat fresh (beat $s_beat, in the future)"
+    elif [ "$beat_delta" -gt 600 ]; then
+      st_beat="heartbeat fresh (beat $s_beat, ${beat_delta}s in the future)"
+    else
+      st_beat="heartbeat fresh (beat $s_beat)"
+    fi
+    ;;
+  missing) st_beat="heartbeat missing (threshold ${stale_seconds}s)" ;;
+  *) st_beat="heartbeat stale (beat $s_beat, threshold ${stale_seconds}s)" ;;
+  esac
+  st_lines="$st_lines$sp held by ${s_owner:-unknown} project ${s_project:-unknown} started ${s_started:-?} $st_pid, $st_beat
+"
+}
+
+# st_json_field VALUE: a JSON string, or null when empty.
+st_json_field() {
+  if [ -z "$1" ]; then
+    printf 'null'
+  else
+    json_str "$1"
+  fi
+}
+
+# st_json_entry: append the JSON object for the slot in $sp.
+st_json_entry() {
+  [ -z "$st_entries" ] || st_entries="$st_entries,"
+  if [ "$st_alive" = 1 ]; then st_a=true; else st_a=false; fi
+  if [ "$st_isl" = 1 ]; then st_l=true; else st_l=false; fi
+  st_entries="$st_entries{\"path\":$(json_str "$sp"),\"name\":$(json_str "${sp##*/}"),\"owner\":$(st_json_field "$s_owner"),\"project\":$(st_json_field "$s_project"),\"worktree\":$(st_json_field "$s_worktree"),\"started\":$(st_json_field "$s_started"),\"pid\":$(st_json_field "$s_pid"),\"beat\":$(st_json_field "$s_beat"),\"pidAlive\":$st_a,\"beatState\":\"$beat_state\",\"live\":$st_l}"
+}
+
+do_status() {
+  st_json=$1
+  st_live=0
+  st_count=0
+  st_entries=
+  st_lines=
+  n=0
+  while [ "$n" -lt 64 ]; do
+    slot_path "$n"
+    if slot_valid "$sp"; then
+      read_slot "$sp"
+      now_s
+      st_alive=0
+      pid_alive "$s_pid" && st_alive=1
+      judge_beat "$s_beat"
+      st_isl=0
+      if [ "$st_alive" = 1 ] && [ "$beat_fresh" = 1 ]; then
+        st_isl=1
+        st_live=$((st_live + 1))
+      fi
+      st_count=$((st_count + 1))
+      if [ "$st_json" = 1 ]; then
+        st_json_entry
+      else
+        st_line
+      fi
+    fi
+    n=$((n + 1))
+  done
+  st_stale=$((st_count - st_live))
+  if [ "$st_json" = 1 ]; then
+    printf '{"version":1,"format":1,"pool":%s,"slotCount":%s,"live":%s,"stale":%s,"slots":[%s]}\n' "$(json_str "$pool")" "$slot_count" "$st_live" "$st_stale" "$st_entries"
+  else
+    if [ "$st_count" -eq 0 ]; then
+      printf 'free: %s is not held\n' "$base"
+    else
+      printf '%s' "$st_lines"
+    fi
+    printf 'slots: %s/%s live, %s stale, pool %s, format 1\n' "$st_live" "$slot_count" "$st_stale" "$pool"
+  fi
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch (C2): usage errors come after configuration (C1, D9).
+# ---------------------------------------------------------------------------
+
+case ${1:-} in
+acquire | release | verify)
+  [ "$#" -eq 2 ] && [ -n "$2" ] || usage_error "$1 needs exactly one argument, the lane"
+  case $1 in
+  acquire) do_acquire "$2" ;;
+  release) do_release "$2" ;;
+  verify) do_verify "$2" ;;
+  esac
+  ;;
+heartbeat)
+  [ "$#" -eq 1 ] || usage_error "heartbeat takes no arguments"
+  do_heartbeat
+  ;;
+status)
+  case $# in
+  1) do_status 0 ;;
+  2)
+    [ "$2" = --json ] || usage_error "status takes no arguments but --json"
+    do_status 1
+    ;;
+  *) usage_error "status takes no arguments but --json" ;;
+  esac
+  ;;
+clean | run)
+  echo "gate-lock: not implemented yet" >&2
+  exit 2
+  ;;
+'') usage_error "no subcommand" ;;
+*) usage_error "unknown subcommand '$1'" ;;
+esac
