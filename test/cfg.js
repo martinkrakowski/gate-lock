@@ -3,9 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { freshPool, runBin, scratchOf } from './harness.js';
 
-/** What `run` still prints once configuration has resolved (GL3 replaces it). */
-export const NOT_IMPL = 'gate-lock: not implemented yet\n';
-
 export const UID = process.getuid();
 
 /** Seams are honoured only in test mode (D20). Spread this into env to enable them. */
@@ -19,23 +16,26 @@ export function cfg(env = {}, args = ['status']) {
 }
 
 // The pool of the latest cfg() call, so accepted() can prove the tool really did
-// its work: a stub that only exits 2 with "not implemented yet" must not pass.
+// its work: a run that took no slot must not pass.
 let lastPool;
 
 /**
  * Configuration was accepted: the subcommand then ran (`status` exits 0 with
- * nothing on stderr, `clean` exits 0 silently), or was refused on its own
- * terms (a usage error, the missing caller pid), or is not built yet (`run`);
- * and, for an explicit pool, the pool now holds its .format marker.
+ * nothing on stderr, `clean` exits 0 silently, `run` either holds a slot and
+ * says so on stdout, or is refused on its own terms - a usage error, the missing
+ * caller pid, a busy host); and, for an explicit pool, the pool now holds its
+ * .format marker.
  */
 export function accepted(r) {
   const said =
-    (r.status === 0 && r.stderr === '' && (r.stdout === '' || /^(free|\/)/.test(r.stdout))) ||
+    (r.status === 0 &&
+      r.stderr === '' &&
+      (r.stdout === '' || /^(free|\/|gate-lock: )/.test(r.stdout) || /^slots: /.test(r.stdout))) ||
     (r.status === 2 &&
       r.stdout === '' &&
-      (r.stderr === NOT_IMPL ||
-        /^gate-lock: [^\n]*\nusage: /.test(r.stderr) ||
-        /^gate-lock: [^\n]*GATE_LOCK_CALLER_PID[^\n]*\n$/.test(r.stderr)));
+      (/^gate-lock: [^\n]*\nusage: /.test(r.stderr) ||
+        /^gate-lock: [^\n]*GATE_LOCK_CALLER_PID[^\n]*\n$/.test(r.stderr))) ||
+    (r.status === 75 && r.stdout === '' && /^gate-lock: [^\n]*busy[^\n]*\n$/.test(r.stderr));
   if (!said || lastPool === undefined) return said;
   return fs.existsSync(path.join(lastPool, '.format'));
 }
@@ -45,7 +45,6 @@ export function refusal(r, ...needles) {
   expect2(r.status === 2, `exit ${r.status}, stderr ${JSON.stringify(r.stderr)}`);
   expect2(r.stdout === '', `stdout ${JSON.stringify(r.stdout)}`);
   expect2(/^gate-lock: [^\n]*\n$/.test(r.stderr), `stderr ${JSON.stringify(r.stderr)}`);
-  expect2(r.stderr !== NOT_IMPL, 'configuration was accepted');
   expect2(!/\nusage: /.test(r.stderr), 'configuration was accepted (usage error)');
   for (const n of needles) {
     expect2(r.stderr.includes(n), `stderr ${JSON.stringify(r.stderr)} lacks ${JSON.stringify(n)}`);

@@ -31,10 +31,12 @@ describe('bin/gate-lock preamble and dispatch', () => {
     }
   });
 
-  it('run is not implemented yet (exit 2) and clean runs the janitor', () => {
+  it('run holds a slot around one command and clean runs the janitor', () => {
     const pool = freshPool();
     const r = runBin(['run', 'x', '--', 'true'], { env: { GATE_LOCK_DIR: pool } });
-    expect(r).toMatchObject({ status: 2, stderr: 'gate-lock: not implemented yet\n' });
+    expect(r).toMatchObject({ status: 0, stderr: '' });
+    expect(r.stdout).toContain('acquired by x');
+    expect(r.stdout).toContain('released by x');
     // clean is built (D16): it runs the pass and says nothing when there is
     // nothing to remove.
     const c = runBin(['clean'], { env: { GATE_LOCK_DIR: pool } });

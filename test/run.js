@@ -1,0 +1,231 @@
+// Helpers shared by the run tests (GL3). Not a test file.
+//
+// Nothing here synchronises with a sleep: a wrapped command announces itself by
+// touching a file and then blocks reading a fifo, so the test decides the
+// instant it ends; signals are sent to the process the harness started, and
+// every wait is a handshake on a file or a poll of a condition.
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import { afterEach } from 'vitest';
+import { runBin, scratchOf, startBin, waitForFile } from './harness.js';
+import { TM, freshPool as slotPool, livePid, until, wtDir } from './slots.js';
+
+export { TM, livePid, until };
+
+/** A pool that already holds its marker, so a listing is comparable before and after. */
+export function freshPool() {
+  return slotPool();
+}
+
+/** Write a POSIX sh script under the pool's scratch and return its path. */
+export function script(pool, name, body) {
+  const p = `${scratchOf(pool)}/${name}`;
+  fs.writeFileSync(p, `#!/bin/sh\n${body}\n`);
+  fs.chmodSync(p, 0o700);
+  return p;
+}
+
+/**
+ * A fifo a wrapped command can block on, plus the handshake files around it.
+ * `ready` appears when the command is up (and holds its pid), `done` when it has
+ * run to its end. `release()` lets it finish; nothing here polls.
+ */
+export function waiting(pool, name = 'block') {
+  const dir = `${scratchOf(pool)}/${name}`;
+  fs.mkdirSync(dir, { recursive: true });
+  // A fifo, so the command blocks in open(2) with no polling and no sleep:
+  // Node has no mkfifo, but mkfifo(1) is everywhere a POSIX shell is.
+  const made = spawnSync('mkfifo', [`${dir}/go`], { stdio: 'ignore' });
+  if (made.error || made.status !== 0) throw new Error(`mkfifo failed for ${dir}/go`);
+  return {
+    dir,
+    ready: `${dir}/ready`,
+    done: `${dir}/done`,
+    pid: () => Number(fs.readFileSync(`${dir}/ready`, 'utf8')),
+    release: () => {
+      try {
+        // O_NONBLOCK: when the command is already gone there is no reader left, and
+        // a plain open for writing would wait for one for ever. With it, the open
+        // answers ENXIO at once, which is the "nothing to let go of" case.
+        const fd = fs.openSync(`${dir}/go`, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+        try {
+          fs.writeSync(fd, 'go\n');
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch {
+        /* the command is gone; there is nothing to let go of */
+      }
+    },
+  };
+}
+
+/** The body of a command that announces itself, blocks, and then finishes, with the
+ *  waiting directory as its $n argument. */
+const blockBody = (n) =>
+  [
+    `printf '%s\\n' "$$" >"$${n}/ready"`,
+    `read _ignored <"$${n}/go"`,
+    `printf '%s\\n' "$$" >"$${n}/done"`,
+  ].join('\n');
+
+/** A wrapped command that announces itself and then blocks until the test lets it go.
+ *  `pre` runs first (it sees the waiting directory as $1 and any extra `args`
+ *  from $2 on), `ignoreTerm` makes it deaf to TERM. */
+export function blocker(pool, name = 'block', { ignoreTerm = false, pre = '', args = [] } = {}) {
+  const w = waiting(pool, name);
+  const body = [ignoreTerm ? "trap '' TERM" : '', pre, blockBody(1)].filter(Boolean).join('\n');
+  return { ...w, cmd: [script(pool, `${name}.sh`, body), w.dir, ...args] };
+}
+
+/** A wrapped command that ignores TERM and gives its slot away, so the lock is lost. */
+export function thief(pool, slot, name = 'thief') {
+  const w = waiting(pool, name);
+  const body = ["trap '' TERM", 'rm -rf "$1"', blockBody(2)].join('\n');
+  return { ...w, cmd: [script(pool, `${name}.sh`, body), slot, w.dir] };
+}
+
+/** A wrapped command that ignores TERM, so only the supervisor's KILL stops it. */
+export function stubborn(pool, name = 'stubborn') {
+  return blocker(pool, name, { ignoreTerm: true });
+}
+
+/**
+ * A wrapped command that waits until the heartbeat loop has refreshed the beat at
+ * least once - bounded polling inside the command, as T24 asks - and then runs
+ * `then` with the slot as $1 and `args` from $2 on. With a long heartbeat period
+ * the rest of the run is then deterministic: the loop will not refresh again
+ * before the run ends, so what follows is what decides the exit status.
+ */
+export function afterBeat(pool, slot, name, then, args = []) {
+  const body = [
+    'started=$(cat "$1/started")',
+    'i=0',
+    'while [ "$i" -lt 20 ]; do',
+    '  b=$(cat "$1/beat" 2>/dev/null || printf \'\')',
+    '  if [ -n "$b" ] && [ "$b" -gt "$started" ]; then break; fi',
+    '  i=$((i + 1))',
+    '  sleep 1',
+    'done',
+    then,
+  ].join('\n');
+  return [script(pool, `${name}.sh`, body), slot, ...args];
+}
+
+// Pids the tests learned about (the wrapped commands), killed after each test
+// so a failing assertion cannot leave a gate running.
+const pids = [];
+// Runs this file started, stopped after each test for the same reason.
+const startedRuns = [];
+afterEach(() => {
+  while (startedRuns.length > 0) {
+    const pid = startedRuns.pop();
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+  while (pids.length > 0) {
+    try {
+      process.kill(pids.pop(), 'SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+});
+
+/** Remember a pid so it is killed after the test, even if the test fails. */
+export function track(pid) {
+  if (Number.isInteger(pid) && pid > 0) pids.push(pid);
+  return pid;
+}
+
+/** True while `pid` is a live process. */
+export function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Wait until `pid` is not a live process any more. */
+export async function waitForDead(pid, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && alive(pid)) {
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+/** Run `run <lane> -- <cmd...>` synchronously (usage errors and refusals). */
+export function runOnce(pool, lane, cmd, { args = [], env = {}, cwd, timeout } = {}) {
+  return runBin(['run', ...args, lane, '--', ...cmd], {
+    env: { GATE_LOCK_DIR: pool, ...env },
+    cwd: cwd ?? wtDir(pool, 'wt0'),
+    timeout,
+  });
+}
+
+/** Run `run` with a raw argument vector (usage-error shapes, which have no command). */
+export function runRaw(pool, args, { env = {}, cwd } = {}) {
+  return runBin(['run', ...args], {
+    env: { GATE_LOCK_DIR: pool, ...env },
+    cwd: cwd ?? wtDir(pool, 'wt0'),
+  });
+}
+
+/** Start `run <lane> -- <cmd...>` without waiting (signals and races). */
+export function startRun(pool, lane, cmd, { args = [], env = {}, cwd } = {}) {
+  const started = startBin(['run', ...args, lane, '--', ...cmd], {
+    env: { GATE_LOCK_DIR: pool, ...env },
+    cwd: cwd ?? wtDir(pool, 'wt0'),
+  });
+  // A run that is still alive when its test ends would keep beating every
+  // period for as long as the host is up, so every started run is remembered
+  // here and stopped after the test, failed or not.
+  startedRuns.push(started.child.pid);
+  return started;
+}
+
+/** Wait until a command has announced itself and return its pid. */
+export async function up(block) {
+  await waitForFile(block.ready);
+  return block.pid();
+}
+
+/**
+ * A live view of a started run's stderr: the test can wait for output it has not
+ * received yet (the harness only hands over the full text when the run ends).
+ */
+export function watchStderr(child) {
+  let text = '';
+  child.stderr.setEncoding('utf8').on('data', (d) => {
+    text += d;
+  });
+  return () => text;
+}
+
+/** The slot paths a run reported on stdout (from the `acquired` lines). */
+export function slotsReported(stdout) {
+  return [...stdout.matchAll(/^gate-lock: acquired by .* at (.*)$/gm)].map((m) => m[1]);
+}
+
+/** The heartbeat pids a run printed, one per heartbeat loop its supervisor started. */
+export function beatPids(stdout) {
+  return [...stdout.matchAll(/^gate-lock: heartbeat pid (\d+) /gm)].map((m) => Number(m[1]));
+}
+
+/** A pid that is really alive for the length of the test. */
+export function longLived() {
+  const child = spawn('sleep', ['600'], { stdio: 'ignore' });
+  afterEach(() => {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  });
+  return child.pid;
+}

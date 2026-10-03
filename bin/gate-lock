@@ -1,9 +1,9 @@
 #!/bin/sh
-# shellcheck disable=SC2034 # heartbeat_seconds is read by `run` (GL3)
-# gate-lock: host-wide gate lock (on-disk format 1). Built so far: configuration,
-# the pool and the .format marker, `workers`, the slot subcommands acquire,
-# heartbeat, verify, release and status, and the janitor `clean`. `run` is not
-# built yet.
+# gate-lock: host-wide gate lock (on-disk format 1). It resolves the pool and the
+# format marker, enforces the slot and worker counts, and holds one shared pool
+# of slots across projects and worktrees on one host: acquire, heartbeat, verify,
+# release and status, the janitor `clean`, `run` around one command, and
+# `workers`.
 set -u
 LC_ALL=C
 export LC_ALL
@@ -183,7 +183,12 @@ seam() {
 pause_at() {
   seam "$1"
   [ -n "$seam_value" ] || return 0
-  : >"$seam_value" 2>/dev/null
+  # The create is a group with stderr redirected: a redirection into a path whose
+  # directory has gone is reported by the shell itself, before the command runs,
+  # and `2>/dev/null` on the command alone would not hide that.
+  {
+    : >"$seam_value"
+  } 2>/dev/null
   while [ -e "$seam_value" ]; do
     sleep 1
   done
@@ -505,12 +510,12 @@ beat_raw=${GATE_LOCK_HEARTBEAT_SECONDS:-}
 if [ -z "$beat_raw" ]; then
   heartbeat_seconds=60
 else
-  is_digits "$beat_raw" || die "GATE_LOCK_HEARTBEAT_SECONDS must be a whole number of seconds, at least 1 and at most 10 digits, got '$beat_raw'"
+  is_digits "$beat_raw" || die "GATE_LOCK_HEARTBEAT_SECONDS must be a whole number of seconds, at least one second and at most 10 digits, got '$beat_raw'"
   strip_zeros "$beat_raw"
   case $norm in
-  ???????????*) die "GATE_LOCK_HEARTBEAT_SECONDS must be a whole number of seconds, at least 1 and at most 10 digits, got '$beat_raw'" ;;
+  ???????????*) die "GATE_LOCK_HEARTBEAT_SECONDS must be a whole number of seconds, at least one second and at most 10 digits, got '$beat_raw'" ;;
   esac
-  [ "$norm" -ge 1 ] || die "GATE_LOCK_HEARTBEAT_SECONDS must be a whole number of seconds, at least 1 and at most 10 digits, got '$beat_raw'"
+  [ "$norm" -ge 1 ] || die "GATE_LOCK_HEARTBEAT_SECONDS must be at least one second, got '$beat_raw'; a zero period spins a process-forking loop instead of sleeping"
   heartbeat_seconds=$norm
 fi
 
@@ -1298,56 +1303,69 @@ resolve_identity() {
     die "cannot determine the caller's worktree (the working directory is unreadable or was removed); no lock was taken"
 }
 
-# slot_out_check (D21): GATE_LOCK_SLOT_OUT is judged before the slot loop, so a
-# refusal takes nothing. Sets $out (empty: none), $out_mode (inplace or rename)
-# and, for rename, $out_final.
-out=
-out_mode=
-out_final=
-slot_out_check() {
-  out=${GATE_LOCK_SLOT_OUT:-}
-  [ -n "$out" ] || return 0
-  if [ -h "$out" ]; then
-    die "GATE_LOCK_SLOT_OUT=$out is a symlink; name a regular file you own or a new path; no lock was taken"
+# out_judge PATH LABEL (D21): judge a file the tool has to write into. Sets
+# $out_mode (inplace or rename) and, for rename, $out_final. Returns 1 with the
+# reason in $out_why when the path cannot be one.
+out_judge() {
+  out_why=
+  if [ -h "$1" ]; then
+    out_why="is a symlink; name a regular file you own or a new path"
+    return 1
   fi
-  if [ -e "$out" ]; then
-    if [ -f "$out" ] && owned_by "$out" "$real_uid"; then
+  if [ -e "$1" ]; then
+    if [ -f "$1" ] && owned_by "$1" "$real_uid"; then
       out_mode=inplace
       return 0
     fi
-    die "GATE_LOCK_SLOT_OUT=$out exists but is not a regular file owned by uid $real_uid; no lock was taken"
+    out_why="exists but is not a regular file owned by uid $real_uid"
+    return 1
   fi
-  case $out in
-  */) die "GATE_LOCK_SLOT_OUT=$out ends with a slash; name a file; no lock was taken" ;;
+  case $1 in
+  */)
+    out_why="ends with a slash; name a file"
+    return 1
+    ;;
   esac
-  case $out in
-  */*) so_dir=${out%/*} ;;
-  *) so_dir=. ;;
+  case $1 in
+  */*) oj_dir=${1%/*} ;;
+  *) oj_dir=. ;;
   esac
-  [ -n "$so_dir" ] || so_dir=/
-  so_phys=$(CDPATH='' cd -- "$so_dir" 2>/dev/null && pwd -P) ||
-    die "GATE_LOCK_SLOT_OUT=$out: the directory $so_dir does not exist; no lock was taken"
-  if ! owned_by "$so_phys" "$real_uid" || ! not_group_other_writable "$so_phys"; then
-    die "GATE_LOCK_SLOT_OUT=$out: its directory $so_phys must be owned by uid $real_uid and not writable by group or others; no lock was taken"
+  [ -n "$oj_dir" ] || oj_dir=/
+  oj_phys=$(CDPATH='' cd -- "$oj_dir" 2>/dev/null && pwd -P) || {
+    out_why="names a directory ($oj_dir) that does not exist"
+    return 1
+  }
+  if ! owned_by "$oj_phys" "$real_uid" || ! not_group_other_writable "$oj_phys"; then
+    out_why="its directory $oj_phys must be owned by uid $real_uid and not writable by group or others"
+    return 1
   fi
-  if [ "$so_phys" = / ]; then
-    out_final=/${out##*/}
+  if [ "$oj_phys" = / ]; then
+    out_final=/${1##*/}
   else
-    out_final=$so_phys/${out##*/}
+    out_final=$oj_phys/${1##*/}
   fi
   out_mode=rename
+  return 0
 }
 
-# write_slot_out SLOT: record the slot path (C9). Returns 1 on failure.
-write_slot_out() {
-  [ -n "$out" ] || return 0
+# out_check PATH LABEL (D21): the same judgement, as a refusal: exit 2, nothing
+# taken. Called before the slot loop, never after it.
+out_check() {
+  out_judge "$1" "$2" || die "$2=$1 $out_why; no lock was taken"
+}
+
+# out_write PATH LABEL VALUE: write one line into an output file. The judgement
+# runs again here, immediately before the write, because a symlink can have
+# appeared since. Returns 1 with the reason in $out_why on any failure.
+out_write() {
+  out_judge "$1" "$2" || return 1
   case $out_mode in
   inplace)
-    # Keep the caller's inode; re-check immediately before writing.
-    if [ -h "$out" ] || [ ! -f "$out" ]; then
+    # Keep the caller's inode.
+    if ! printf '%s\n' "$3" >"$1" 2>/dev/null; then
+      out_why="cannot be written"
       return 1
     fi
-    printf '%s\n' "$1" >"$out" 2>/dev/null
     ;;
   rename)
     # A fresh temp name, created exclusively (noclobber): a file already at a
@@ -1364,7 +1382,7 @@ write_slot_out() {
       if [ ! -e "$wo_try" ] && [ ! -h "$wo_try" ]; then
         if (
           set -C
-          printf '%s\n' "$1" >"$wo_try"
+          printf '%s\n' "$3" >"$wo_try"
         ) 2>/dev/null; then
           wo_tmp=$wo_try
           break
@@ -1372,14 +1390,33 @@ write_slot_out() {
       fi
       wo_k=$((wo_k + 1))
     done
-    [ -n "$wo_tmp" ] || return 1
+    if [ -z "$wo_tmp" ]; then
+      out_why="no temporary name beside it could be created"
+      return 1
+    fi
     chmod 0600 "$wo_tmp" 2>/dev/null
     if [ -d "$out_final" ] || ! mv -f "$wo_tmp" "$out_final" 2>/dev/null; then
       rm -f "$wo_tmp" 2>/dev/null
+      out_why="cannot be replaced by the temporary file beside it"
       return 1
     fi
     ;;
   esac
+  return 0
+}
+
+# slot_out_check (D21): GATE_LOCK_SLOT_OUT is judged before the slot loop, so a
+# refusal takes nothing. Sets $out (empty: none).
+slot_out_check() {
+  out=${GATE_LOCK_SLOT_OUT:-}
+  [ -n "$out" ] || return 0
+  out_check "$out" GATE_LOCK_SLOT_OUT
+}
+
+# write_slot_out SLOT: record the slot path (C9). Returns 1 on failure.
+write_slot_out() {
+  [ -n "$out" ] || return 0
+  out_write "$out" GATE_LOCK_SLOT_OUT "$1"
 }
 
 # self_held_check (F67): a caller pid that already holds an answering slot, in
@@ -1957,6 +1994,640 @@ do_clean() {
 }
 
 # ---------------------------------------------------------------------------
+# run (C28-C45, D6, D10, D15, D18, D21, D23; the worker-cap warning and Waiting)
+#
+# `run` is one holder around one command, with a heartbeat:
+#
+#   run  (the holder; the pid in the slot)  ->  the command it wraps
+#     -> the supervisor subshell
+#          -> the heartbeat loop subshell
+#               -> one `gate-lock heartbeat` per period
+#
+# The holder is run's own pid (C28), so the command is what the heartbeat keeps
+# alive, and an inherited caller pid is cleared rather than recorded. The
+# supervisor owns the loop as its child (D10): a loop that dies with a status
+# other than 0 or 1 is restarted once; a failed refresh, or a second such death,
+# sends TERM to the command, KILL after the grace period, and the supervisor
+# exits 1. `run` collects that status with wait once the command has ended (D6),
+# which is how a lost lock is told from a clean run - there is no marker file,
+# and `kill -0` is never used to decide that a child has finished, because a
+# zombie answers it too: only wait says that.
+# ---------------------------------------------------------------------------
+
+run_lane=
+run_slot=
+run_slot_out=
+run_status_file=
+run_wait=
+run_wait_given=0
+run_dir=
+run_cmd_pid=
+run_sup_pid=
+run_cmd_status=0
+run_sup_status=0
+run_acq_status=0
+run_verify_ok=1
+run_removed=0
+run_sig=
+run_sig_code=0
+run_sig_seen=0
+run_busy_kind=
+run_exit_code=0
+run_verify_done=0
+run_release_done=0
+run_recorded=0
+run_finished=0
+# The seconds between the supervisor's TERM and its KILL (D10). A test seam may
+# shorten it; nothing else may.
+run_kill_grace=10
+
+# run_signal NAME CODE (D15, C38-C40): HUP, QUIT and TERM all forward TERM to
+# the command, and INT does too, because an asynchronous command starts with INT
+# and QUIT ignored: a forwarded INT would be a no-op for a plain shell command
+# (C39). A second signal, of any kind, is ignored - re-entering is the one thing
+# worse than ignoring it, because it can skip the release (C40).
+run_signal() {
+  run_sig_seen=$((run_sig_seen + 1))
+  if [ -n "$run_sig" ]; then
+    return 0
+  fi
+  run_sig=$1
+  run_sig_code=$2
+  if [ -n "$run_cmd_pid" ]; then
+    kill -TERM "$run_cmd_pid" 2>/dev/null
+  fi
+}
+
+# run_wait_pid PID: wait for a child, waiting again when our own handler
+# interrupted the wait. A wait that a trapped signal broke out of did not reap
+# anything, so the next one waits for the child to be really gone (C38, R8c).
+#
+# The signal count is read immediately before each wait, not once at the start:
+# only a signal that arrives *during* a wait can have interrupted it, and a wait
+# for an already reaped child answers with the status it reaped - 143 for a
+# command we stopped - which is above 128 but is not an interruption (D10).
+run_wait_pid() {
+  wp_pid=$1
+  while :; do
+    wp_before=$run_sig_seen
+    wait "$wp_pid" 2>/dev/null
+    wp_status=$?
+    if [ "$run_sig_seen" = "$wp_before" ]; then
+      break
+    fi
+  done
+}
+
+# run_wait_supervisor PID: as run_wait_pid, keeping the supervisor's status in
+# $run_sup_status.
+run_wait_supervisor() {
+  run_sup_status=0
+  while :; do
+    ws_before=$run_sig_seen
+    wait "$1" 2>/dev/null
+    ws_status=$?
+    if [ "$run_sig_seen" = "$ws_before" ]; then
+      break
+    fi
+  done
+  run_sup_status=$ws_status
+}
+
+# run_reap_command: wait for the command and remember its own status.
+# run_reap_command: wait for the command and remember its own status. The pid is
+# cleared only after the wait, because a signal that arrives while we are waiting
+# is answered by forwarding TERM to the command - which is still ours to stop
+# until it has really gone (C38).
+run_reap_command() {
+  if [ -z "$run_cmd_pid" ]; then
+    return 0
+  fi
+  run_last_cmd_pid=$run_cmd_pid
+  run_wait_pid "$run_last_cmd_pid"
+  run_cmd_status=$wp_status
+  run_cmd_pid=
+}
+
+# run_stop_supervisor (C41, R7, R8d): TERM the supervisor, which stops its loop
+# and waits for it. When this returns, no refresh of ours is in flight, so
+# removing the slot cannot race one.
+run_stop_supervisor() {
+  if [ -z "$run_sup_pid" ]; then
+    return 0
+  fi
+  run_sup=$run_sup_pid
+  run_sup_pid=
+  kill -TERM "$run_sup" 2>/dev/null
+  run_wait_supervisor "$run_sup"
+}
+
+# run_lost_lock: what a supervisor status of 1 means (C37, D6, D10).
+run_lost_lock() {
+  [ "$run_sup_status" -eq 1 ] || return 0
+  printf 'gate-lock: the lock was lost while the command ran; the command was stopped (pid %s)\n' "${run_last_cmd_pid:-none}" >&2
+  printf 'gate-lock: lock lost: exiting 2; %s is not this run to release, and whatever is there is left as it is\n' "${run_slot:-the slot}" >&2
+}
+
+# run_verify_lock (C35): after the command ends the lock must still be this run's.
+# A signalled run skips this: the release answers for it and the signal path
+# stays quiet on stderr, which is what a caller tearing a gate down expects.
+run_verify_lock() {
+  if [ "$run_verify_done" = 1 ]; then
+    return 0
+  fi
+  run_verify_done=1
+  if [ -n "$run_sig" ] || [ -z "$run_slot" ]; then
+    return 0
+  fi
+  if GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$run_slot" "$self" verify "$run_lane"; then
+    run_verify_ok=1
+  else
+    run_verify_ok=0
+  fi
+}
+
+# run_release_lock (C36): give the slot back, pinned, with run's own pid, and say
+# so when it was not released. The release child's own stdio is run's own, so the
+# release line lands on the caller's stdout and not in a step's capture (R21).
+# Its stdout is read as well as shown, because a release that is simply gone is
+# exit 0 (idempotent), and only the line says the slot was removed.
+run_release_lock() {
+  if [ "$run_release_done" = 1 ]; then
+    return 0
+  fi
+  run_release_done=1
+  if [ -z "$run_slot" ]; then
+    return 0
+  fi
+  GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$run_slot" "$self" release "$run_lane" >"$run_dir/rel.out" 2>"$run_dir/rel.err"
+  cat "$run_dir/rel.err" >&2
+  cat "$run_dir/rel.out"
+  if grep -q '^gate-lock: released by' "$run_dir/rel.out" 2>/dev/null; then
+    run_removed=1
+    return 0
+  fi
+  if [ "$run_verify_ok" = 0 ]; then
+    run_rel_why="the slot was not this run's to give back"
+  else
+    run_rel_why="the release did not remove it"
+  fi
+  printf 'gate-lock: FAILED to release the lock %s: %s\n' "$run_slot" "$run_rel_why" >&2
+}
+
+# run_record_status (D18): one of tool:<code>, cmd:<code>, busy:host or
+# busy:worktree. A failure to write it is a warning and not a refusal: the command
+# has run and the lock is on its way back.
+run_record_status() {
+  if [ "$run_recorded" = 1 ]; then
+    return 0
+  fi
+  run_recorded=1
+  [ -n "$run_status_file" ] || return 0
+  if [ -n "$run_busy_kind" ]; then
+    run_status=busy:$run_busy_kind
+  elif [ -n "$run_sig" ] || [ "$run_sup_status" -eq 1 ] || [ "$run_verify_ok" = 0 ] ||
+    [ "$run_removed" = 0 ] || [ "$run_acq_status" != 0 ]; then
+    run_status=tool:$run_exit_code
+  else
+    run_status=cmd:$run_exit_code
+  fi
+  if ! out_write "$run_status_file" "--status-file" "$run_status"; then
+    printf 'gate-lock: cannot record the run status %s in --status-file %s: %s\n' "$run_status" "$run_status_file" "$out_why" >&2
+  fi
+}
+
+# run_scratch_rm: the private directory and everything in it. Only what this
+# process created is ever removed, and a name that has become a link is left.
+run_scratch_rm() {
+  [ -n "$run_dir" ] || return 0
+  if [ -h "$run_dir" ]; then
+    printf 'gate-lock: left %s alone: it is not the private directory this run created\n' "$run_dir" >&2
+    run_dir=
+    return 0
+  fi
+  rm -rf "${run_dir:?}" 2>/dev/null
+  run_dir=
+}
+
+# run_scratch: the private directory that holds the file recording the slot path.
+# `mkdir` refuses a name that is already there, so the name is this run's alone; a
+# pid recycled under a leftover of this process's own takes the next suffix. The
+# acquire writes that file through D21's own rules, because its parent is a 0700
+# directory of ours. Nothing of this run's is ever published in the pool.
+run_scratch() {
+  tmp_root || die "cannot resolve a private directory for the slot path; no lock was taken"
+  [ -n "$tmp_phys" ] ||
+    die "the private directory for the slot path would live in the filesystem root; set GATE_LOCK_DIR, and no lock was taken"
+  run_k=0
+  while :; do
+    if [ "$run_k" -eq 0 ]; then
+      run_dir=$tmp_phys/gate-lock-run.$$
+    else
+      run_dir=$tmp_phys/gate-lock-run.$$.$run_k
+    fi
+    if mkdir -m 0700 "$run_dir" 2>/dev/null; then
+      break
+    fi
+    run_k=$((run_k + 1))
+    [ "$run_k" -le 20 ] ||
+      die "cannot create a private directory for the slot path in $tmp_phys; no lock was taken"
+  done
+  if [ -h "$run_dir" ] || [ ! -d "$run_dir" ] || ! owned_by "$run_dir" "$real_uid" ||
+    ! mode_is_0700 "$run_dir"; then
+    rm -rf "${run_dir:?}" 2>/dev/null
+    run_dir=
+    die "$tmp_phys/gate-lock-run.$$ is not a private directory of ours (mode 0700, owned by uid $real_uid, not a symlink); no lock was taken"
+  fi
+  run_slot_out=$run_dir/slot
+}
+
+# run_beat_loop SLOT PERIOD ALIVE STATUS (C37, C42, D10): the heartbeat loop.
+# It refreshes the beat once per period with run's pid and the pin run took, and
+# does nothing else. Exit 0 means "stopped", which is how the cleanup says no
+# lock was lost; exit 1 means a refresh failed, so the lock is gone or somebody
+# else's; any other status means the loop itself died.
+#
+# Two files in this run's private directory carry its state to the supervisor:
+# STATUS receives the exit status from an EXIT trap, and ALIVE is rewritten once
+# a second. The pause is a second at a time rather than one sleep of the whole
+# period, and that is what makes the loop stoppable at all: a shell's `wait` is
+# not guaranteed to notice a signal that arrived just before it, so a single long
+# sleep could keep this loop - and with it the whole cleanup - deaf for a whole
+# period (C42, R8d).
+run_beat_loop() {
+  rb_slot=$1
+  rb_period=$2
+  rb_alive=$3
+  rb_status=$4
+  rb_stop=0
+  rb_seen=0
+  rb_tick=0
+  trap 'rb_stop=1; rb_seen=$((rb_seen + 1))' TERM INT HUP QUIT
+  trap '{ printf "%s\n" "$?" >"$rb_status"; } 2>/dev/null' EXIT
+  while [ "$rb_stop" = 0 ]; do
+    rb_tick=$((rb_tick + 1))
+    { printf '%s\n' "$rb_tick" >"$rb_alive"; } 2>/dev/null
+    # A test seam that kills this loop with a status other than 0 or 1, as many
+    # times as the file says, so the supervisor's restart-once rule is provable.
+    seam GATE_LOCK_TEST_LOOP_DIE
+    rb_die=$seam_value
+    if [ -n "$rb_die" ] && [ -f "$rb_die" ]; then
+      rb_left=$(cat "$rb_die" 2>/dev/null)
+      case ${rb_left:-x} in
+      '' | *[!0-9]*) rb_left=0 ;;
+      esac
+      if [ "$rb_left" -gt 0 ]; then
+        { printf '%s\n' "$((rb_left - 1))" >"$rb_die"; } 2>/dev/null
+        exit 2
+      fi
+    fi
+    # The refresh is a foreground child on purpose: the loop only ends when no
+    # refresh of its own is running (C41), so a TERM that arrives mid-refresh
+    # waits for it rather than cutting it short.
+    if ! GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$rb_slot" "$self" heartbeat; then
+      exit 1
+    fi
+    rb_left=$rb_period
+    while [ "$rb_left" -gt 0 ]; do
+      rb_tick=$((rb_tick + 1))
+      { printf '%s\n' "$rb_tick" >"$rb_alive"; } 2>/dev/null
+      rb_before=$rb_seen
+      sleep 1 &
+      rb_sleeper=$!
+      # Both windows of the stop flag are covered: a signal that arrived before
+      # this sleep started has already run its handler, and a signal that
+      # arrives while the shell is waiting interrupts the wait itself.
+      if [ "$rb_stop" = 0 ]; then
+        wait "$rb_sleeper" 2>/dev/null
+      fi
+      if [ "$rb_stop" = 1 ]; then
+        # C42: the sleeper this loop started is stopped and reaped, never orphaned.
+        kill "$rb_sleeper" 2>/dev/null
+        wait "$rb_sleeper" 2>/dev/null
+        exit 0
+      fi
+      rb_left=$((rb_left - 1))
+    done
+  done
+  exit 0
+}
+
+# run_supervise SLOT PERIOD LANE CMDPID DIR (D10): the heartbeat supervisor. It
+# owns the loop as its own child, restarts it once if it dies with a status
+# neither 0 nor 1, and stops the command when the loop is gone for good.
+#
+# It watches the loop a second at a time rather than in one wait, for the same
+# reason the loop's pause is sliced: a signal that arrives just before a `wait`
+# is not guaranteed to interrupt it, and the cleanup must not depend on that.
+# Three seconds without a trace of the loop is where `wait` is asked instead: a
+# loop killed outright leaves no status file, and only wait can say it is gone.
+run_supervise() {
+  sv_slot=$1
+  sv_period=$2
+  sv_lane=$3
+  sv_cmd=$4
+  sv_dir=$5
+  sv_alive=$sv_dir/beat-alive
+  sv_status=$sv_dir/beat-status
+  sv_stop=0
+  sv_seen=0
+  sv_restart=0
+  trap 'sv_stop=1; sv_seen=$((sv_seen + 1))' TERM INT HUP QUIT
+  while :; do
+    rm -f "$sv_status" 2>/dev/null
+    run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" &
+    sv_loop=$!
+    # C31: the heartbeat's pid is announced on stdout. It is the loop's own pid,
+    # so a caller that signals it stops the beats, and the supervisor restarts it
+    # (D10) rather than leaving the slot unrefreshed.
+    printf 'gate-lock: heartbeat pid %s every %ss while %s runs\n' "$sv_loop" "$sv_period" "$sv_lane"
+    sv_mark=
+    sv_stale=0
+    sv_asked=0
+    while :; do
+      if [ -e "$sv_status" ]; then
+        break
+      fi
+      sv_now=
+      {
+        IFS= read -r sv_now <"$sv_alive"
+      } 2>/dev/null
+      if [ "$sv_now" = "$sv_mark" ]; then
+        sv_stale=$((sv_stale + 1))
+      else
+        sv_mark=$sv_now
+        sv_stale=0
+      fi
+      # A stop is pending: the loop is asked again and again, because it may be
+      # inside a refresh that must not be cut off (C41, R7) and the only thing
+      # that ends that wait is the loop itself. This never falls through to a
+      # bare `wait`, which would block on a loop nobody had stopped.
+      if [ "$sv_stop" = 1 ]; then
+        kill -TERM "$sv_loop" 2>/dev/null
+        sv_asked=$((sv_asked + 1))
+        if [ "$sv_asked" -ge 30 ]; then
+          break
+        fi
+        sleep 1
+        continue
+      fi
+      # Nothing is pending and the loop has left no trace for three seconds: only
+      # `wait` can say it is gone (a loop killed outright leaves no status).
+      if [ "$sv_stale" -ge 3 ]; then
+        break
+      fi
+      sv_interrupted=0
+      sv_before=$sv_seen
+      sleep 1 &
+      sv_nap=$!
+      if [ "$sv_stop" = 0 ]; then
+        wait "$sv_nap" 2>/dev/null
+        if [ "$sv_seen" != "$sv_before" ]; then
+          sv_interrupted=1
+        fi
+      else
+        sv_interrupted=1
+      fi
+      if [ "$sv_interrupted" = 0 ]; then
+        continue
+      fi
+      # Our signal arrived while we watched: the loop is told now, and the sleeper
+      # this poll started is stopped and reaped, never orphaned (C42).
+      kill -TERM "$sv_loop" 2>/dev/null
+      kill "$sv_nap" 2>/dev/null
+      wait "$sv_nap" 2>/dev/null
+    done
+    wait "$sv_loop" 2>/dev/null
+    sv_st=$?
+    if [ -e "$sv_status" ]; then
+      sv_st=$(cat "$sv_status" 2>/dev/null)
+      case ${sv_st:-} in
+      '' | *[!0-9]*) sv_st=1 ;;
+      esac
+    fi
+    rm -f "$sv_alive" "$sv_status" 2>/dev/null
+    # run is cleaning up: the loop is stopped and reaped, so no refresh of ours is
+    # in flight when the slot is removed (C41, R7).
+    if [ "$sv_stop" = 1 ]; then
+      exit 0
+    fi
+    # 0: stopped on purpose. 1: a refresh failed, so the lock is gone. Anything
+    # else: the loop itself died, which is restarted exactly once.
+    if [ "$sv_st" -eq 0 ]; then
+      exit 0
+    fi
+    if [ "$sv_st" -eq 1 ]; then
+      break
+    fi
+    if [ "$sv_restart" -eq 0 ]; then
+      sv_restart=1
+      continue
+    fi
+    break
+  done
+  sv_grace=$run_kill_grace
+  seam GATE_LOCK_TEST_KILL_GRACE
+  case ${seam_value:-} in
+  '' | *[!0-9]*) ;;
+  *) sv_grace=$seam_value ;;
+  esac
+  # The lock is gone and the command is still running: TERM it, then KILL it after
+  # the grace period, so nothing outlives the run without a lock (D10).
+  kill -TERM "$sv_cmd" 2>/dev/null
+  sv_n=0
+  while [ "$sv_n" -lt "$sv_grace" ]; do
+    sleep 1
+    sv_n=$((sv_n + 1))
+  done
+  kill -KILL "$sv_cmd" 2>/dev/null
+  exit 1
+}
+
+# run_acquire (C28, C33, C44, the plan's "Waiting"): take a slot for run's own
+# pid. The acquire's stderr is captured so a busy answer can be told apart - a
+# same-worktree refusal from a full host - and is then re-emitted unchanged; its
+# stdout (the reclaim and acquired lines) goes straight to the caller's.
+#
+# A 75 is retried while --wait allows it, with a pause of one to five whole
+# seconds jittered by this process's pid and the clock (L1, L10), never past the
+# deadline. Without --wait it is one attempt, which is what a caller that wants to
+# decide for itself expects.
+run_acquire() {
+  run_acq_status=0
+  run_busy_kind=
+  run_deadline=
+  if [ -n "$run_wait" ]; then
+    now_s
+    run_deadline=$((now + run_wait))
+  fi
+  run_attempts=0
+  while :; do
+    if [ "$run_attempts" -gt 0 ]; then
+      now_s
+      [ "$((now + 1))" -le "$run_deadline" ] || break
+    fi
+    GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_OUT="$run_slot_out" "$self" acquire "$run_lane" 2>"$run_dir/acq.err"
+    run_acq_status=$?
+    run_attempts=$((run_attempts + 1))
+    cat "$run_dir/acq.err" >&2
+    if [ "$run_acq_status" != 75 ]; then
+      return 0
+    fi
+    run_busy_kind=host
+    if grep -q 'same worktree' "$run_dir/acq.err" 2>/dev/null; then
+      run_busy_kind=worktree
+    fi
+    [ -n "$run_deadline" ] || return 0
+    now_s
+    [ "$now" -lt "$run_deadline" ] || return 0
+    run_pause=$(((now % 5 + $$ % 5) % 5 + 1))
+    [ "$((now + run_pause))" -le "$run_deadline" ] || run_pause=$((run_deadline - now))
+    [ "$run_pause" -ge 1 ] || return 0
+    sleep "$run_pause"
+  done
+  return 0
+}
+
+# run_finish: everything that happens once the command has ended, in the order the
+# specification gives: reap the heartbeat, then the verdict, then the release.
+run_finish() {
+  run_stop_supervisor
+  run_reap_command
+  run_lost_lock
+  run_verify_lock
+  run_release_lock
+  run_finished=1
+  # A signal outranks everything (C38). Then a lost lock (D10). Then a verify that
+  # failed or a lock that was not released (C35, C36): non-zero, and the
+  # command's own status when the command had already failed. Otherwise the
+  # command's status, unchanged (C34).
+  if [ -n "$run_sig" ]; then
+    run_exit_code=$run_sig_code
+  elif [ "$run_sup_status" -eq 1 ]; then
+    run_exit_code=2
+  elif [ "$run_verify_ok" = 0 ] || [ "$run_removed" = 0 ]; then
+    if [ "$run_cmd_status" -eq 0 ]; then
+      run_exit_code=1
+    else
+      run_exit_code=$run_cmd_status
+    fi
+  else
+    run_exit_code=$run_cmd_status
+  fi
+  run_record_status
+  run_scratch_rm
+}
+
+# run_cleanup: the single exit path (C36). It runs from the EXIT trap, so it is
+# also what happens when this run was refused, signalled, or ended by something it
+# does not handle. Every step is guarded and idempotent, and it ends in an exit,
+# so the trap never returns into the middle of the script.
+run_cleanup() {
+  if [ "$run_finished" != 1 ]; then
+    run_stop_supervisor
+    run_reap_command
+    run_verify_lock
+    run_release_lock
+    if [ "$run_exit_code" -eq 0 ] && [ "$run_removed" = 0 ]; then
+      run_exit_code=1
+    fi
+    run_record_status
+  fi
+  run_scratch_rm
+  exit "$run_exit_code"
+}
+
+# do_run ARGS (C29, D18, D21, C31): `run [options] <lane> -- <command...>`.
+do_run() {
+  # The options, then the lane, then the separator and the command. Anything else
+  # is a usage error, which takes no lock. Only the first `--` separates: a later
+  # one is an ordinary argument of the command (C29).
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+    --) break ;;
+    --status-file)
+      [ "$#" -ge 2 ] || usage_error "--status-file needs the path of a file to record the run status in"
+      run_status_file=$2
+      shift 2
+      ;;
+    --wait)
+      [ "$#" -ge 2 ] || usage_error "--wait needs the number of seconds to keep retrying a busy pool for"
+      run_wait=$2
+      run_wait_given=1
+      shift 2
+      ;;
+    --*) usage_error "unknown option '$1' for run" ;;
+    *) break ;;
+    esac
+  done
+  [ "$#" -ge 1 ] || usage_error "run needs a lane and a command: gate-lock run [options] <lane> -- <command...>"
+  if [ "$1" = -- ]; then
+    usage_error "run needs a lane before the separator --"
+  fi
+  run_lane=$1
+  shift
+  [ "$#" -ge 1 ] || usage_error "run needs the separator -- immediately after the lane"
+  [ "$1" = -- ] || usage_error "the separator -- must follow the lane $run_lane immediately"
+  shift
+  [ "$#" -ge 1 ] || usage_error "run needs a command after the separator --"
+  # The wait was given, so its value is judged even when it is empty: an empty
+  # --wait is an operator's slip, not a request to wait for ever.
+  if [ "$run_wait_given" = 1 ]; then
+    is_digits "$run_wait" || usage_error "--wait must be a whole number of seconds, got '$run_wait'"
+    case $run_wait in
+    ??????????*) usage_error "--wait must be a whole number of seconds (at most 10 digits), got '$run_wait'" ;;
+    esac
+  fi
+  # D21: the status file is judged before the slot loop, so a refusal takes nothing.
+  [ -n "$run_status_file" ] && out_check "$run_status_file" "--status-file"
+  # F66: an inherited pin is cleared before this run's own acquire, and no pin is
+  # exported to the command. The slot path run takes is recorded in a private
+  # file of its own instead, outside the pool.
+  unset GATE_LOCK_SLOT_PATH GATE_LOCK_SLOT_OUT
+  run_scratch
+  # The plan's worker-cap warning: one line on stderr, and the exit status of the
+  # run is whatever the command and the lock say it is.
+  if [ "$slot_count" -gt 1 ] && [ -z "$host_workers_raw" ] && [ -z "${GATE_LOCK_WORKERS:-}" ]; then
+    printf 'gate-lock: this pool has %s slots and neither GATE_HOST_WORKERS nor GATE_LOCK_WORKERS is set; cap the workers of each gate with resolveMaxWorkers()\n' "$slot_count" >&2
+  fi
+  # C31: signal handling and cleanup first, then the acquire.
+  trap 'run_signal TERM 143' TERM
+  trap 'run_signal TERM 131' QUIT
+  trap 'run_signal TERM 129' HUP
+  trap 'run_signal INT 130' INT
+  trap 'run_cleanup' EXIT
+  run_acquire
+  if [ "$run_acq_status" != 0 ]; then
+    # Busy, or a refusal: no lock, no command, and the status the acquire gave.
+    run_exit_code=$run_acq_status
+    exit "$run_acq_status"
+  fi
+  rdf "$run_slot_out"
+  run_slot=$rd
+  # H6 (R9): after the slot exists and before the held flag is set. A signal here
+  # still releases, because the cleanup releases whenever this run holds a slot -
+  # and the slot path is known from here on whatever the flag says.
+  pause_at GATE_LOCK_TEST_PAUSE_AFTER_ACQUIRE
+  if [ -n "$run_sig" ]; then
+    run_exit_code=$run_sig_code
+    exit "$run_sig_code"
+  fi
+  # C31/C32: the command in the background, with the tool's own stdout and stderr
+  # unchanged (no capture, no buffering) and its stdin null.
+  "$@" </dev/null &
+  run_cmd_pid=$!
+  run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" &
+  run_sup_pid=$!
+  if [ -n "$run_sig" ]; then
+    run_exit_code=$run_sig_code
+    exit "$run_sig_code"
+  fi
+  run_reap_command
+  run_finish
+  exit "$run_exit_code"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch (C2): usage errors come after configuration (C1, D9).
 # ---------------------------------------------------------------------------
 
@@ -1990,8 +2661,8 @@ clean)
   do_clean
   ;;
 run)
-  echo "gate-lock: not implemented yet" >&2
-  exit 2
+  shift
+  do_run "$@"
   ;;
 '') usage_error "no subcommand" ;;
 *) usage_error "unknown subcommand '$1'" ;;
