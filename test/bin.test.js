@@ -7,7 +7,7 @@ import { BIN, REPO_ROOT, buildEnv, freshPool, runBin, scratchOf } from './harnes
 
 const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
 
-describe('bin/gate-lock stub', () => {
+describe('bin/gate-lock preamble and dispatch', () => {
   it('--format prints 1 and exits 0', () => {
     const r = runBin(['--format']);
     expect(r).toMatchObject({ status: 0, stdout: '1\n', stderr: '' });
@@ -23,7 +23,7 @@ describe('bin/gate-lock stub', () => {
   });
 
   it('an unknown subcommand exits 2 with the gate-lock: prefix on stderr', () => {
-    const r = runBin(['frobnicate']);
+    const r = runBin(['frobnicate'], { env: { GATE_LOCK_DIR: freshPool() } });
     expect(r.status).toBe(2);
     expect(r.stdout).toBe('');
     expect(r.stderr).toBe('gate-lock: not implemented yet\n');
@@ -31,7 +31,7 @@ describe('bin/gate-lock stub', () => {
 
   it('no arguments, and the real subcommands, are not implemented yet (exit 2)', () => {
     for (const args of [[], ['acquire', 'x'], ['status'], ['run', 'x', '--', 'true']]) {
-      const r = runBin(args);
+      const r = runBin(args, { env: { GATE_LOCK_DIR: freshPool() } });
       expect(r.status).toBe(2);
       expect(r.stderr).toMatch(/^gate-lock: /);
     }
