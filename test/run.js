@@ -141,7 +141,7 @@ export function track(pid) {
   return pid;
 }
 
-/** True while `pid` is a live process. */
+/** Is `pid` still a process? */
 export function alive(pid) {
   try {
     process.kill(pid, 0);
@@ -149,6 +149,23 @@ export function alive(pid) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Has this pid stopped being a process of ours? A signal-zero probe answers for a
+ * pid that the kernel has not finished retiring, so where /proc says a pid has no
+ * entry at all, that is the answer; elsewhere the probe is the only one there is.
+ */
+export function stopped(pid) {
+  if (fs.existsSync('/proc')) {
+    try {
+      fs.statSync(`/proc/${pid}`);
+      return false;
+    } catch {
+      return true;
+    }
+  }
+  return !alive(pid);
 }
 
 /** Wait until `pid` is not a live process any more. */

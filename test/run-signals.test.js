@@ -8,9 +8,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { listing, scratchOf, waitForFile } from './harness.js';
-import { TM, livePid, names, readSlot } from './slots.js';
+import { TM, livePid, names, readSlot, until } from './slots.js';
 import {
   HAS_PGREP,
+  alive,
   beatPids,
   blocker,
   childrenMatching,
@@ -18,6 +19,7 @@ import {
   runOnce,
   script,
   startRun,
+  stopped,
   track,
   up,
   waitForDead,
@@ -75,6 +77,19 @@ function beatHook(pool, name = 'beat-hook') {
     seam: path.join(dir, 'beat-rename'),
     release: () => fs.rmSync(dir, { recursive: true, force: true }),
   };
+}
+
+/**
+ * Is there a run's private directory under `root` that holds `name`? The temp
+ * root seam lets a test point a run's scratch somewhere it owns, so what the
+ * watchdog publishes there can be read while the run is still tearing down.
+ */
+function runDirWith(root, name) {
+  if (!fs.existsSync(root)) return false;
+  return fs
+    .readdirSync(root)
+    .filter((n) => n.startsWith('gate-lock-run.'))
+    .some((n) => fs.existsSync(path.join(root, n, name)));
 }
 
 /** A wrapped command that traps TERM and takes two seconds to stop. */
@@ -169,6 +184,118 @@ describe('C40 a command that will not stop', () => {
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
   }, 60_000);
+
+  it('D15 a second signal of any kind after the first is ignored: 143, the lock released, nothing killed', async () => {
+    // The watchdog this run arms when it forwards the TERM must not take the
+    // run's own signal handling with it: a run whose traps were replaced would
+    // stop being able to answer a signal at all, which is not what D15 says.
+    for (const second of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGQUIT']) {
+      const pool = freshPool();
+      const { block, gate, pid } = await signalledRun(pool, { name: `second-${second}` });
+      gate.child.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 300));
+      gate.child.kill(second);
+      const r = await gate.done;
+      expect(r.status, second).toBe(143);
+      expect(r.signal, second).toBe(null);
+      expect(r.stdout, second).toContain('released by lane');
+      expect(r.stderr, second).toBe('');
+      expect(names(pool), second).toEqual(['.format']);
+      await waitForDead(pid);
+      expect(fs.existsSync(block.done), second).toBe(false);
+    }
+  }, 60_000);
+
+  it('D10 the watchdog and the second it sleeps in are gone once a signalled run ends', async () => {
+    const pool = freshPool();
+    // The private directory is named from the temp root, which a test can point
+    // somewhere it owns, so the watchdog's published pids can be read while the
+    // run is still tearing down.
+    const tmpRoot = path.join(scratchOf(pool), 'tmp-root');
+    fs.mkdirSync(tmpRoot, { mode: 0o700 });
+    const env = {
+      ...TM,
+      GATE_LOCK_HEARTBEAT_SECONDS: '1',
+      GATE_LOCK_TEST_KILL_GRACE: '3',
+      GATE_LOCK_TEST_TMP_ROOT: tmpRoot,
+    };
+
+    // (a) The watchdog fires: it ignored TERM itself, so it has slept the whole
+    // grace and killed the command, and its own second is long gone.
+    {
+      const deaf = blocker(pool, 'deaf', { ignoreTerm: true });
+      const gate = startRun(pool, 'lane', deaf.cmd, { env });
+      await up(deaf);
+      track(deaf.pid());
+      gate.child.kill('SIGTERM');
+      await until(() => runDirWith(tmpRoot, 'escalator.sleep'), 15000);
+      const [name] = fs.readdirSync(tmpRoot).filter((n) => n.startsWith('gate-lock-run.'));
+      const dir = path.join(tmpRoot, name);
+      const sleepPid = Number(fs.readFileSync(path.join(dir, 'escalator.sleep'), 'utf8'));
+      expect(Number.isInteger(sleepPid)).toBe(true);
+      const r = await gate.done;
+      // The run was signalled, so the signal's own code is what it answers with -
+      // the lock was lost as well, and a signal outranks that.
+      expect(r.status).toBe(143);
+      expect(r.stdout).toContain('released by lane');
+      expect(gone(sleepPid)).toBe(true);
+      expect(fs.existsSync(dir)).toBe(false);
+    }
+
+    // (b) The watchdog is cancelled, because the command stopped on its own. The
+    // second it was sleeping in has to go with it: nothing of ours may outlive
+    // the run, and a reparented `sleep` would live for the whole grace. The
+    // command takes two seconds to stop, so the watchdog is still armed while the
+    // test reads what it published.
+    {
+      const dir = path.join(scratchOf(pool), 'slow-cancel');
+      // A long grace, so the watchdog is still sleeping when the cancel runs:
+      // the cancel happens after the supervisor has stopped, so it comes later
+      // than the signal does.
+      const gate = startRun(pool, 'lane', slowCommand(pool, dir), {
+        env: { ...env, GATE_LOCK_TEST_KILL_GRACE: '10' },
+      });
+      await waitForFile(path.join(dir, 'ready'));
+      const victim = track(Number(fs.readFileSync(path.join(dir, 'ready'), 'utf8')));
+      gate.child.kill('SIGTERM');
+      await until(() => runDirWith(tmpRoot, 'escalator.sleep'), 15000);
+      const [name] = fs.readdirSync(tmpRoot).filter((n) => n.startsWith('gate-lock-run.'));
+      const runDir2 = path.join(tmpRoot, name);
+      const sleepPid = Number(fs.readFileSync(path.join(runDir2, 'escalator.sleep'), 'utf8'));
+      const r = await gate.done;
+      expect(r.status).toBe(143);
+      await waitForDead(victim);
+      expect(stopped(sleepPid), 'the watchdog second outlived the run').toBe(true);
+      expect(fs.existsSync(runDir2)).toBe(false);
+      expect(names(pool)).toEqual(['.format']);
+    }
+  }, 90_000);
+
+  it('D10 a watchdog whose run is gone does not kill the command: it only escalates while run wants it', async () => {
+    const pool = freshPool();
+    const tmpRoot = path.join(scratchOf(pool), 'tmp-root');
+    fs.mkdirSync(tmpRoot, { mode: 0o700 });
+    const block = blocker(pool, 'deaf', { ignoreTerm: true });
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '2',
+        GATE_LOCK_TEST_TMP_ROOT: tmpRoot,
+      },
+    });
+    await up(block);
+    const victim = track(block.pid());
+    const dir = path.join(tmpRoot, `gate-lock-run.${gate.child.pid}`);
+    gate.child.kill('SIGTERM');
+    await waitForFile(path.join(dir, 'escalator.sleep'), 15000);
+    // KILL the run itself: the lock is now nobody's, and the command's pid may
+    // be reused at any moment. The watchdog must notice that its parent is gone
+    // and leave the command alone rather than aim a KILL at a stranger.
+    gate.child.kill('SIGKILL');
+    await new Promise((r) => setTimeout(r, 5000));
+    expect(alive(victim), 'the watchdog killed the command after run was gone').toBe(true);
+  }, 90_000);
 });
 
 describe('C49 a signal aimed at a child of run', () => {

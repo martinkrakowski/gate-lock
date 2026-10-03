@@ -2070,35 +2070,75 @@ run_forward_term() {
   [ -n "$run_cmd_pid" ] || return 0
   kill -TERM "$run_cmd_pid" 2>/dev/null
   [ -n "$run_escalator_pid" ] && return 0
-  run_escalator() {
-    # A one-shot watchdog, in a subshell of this run: it keeps none of run's stdio
-    # (`exec` first), so the caller's streams close the moment run exits, and it is
-    # cancelled by run_reap_command as soon as the command is really gone.
-    trap '' TERM INT HUP QUIT
-    (
-      exec >/dev/null 2>&1
-      run_escalator_grace
-      sleep "$run_escalator_grace"
-      kill -KILL "$run_escalator_cmd" 2>/dev/null
-    ) &
-  }
   run_escalator_grace=$run_kill_grace
   seam GATE_LOCK_TEST_KILL_GRACE
   case ${seam_value:-} in
   '' | *[!0-9]*) ;;
   *) run_escalator_grace=$seam_value ;;
   esac
-  run_escalator_cmd=$run_cmd_pid
-  run_escalator
+  run_escalator "$run_escalator_grace" "$run_cmd_pid" "$run_dir" "$$"
+}
+
+# run_escalator GRACE COMMAND DIR RUNPID (D10, C40): the watchdog that makes a
+# signalled run end. A command that ignores TERM would otherwise hold this run for
+# ever in the cleanup that waits for it, and the only thing that can break that
+# wait is a KILL on the command. The supervisor escalates the same way for a lost
+# lock; only this process can escalate here, because only it can wait for the
+# command.
+#
+# Defined once, at the top level, and everything it does is inside the subshell.
+# In particular the `trap` below is the watchdog's own: this run's signal handling
+# is left exactly as it was, because a run that has lost its traps cannot answer a
+# signal at all, and D15 wants a second signal ignored, which is not the same
+# thing as having no handler.
+#
+# The second it sleeps in is published by name, so that cancelling this watchdog
+# can stop that second too and leave nothing behind: a reparented `sleep` would
+# outlive the run by a whole grace period.
+#
+# RUNPID is this run's own pid, passed in rather than read from `$PPID`: inside a
+# subshell `$PPID` is not reliably the process that forked it, and a watchdog that
+# watches the wrong process would keep a KILL armed for a run that is gone.
+run_escalator() {
+  (
+    exec >/dev/null 2>&1
+    trap '' TERM INT HUP QUIT
+    sleep "$1" &
+    esc_sleep=$!
+    printf '%s\n' "$esc_sleep" >"$3/escalator.sleep" 2>/dev/null
+    wait "$esc_sleep" 2>/dev/null
+    # Cancelled: the second this watchdog was sleeping in was stopped by name.
+    [ -e "$3/escalator.stop" ] && exit 0
+    # The grace is up, so the KILL is due - but only while this run is still here
+    # to want it. A run that was KILLed itself is gone, its command may have been
+    # reaped, and that pid may since have been given to somebody else, so a KILL
+    # from here could land on a stranger. `kill -0` on the run is the only thing
+    # that tells the two apart; the residual window is the one command this
+    # subshell still has to run, so it is microseconds, and a pid would have to be
+    # recycled inside it.
+    kill -0 "$4" 2>/dev/null || exit 0
+    kill -KILL "$2" 2>/dev/null
+  ) &
   run_escalator_pid=$!
 }
 
 # run_cancel_escalator: the command is gone, so the watchdog has nothing left to
-# do. A KILL is what stops it: a TERM would only be noticed after its own sleep.
+# do - and nothing of ours may outlive this run. It is told to stop, the second it
+# is sleeping in is stopped by name, and the watchdog itself is reaped.
 run_cancel_escalator() {
   [ -n "$run_escalator_pid" ] || return 0
+  : >"$run_dir/escalator.stop" 2>/dev/null
+  esc_sleep=$(cat "$run_dir/escalator.sleep" 2>/dev/null)
+  case ${esc_sleep:-} in
+  '' | *[!0-9]*) ;;
+  # KILL and not TERM: the watchdog ignores TERM before it starts this second, so
+  # the second is born ignoring it, and an ignored signal survives the exec.
+  *) kill -KILL "$esc_sleep" 2>/dev/null ;;
+  esac
   kill -KILL "$run_escalator_pid" 2>/dev/null
+  wait "$run_escalator_pid" 2>/dev/null
   run_escalator_pid=
+  rm -f "$run_dir/escalator.sleep" "$run_dir/escalator.stop" 2>/dev/null
 }
 
 # run_wait_pid PID: wait for a child, waiting again when our own handler
