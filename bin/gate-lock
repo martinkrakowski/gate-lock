@@ -2028,6 +2028,7 @@ run_cmd_status=0
 run_sup_status=0
 run_acq_status=0
 run_attempts=0
+run_acq_child=0
 run_verify_ok=1
 run_removed=0
 run_sig=
@@ -2263,10 +2264,12 @@ run_release_lock() {
   fi
   run_release_done=1
   if [ -z "$run_slot" ]; then
-    # The fallback is for an acquire child that was killed after winning a name, so
-    # it needs an attempt that really ran: a signal that ended a *wait* never
-    # started one, and there is then nothing of ours to release.
-    if [ "$run_acq_status" -lt 128 ] || [ "$run_attempts" -eq 0 ]; then
+    # The fallback is for an acquire child that died of a signal after winning a
+    # name, so it is gated on that child's own status and nothing else: a signal
+    # that ended a *wait* is recorded in `run_acq_status`, and a wait holds no slot
+    # to give back. Behind the shield the child ignores INT and TERM, so in
+    # practice this means a KILL (C49).
+    if [ "$run_acq_child" -lt 128 ]; then
       return 0
     fi
     printf 'gate-lock: the acquire was stopped before it recorded the slot; releasing by lane %s and pid %s\n' "$run_lane" "$$" >&2
@@ -2613,6 +2616,11 @@ run_acquire() {
     fi
     run_child env "GATE_LOCK_CALLER_PID=$$" "GATE_LOCK_SLOT_OUT=$run_slot_out" "$self" acquire "$run_lane" 2>"$run_dir/acq.err"
     run_acq_status=$?
+    # The child's own status, kept beside the run's answer to it: a signal that
+    # arrives while this child runs is answered with the signal's code a moment
+    # later (the shell defers it until the child exits, L1), and only the child's
+    # own status says whether an acquire was stopped rather than answered (D6).
+    run_acq_child=$run_acq_status
     run_attempts=$((run_attempts + 1))
     cat "$run_dir/acq.err" >&2
     if [ "$run_acq_status" != 75 ]; then

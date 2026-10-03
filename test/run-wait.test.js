@@ -230,6 +230,27 @@ describe('--wait', () => {
     expect(readSlot(pool, 'gate.lock').owner).toBe('holder');
   }, 30_000);
 
+  it('Waiting a signal during the backoff ends the wait without a fallback release', async () => {
+    // The other way a signal can end a wait: the acquire has already answered 75
+    // and the loop is in its backoff sleep. The busy line is the handshake that
+    // the sleep has been entered - the run echoes it before it sleeps.
+    const pool = freshPool();
+    seed(pool, 'gate.lock', { owner: 'holder', pid: livePid() });
+    const gate = startRun(pool, 'lane', ['true'], { args: ['--wait', '60'] });
+    const busy = watchStderr(gate.child);
+    await until(() => busy().includes('busy'), 20000);
+    gate.child.kill('SIGTERM');
+    const r = await gate.done;
+    expect(r.status).toBe(143);
+    // The wait held no slot, so there is nothing to give back and nothing to say
+    // about giving it back.
+    expect(r.stderr, JSON.stringify(r.stderr)).not.toContain(
+      'the acquire was stopped before it recorded the slot',
+    );
+    expect(r.stdout).not.toContain('released by');
+    expect(readSlot(pool, 'gate.lock').owner).toBe('holder');
+  }, 60_000);
+
   it('Waiting a signal that arrives while the acquire is running is not lost to a busy answer', async () => {
     // The acquire child is parked just before it renames its candidate, which is a
     // window only an acquire has. A signal sent in that window is deferred by the
@@ -250,6 +271,10 @@ describe('--wait', () => {
       const r = await gate.done;
       expect(r.status).toBe(143);
       expect(r.stderr).toContain('busy');
+      // A signal that ended the acquire is not an acquire that was stopped: this
+      // run holds no slot, so there is nothing to give back and nothing to say
+      // about giving it back.
+      expect(r.stderr).not.toContain('the acquire was stopped before it recorded the slot');
       expect(fs.readFileSync(file, 'utf8')).toBe('tool:143\n');
       // The holder's slot is untouched: this run never took one.
       expect(readSlot(pool, 'gate.lock').owner).toBe('holder');
