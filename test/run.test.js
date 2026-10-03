@@ -449,7 +449,7 @@ describe('T46 three runs at slot count 3', () => {
     const runs = [0, 1, 2].map((k) => {
       const block = blocker(pool, `lane${k}`);
       const gate = startRun(pool, `lane${k}`, block.cmd, { env, cwd: wtDir(pool, `wt-${k}`) });
-      return { block, gate, worktree: `${scratchOf(pool)}/wt-${k}` };
+      return { block, gate, lane: `lane${k}`, worktree: wtDir(pool, `wt-${k}`) };
     });
     // Whatever happens, the three runs are released and reaped: a leaked run
     // keeps beating for as long as the host is up, and this suite is not a gate.
@@ -459,12 +459,16 @@ describe('T46 three runs at slot count 3', () => {
         .filter((n) => /^gate\.lock(\.\d+)?$/.test(n))
         .sort();
       expect(held).toEqual(['gate.lock', 'gate.lock.1', 'gate.lock.2']);
-      // Each slot records its own run's pid and its own worktree.
-      for (const [k, name] of held.entries()) {
+      // Each slot records its own run's pid and its own worktree. Which lane wins
+      // which slot is a race and is not asserted: a slot is matched to its run by
+      // the worktree, which is what makes it that run's.
+      for (const name of held) {
         const slot = readSlot(pool, name);
-        expect(slot.worktree).toBe(runs[k].worktree);
-        expect(slot.owner).toBe(`lane${k}`);
-        expect(runs[k].gate.child.pid).toBe(Number(slot.pid));
+        const run = runs.find((r) => r.worktree === slot.worktree);
+        expect(run, `${name} holds ${slot.worktree}`).toBeDefined();
+        expect(slot.owner).toBe(run.lane);
+        expect(slot.project).toBe(path.basename(slot.worktree));
+        expect(run.gate.child.pid).toBe(Number(slot.pid));
       }
       // A fourth run in a fourth worktree is refused as busy, naming a holder.
       const fourth = blocker(pool, 'lane3');
