@@ -133,7 +133,7 @@ done`,
     ];
     const r = runOnce(pool, 'lane', cmd, { env: { GATE_LOCK_HEARTBEAT_SECONDS: '1' } });
     expect(r.status).toBe(0);
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(r.stdout).toContain('heartbeat pid');
     expect(r.stdout).toContain('every 1s while lane runs');
     expect(Number(fs.readFileSync(moved, 'utf8').trim())).toBeGreaterThan(nowS() - 5);
@@ -177,7 +177,7 @@ describe('T32 the command status is the run status', () => {
     for (const code of ['3', '127', '1']) {
       const r = runOnce(pool, 'lane', ['sh', '-c', `exit ${code}`]);
       expect(r.status).toBe(Number(code));
-      expect(r.stderr).toBe('');
+      expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
       expect(r.stdout).toContain('released by lane');
       expect(names(pool)).toEqual(['.format']);
     }
@@ -353,6 +353,52 @@ describe('T39 the command arguments', () => {
 });
 
 describe('T40 usage errors take no lock', () => {
+  it('T40 every `gate-lock run` line in the README parses: the options come before the lane and -- follows it', () => {
+    // Every `gate-lock run …` command the README shows a caller is run here with
+    // its command replaced by `true` and its paths moved into this test's scratch,
+    // so a recipe the parser rejects - the options after the lane, the wrong
+    // number of arguments - fails this test rather than a reader's copy and paste.
+    const pool = freshPool();
+    const docs = ['README.md', 'CHANGELOG.md'].map((name) =>
+      fs.readFileSync(new URL(`../${name}`, import.meta.url), 'utf8'),
+    );
+    const shown = docs
+      .join('\n')
+      .split('\n')
+      .map((line) => line.trim())
+      // The synopsis is a shape, not a command to run; every other line that
+      // names `gate-lock run` and has a body is one.
+      .filter((line) => /^gate-lock run \S/.test(line) && !line.includes('[--'))
+      // `gate-lock run "$lane" … || case …` is a shell fragment: keep the run and
+      // its arguments, drop the pipeline.
+      .map((line) => line.split('||')[0].trim());
+    expect(shown.length).toBeGreaterThan(3);
+    for (const line of shown) {
+      const head = line
+        .replace(/\s+#.*$/, '')
+        .split(/\s+/)
+        .slice(2)
+        .filter(Boolean);
+      const separator = head.indexOf('--');
+      expect(separator, line).toBeGreaterThan(0);
+      // A shell word stands for itself here: the default of `${X:-n}` is n, and
+      // a quoted variable or an absolute path becomes something of this test's.
+      const args = head.slice(0, separator).map((word) => {
+        const bare = word.replace(/^["']|["']$/g, '');
+        const m = bare.match(/^\$\{[A-Z_]+:-(.+)\}$/);
+        if (m) return m[1];
+        if (bare === 'lane') return 'lane';
+        if (bare.startsWith('/')) return path.join(scratchOf(pool), path.basename(bare));
+        return bare;
+      });
+      // The words go to the parser in the order the README writes them, so the
+      // parser is what judges them: options first, then the lane, then `--`. A
+      // recipe with the options after the lane is a usage error here.
+      const r = runRaw(pool, [...args, '--', 'true']);
+      expect(r.status, `${line}\nstatus ${r.status}\n${r.stderr}`).toBe(0);
+    }
+  });
+
   it('T40 no separator, nothing after the separator, no lane and a stray word are all exit 2 with usage', () => {
     const pool = freshPool();
     const cases = [
@@ -495,7 +541,7 @@ describe('the worker cap warning', () => {
     // The warning is on stderr and the status is the command's own, unchanged.
     expect(warned.status).toBe(3);
     const lines = warned.stderr.split('\n').filter(Boolean);
-    expect(lines).toHaveLength(1);
+    expect(lines, warned.stderr).toHaveLength(1);
     expect(lines[0]).toMatch(/^gate-lock: .*workers?/);
     expect(lines[0]).toContain('GATE_LOCK_WORKERS');
     // With a cap set the decision has been made, so the tool says nothing. The
@@ -649,7 +695,7 @@ describe('D10 a loop that keeps dying', () => {
     block.release();
     const r = await gate.done;
     expect(r.status).toBe(0);
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(beatPids(r.stdout)).toHaveLength(2);
   });
 

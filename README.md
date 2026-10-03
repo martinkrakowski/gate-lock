@@ -69,8 +69,8 @@ every exit path - success, failure, a signal, or a refused acquire.
 ```sh
 gate-lock run unit -- npm test                       # the command's own exit status
 gate-lock run lint:node -- npm run lint              # a lane per job
-gate-lock run e2e --wait 300 -- npm run e2e          # retry while the host is busy
-gate-lock run docs --status-file /tmp/gate.status -- make docs
+gate-lock run --wait 300 e2e -- npm run e2e          # retry while the host is busy
+gate-lock run --status-file /tmp/gate.status docs -- make docs
 ```
 
 - The **lane** is free text: the label every other line about this slot shows. It

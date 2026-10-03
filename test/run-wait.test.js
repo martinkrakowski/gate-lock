@@ -24,7 +24,7 @@ describe('--status-file', () => {
     expect(r.status).toBe(3);
     expect(fs.readFileSync(file, 'utf8')).toBe('cmd:3\n');
     expect(fs.statSync(file).ino).toBe(ino);
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
   });
 
   it('D18 a zero status is cmd:0, and a new path is written through a temp file (mode 0600, no leftover)', () => {
@@ -296,7 +296,7 @@ describe('--wait', () => {
     // lines is the assertion that matters: one attempt, so one line.
     const r = runOnce(pool, 'lane', ['true'], { timeout: 120000 });
     expect(r.status).toBe(0);
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
   });
 
   it('Waiting a value that is not a whole number of seconds is a usage error', () => {

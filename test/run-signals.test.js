@@ -121,7 +121,7 @@ describe('T26 / T27 / D15 one signal', () => {
     const r = await gate.done;
     expect(r.status).toBe(143);
     expect(r.stdout).toContain('released by lane');
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(names(pool)).toEqual(['.format']);
     await waitForDead(pid);
     expect(fs.existsSync(block.done)).toBe(false);
@@ -136,7 +136,7 @@ describe('T26 / T27 / D15 one signal', () => {
     const r = await gate.done;
     expect(r.status).toBe(130);
     expect(r.stdout).toContain('released by lane');
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(names(pool)).toEqual(['.format']);
     await waitForDead(pid);
     expect(fs.existsSync(block.done)).toBe(false);
@@ -180,7 +180,7 @@ describe('C40 a command that will not stop', () => {
     // The command is stopped, and the lock comes back.
     await waitForDead(victim, 10000);
     expect(fs.existsSync(block.done)).toBe(false);
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
   }, 60_000);
@@ -349,7 +349,7 @@ describe('C49 a signal aimed at a child of run', () => {
         const r = await gate.done;
         expect(r.status).toBe(0);
         expect(r.stdout).toContain('released by lane');
-        expect(r.stderr).toBe('');
+        expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
         expect(names(pool)).toEqual(['.format']);
       } finally {
         fs.rmSync(hook, { force: true });
@@ -438,7 +438,7 @@ describe('T28 / T29 a second signal', () => {
     const r = await gate.done;
     expect(r.status).toBe(143);
     expect(r.stdout).toContain('released by lane');
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(names(pool)).toEqual(['.format']);
     await waitForDead(pid);
   });
@@ -452,7 +452,7 @@ describe('T28 / T29 a second signal', () => {
     const r = await gate.done;
     expect(r.status).toBe(130);
     expect(r.stdout).toContain('released by lane');
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(names(pool)).toEqual(['.format']);
     await waitForDead(pid);
   });
@@ -577,7 +577,7 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     hook.release();
     const r = await gate.done;
     expect(r.status).toBe(143);
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
     expect(gone(beatPids(r.stdout)[0])).toBe(true);
@@ -605,7 +605,7 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     hook.release();
     const r = await gate.done;
     expect(r.status).toBe(143);
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
     expect(gone(beatPids(r.stdout)[0])).toBe(true);
@@ -687,7 +687,7 @@ describe('a command that signals itself', () => {
     const r = await gate.done;
     expect(r.status).toBe(143);
     expect(r.stdout).toContain('released by lane');
-    expect(r.stderr).toBe('');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(names(pool)).toEqual(['.format']);
   });
 });
