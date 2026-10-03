@@ -181,6 +181,8 @@ describe('harness: spec-exact writers and listing', () => {
     worktree: '/w/proj',
     project: 'proj',
   };
+  const without = (obj, ...keys) =>
+    Object.fromEntries(Object.entries(obj).filter(([k]) => !keys.includes(k)));
   const modeOf = (p) => fs.statSync(p).mode & 0o7777;
 
   it('writeSlot writes six one-line files byte for byte', () => {
@@ -203,7 +205,7 @@ describe('harness: spec-exact writers and listing', () => {
 
   it('writeSlot with files:4 omits worktree and project (F30)', () => {
     const pool = freshPool();
-    const { worktree: _w, project: _p, ...four } = held;
+    const four = without(held, 'worktree', 'project');
     const dir = writeSlot(pool, 'gate.lock.1', four, { files: 4 });
     expect(fs.readdirSync(dir).sort()).toEqual(['beat', 'owner', 'pid', 'started']);
     // files:4 ignores worktree/project even when given
@@ -213,8 +215,8 @@ describe('harness: spec-exact writers and listing', () => {
 
   it('writeSlot with files:6 throws when worktree or project is undefined', () => {
     const pool = freshPool();
-    const { worktree: _w, ...noWorktree } = held;
-    const { project: _p, ...noProject } = held;
+    const noWorktree = without(held, 'worktree');
+    const noProject = without(held, 'project');
     expect(() => writeSlot(pool, 'gate.lock', noWorktree)).toThrow(/worktree/);
     expect(() => writeSlot(pool, 'gate.lock', noProject)).toThrow(/project/);
     expect(fs.readdirSync(pool)).toEqual([]);
