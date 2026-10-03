@@ -10,8 +10,10 @@ import { describe, expect, it } from 'vitest';
 import { listing, scratchOf, waitForFile } from './harness.js';
 import { TM, livePid, names, readSlot } from './slots.js';
 import {
+  HAS_PGREP,
   beatPids,
   blocker,
+  childrenMatching,
   freshPool,
   runOnce,
   script,
@@ -167,6 +169,114 @@ describe('C40 a command that will not stop', () => {
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
   }, 60_000);
+});
+
+describe('C49 a signal aimed at a child of run', () => {
+  // A terminal sends INT (or TERM) to the whole foreground process group, so a
+  // second Ctrl-C can reach the acquire or the release of a run that is ignoring
+  // signals itself. The acquire and the release have to survive it: one that dies
+  // mid-flight leaves the lock to be reclaimed rather than released.
+  const aimed = it.skipIf(!HAS_PGREP);
+
+  aimed(
+    'C49 INT to the release child cannot lose the lock: the release finishes and the pool is clean',
+    async () => {
+      const pool = freshPool();
+      const hook = path.join(scratchOf(pool), 'release-hook');
+      const gate = startRun(pool, 'lane', ['sh', '-c', 'exit 0'], {
+        env: {
+          ...TM,
+          GATE_LOCK_HEARTBEAT_SECONDS: '1',
+          GATE_LOCK_TEST_PAUSE_BEFORE_RELEASE: hook,
+        },
+      });
+      try {
+        // The release is parked just before it removes what it moved aside (H7).
+        await waitForFile(hook);
+        const release = childrenMatching(gate.child.pid, ' release ');
+        expect(release).toHaveLength(1);
+        process.kill(Number(release[0]), 'SIGINT');
+        fs.rmSync(hook, { force: true });
+        const r = await gate.done;
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain('released by lane');
+        expect(r.stderr).toBe('');
+        expect(names(pool)).toEqual(['.format']);
+      } finally {
+        fs.rmSync(hook, { force: true });
+      }
+    },
+    60_000,
+  );
+
+  aimed(
+    'C49 INT to the acquire child cannot lose the lock: the acquire finishes and the slot is released',
+    async () => {
+      const pool = freshPool();
+      const hook = path.join(scratchOf(pool), 'create-hook');
+      const gate = startRun(pool, 'lane', ['sh', '-c', 'exit 0'], {
+        env: {
+          ...TM,
+          GATE_LOCK_HEARTBEAT_SECONDS: '1',
+          GATE_LOCK_TEST_PAUSE_BEFORE_CREATE_RENAME: hook,
+        },
+      });
+      try {
+        // The acquire is parked just before it renames its candidate onto the
+        // slot name (H2).
+        await waitForFile(hook);
+        const acquire = childrenMatching(gate.child.pid, ' acquire ');
+        expect(acquire).toHaveLength(1);
+        process.kill(Number(acquire[0]), 'SIGINT');
+        fs.rmSync(hook, { force: true });
+        const r = await gate.done;
+        expect(r.status).toBe(0);
+        expect(r.stdout).toContain('acquired by lane');
+        expect(r.stdout).toContain('released by lane');
+        expect(names(pool)).toEqual(['.format']);
+      } finally {
+        fs.rmSync(hook, { force: true });
+      }
+    },
+    60_000,
+  );
+  aimed(
+    'C49 a KILL to the acquire child cannot leak the lock either: the run gives it back by lane and pid (C49)',
+    async () => {
+      const pool = freshPool();
+      const hook = path.join(scratchOf(pool), 'kill-hook');
+      const status = path.join(scratchOf(pool), 'kill-status');
+      const gate = startRun(pool, 'lane', ['sh', '-c', 'exit 0'], {
+        args: ['--status-file', status],
+        env: {
+          ...TM,
+          GATE_LOCK_HEARTBEAT_SECONDS: '1',
+          GATE_LOCK_TEST_PAUSE_BEFORE_CREATE_RENAME: hook,
+        },
+      });
+      try {
+        await waitForFile(hook);
+        const acquire = childrenMatching(gate.child.pid, ' acquire ');
+        expect(acquire).toHaveLength(1);
+        // KILL is the one signal the shield cannot stop, and the one a caller
+        // reaches for. The acquire dies without recording anything, so the run
+        // has to give the slot back from the only names it has.
+        process.kill(Number(acquire[0]), 'SIGKILL');
+        fs.rmSync(hook, { force: true });
+        const r = await gate.done;
+        expect(r.status).toBe(137);
+        expect(r.stderr).toContain('the acquire was stopped before it recorded the slot');
+        expect(r.stdout).toContain('nothing to release');
+        expect(fs.readFileSync(status, 'utf8')).toBe('tool:137\n');
+        // No slot is left held. A candidate the killed acquire had already made is
+        // a transient, and the janitor owns those (D16).
+        expect(names(pool).filter((n) => /^gate\.lock(\.\d+)?$/.test(n))).toEqual([]);
+      } finally {
+        fs.rmSync(hook, { force: true });
+      }
+    },
+    60_000,
+  );
 });
 
 describe('T28 / T29 a second signal', () => {

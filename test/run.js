@@ -229,3 +229,25 @@ export function longLived() {
   });
   return child.pid;
 }
+
+/**
+ * The pids of `pid`'s children whose command line contains `needle`. A run's
+ * acquire, release, command, supervisor and loop are all its children, and a test
+ * that needs a signal to reach one of them and *not* the run itself has to say
+ * which. `pgrep` and `ps` are on GNU and BSD alike; where they are missing the
+ * tests that use this are skipped.
+ */
+export function childrenMatching(pid, needle) {
+  const listed = spawnSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' });
+  if (listed.error || listed.status !== 0) return [];
+  return listed.stdout
+    .split('\n')
+    .filter(Boolean)
+    .filter((child) =>
+      spawnSync('ps', ['-o', 'args=', '-p', child], { encoding: 'utf8' }).stdout.includes(needle),
+    );
+}
+
+/** Is `pgrep` available here? The tests that aim a signal at a grandchild need it. */
+export const HAS_PGREP =
+  spawnSync('pgrep', ['-P', '$$'], { stdio: 'ignore', shell: true }).error === undefined;

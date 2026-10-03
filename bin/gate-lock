@@ -2137,6 +2137,18 @@ run_wait_supervisor() {
 }
 
 # run_reap_command: wait for the command and remember its own status.
+# run_child COMMAND...: run one of this tool's own children so that a signal meant
+# for this process cannot kill it half way through. A terminal sends INT (or TERM)
+# to the whole foreground process group, and an acquire that dies between winning
+# a name and recording it, or a release that dies with the slot renamed aside,
+# leaves the lock to be reclaimed rather than released. `sh -c 'trap "" INT TERM;
+# exec "$@"'` ignores both, and an ignored disposition survives the exec, so what
+# runs is the tool itself with those two signals ignored; a KILL still reaches it,
+# which is the escape hatch C40 names.
+run_child() {
+  sh -c 'trap "" INT TERM; exec "$@"' sh "$@"
+}
+
 # run_reap_command: wait for the command and remember its own status. The pid is
 # cleared only after the wait, because a signal that arrives while we are waiting
 # is answered by forwarding TERM to the command - which is still ours to stop
@@ -2183,7 +2195,7 @@ run_verify_lock() {
   if [ -n "$run_sig" ] || [ -z "$run_slot" ]; then
     return 0
   fi
-  if GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$run_slot" "$self" verify "$run_lane"; then
+  if run_child env "GATE_LOCK_CALLER_PID=$$" "GATE_LOCK_SLOT_PATH=$run_slot" "$self" verify "$run_lane"; then
     run_verify_ok=1
   else
     run_verify_ok=0
@@ -2195,15 +2207,32 @@ run_verify_lock() {
 # release line lands on the caller's stdout and not in a step's capture (R21).
 # Its stdout is read as well as shown, because a release that is simply gone is
 # exit 0 (idempotent), and only the line says the slot was removed.
+#
+# There is one case with no pin: an acquire that was killed after winning a name
+# and before recording it. The lane and this run's pid are then the only names it
+# left, and they are enough - one pid holds one slot (F67) - so the unpinned
+# release finds this run's slot, or nothing at all when there was none (C49).
 run_release_lock() {
   if [ "$run_release_done" = 1 ]; then
     return 0
   fi
   run_release_done=1
   if [ -z "$run_slot" ]; then
+    if [ "$run_acq_status" -lt 128 ]; then
+      return 0
+    fi
+    printf 'gate-lock: the acquire was stopped before it recorded the slot; releasing by lane %s and pid %s\n' "$run_lane" "$$" >&2
+    run_child env "GATE_LOCK_CALLER_PID=$$" "$self" release "$run_lane" >"$run_dir/rel.out" 2>"$run_dir/rel.err"
+    cat "$run_dir/rel.err" >&2
+    cat "$run_dir/rel.out"
+    if grep -qE '^gate-lock: (released by|nothing to release)' "$run_dir/rel.out" 2>/dev/null; then
+      run_removed=1
+      return 0
+    fi
+    printf 'gate-lock: FAILED to release the lock for lane %s: %s\n' "$run_lane" "$run_lane was not released" >&2
     return 0
   fi
-  GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$run_slot" "$self" release "$run_lane" >"$run_dir/rel.out" 2>"$run_dir/rel.err"
+  run_child env "GATE_LOCK_CALLER_PID=$$" "GATE_LOCK_SLOT_PATH=$run_slot" "$self" release "$run_lane" >"$run_dir/rel.out" 2>"$run_dir/rel.err"
   cat "$run_dir/rel.err" >&2
   cat "$run_dir/rel.out"
   if grep -q '^gate-lock: released by' "$run_dir/rel.out" 2>/dev/null; then
@@ -2532,7 +2561,7 @@ run_acquire() {
       now_s
       [ "$((now + 1))" -le "$run_deadline" ] || break
     fi
-    GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_OUT="$run_slot_out" "$self" acquire "$run_lane" 2>"$run_dir/acq.err"
+    run_child env "GATE_LOCK_CALLER_PID=$$" "GATE_LOCK_SLOT_OUT=$run_slot_out" "$self" acquire "$run_lane" 2>"$run_dir/acq.err"
     run_acq_status=$?
     run_attempts=$((run_attempts + 1))
     cat "$run_dir/acq.err" >&2
