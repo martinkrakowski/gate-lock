@@ -1,8 +1,9 @@
 #!/bin/sh
 # shellcheck disable=SC2034 # heartbeat_seconds is read by `run` (GL3)
 # gate-lock: host-wide gate lock (on-disk format 1). Built so far: configuration,
-# the pool and the .format marker, `workers`, and the slot subcommands acquire,
-# heartbeat, verify, release and status. `clean` and `run` are not built yet.
+# the pool and the .format marker, `workers`, the slot subcommands acquire,
+# heartbeat, verify, release and status, and the janitor `clean`. `run` is not
+# built yet.
 set -u
 LC_ALL=C
 export LC_ALL
@@ -107,6 +108,48 @@ not_group_other_writable() {
 }
 mode_is_0700() { [ -n "$(find "$1" -prune -perm 0700 -print 2>/dev/null)" ]; }
 
+# tmp_trusted DIR (D1, D16): a temp directory is only trusted when it is ours or
+# sticky, which is what makes a file in it safe against a plant: in a directory
+# only we can write, or in a sticky one, nobody else can replace what we put
+# there. Somebody else's plain directory could be rigged, so it is not used.
+# The expected uid is the real one, and GATE_LOCK_TEST_TMP_UID makes the one
+# ownership claim foreign on its own so this branch is testable; empty is inert.
+tmp_trusted() {
+  tt_uid=$real_uid
+  seam GATE_LOCK_TEST_TMP_UID
+  [ -z "$seam_value" ] || tt_uid=$seam_value
+  if ! owned_by "$1" "$tt_uid" &&
+    [ -z "$(find "$1" -prune -perm -1000 -print 2>/dev/null)" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# tmp_root: the physical temp directory to use when TMPDIR is unset, unusable or
+# untrusted. Sets $tmp_phys. TMPDIR is used when it is there and trusted; the
+# seam root, else /tmp, is the fallback in every other case. Used by the pool
+# resolver (D1) and by the janitor's age reference (D16), so one rule decides
+# where a scratch file of ours may live.
+tmp_root() {
+  tmp_phys=
+  case ${TMPDIR:-} in
+  /*) tmp_phys=$(CDPATH='' cd -- "$TMPDIR" 2>/dev/null && pwd -P) || tmp_phys= ;;
+  esac
+  if [ -n "$tmp_phys" ]; then
+    if tmp_trusted "$tmp_phys"; then
+      [ "$tmp_phys" != / ] || tmp_phys=
+      return 0
+    fi
+    # Not ours and not sticky: not trusted. Silent fallback.
+    tmp_phys=
+  fi
+  seam GATE_LOCK_TEST_TMP_ROOT
+  fallback_root=${seam_value:-/tmp}
+  tmp_phys=$(CDPATH='' cd -- "$fallback_root" 2>/dev/null && pwd -P) || return 1
+  [ "$tmp_phys" != / ] || tmp_phys=
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Test-mode gate (D20): the GATE_LOCK_TEST_* seams are honoured only when
 # GATE_LOCK_TEST_MODE is exactly 1. Otherwise a set one is named in a one-line
@@ -131,6 +174,19 @@ seam() {
   if [ "$test_mode" = 1 ]; then
     eval "seam_value=\${$1:-}"
   fi
+}
+
+# pause_at SEAM (H1-H8, D20): in test mode, when the seam names a file, create
+# it, then wait (whole seconds, L10) for as long as it exists. Defined here,
+# before the first window it opens (H1, the marker publication), so every
+# subcommand can park.
+pause_at() {
+  seam "$1"
+  [ -n "$seam_value" ] || return 0
+  : >"$seam_value" 2>/dev/null
+  while [ -e "$seam_value" ]; do
+    sleep 1
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -342,22 +398,11 @@ else
   if [ -z "$pool" ]; then
     # Our own per-uid intermediate under the physical TMPDIR (or /tmp), so the
     # pool's parent is a directory only we can write, never the sticky /tmp.
-    tmp_phys=
-    case ${TMPDIR:-} in
-    /*) tmp_phys=$(CDPATH='' cd -- "$TMPDIR" 2>/dev/null && pwd -P) || tmp_phys= ;;
-    esac
-    # A TMPDIR is only trusted when it is ours or sticky (like /tmp itself):
-    # somebody else's plain directory could be rigged. Silent fallback.
-    if [ -n "$tmp_phys" ] && ! owned_by "$tmp_phys" "$real_uid" &&
-      [ -z "$(find "$tmp_phys" -prune -perm -1000 -print 2>/dev/null)" ]; then
-      tmp_phys=
+    if ! tmp_root; then
+      die "cannot resolve the temporary directory $fallback_root, the fallback for TMPDIR"
     fi
-    if [ -z "$tmp_phys" ]; then
-      seam GATE_LOCK_TEST_TMP_ROOT
-      fallback_root=${seam_value:-/tmp}
-      tmp_phys=$(CDPATH='' cd -- "$fallback_root" 2>/dev/null && pwd -P) || die "cannot resolve $fallback_root"
-    fi
-    [ "$tmp_phys" != / ] || tmp_phys=
+    [ -n "$tmp_phys" ] ||
+      die "the temporary directory for the gate lock would be the filesystem root; name the pool with GATE_LOCK_DIR instead"
     inter=$tmp_phys/gate-lock-$real_uid
     mkdir -m 0700 "$inter" 2>/dev/null
     if [ -h "$inter" ] || [ ! -d "$inter" ] || ! owned_by "$inter" "$leaf_uid" || ! mode_is_0700 "$inter"; then
@@ -407,6 +452,9 @@ if [ ! -e "$marker" ]; then
     printf '1\n' >"$marker_tmp"
   ) 2>/dev/null; then
     chmod 0600 "$marker_tmp" 2>/dev/null
+    # H1: between writing the temp marker and linking it, the only state in
+    # which two acquirers can overlap on a pool that has no marker yet (R10).
+    pause_at GATE_LOCK_TEST_PAUSE_BEFORE_FORMAT_LINK
     ln "$marker_tmp" "$marker" 2>/dev/null
     rm -f "$marker_tmp"
   fi
@@ -560,17 +608,6 @@ now_s() {
   is_digits "$now" || die "cannot read the clock (date +%s gave '$now')"
 }
 
-# pause_at SEAM (H1-H8, D20): in test mode, when the seam names a file, create
-# it, then wait (whole seconds, L10) for as long as it exists.
-pause_at() {
-  seam "$1"
-  [ -n "$seam_value" ] || return 0
-  : >"$seam_value" 2>/dev/null
-  while [ -e "$seam_value" ]; do
-    sleep 1
-  done
-}
-
 # rdf FILE: the first line of a regular file (not a symlink), without its
 # newline, in $rd; empty on any failure.
 rdf() {
@@ -686,6 +723,23 @@ read_slot() {
   s_worktree=$rd
   rdf "$1/project"
   s_project=$rd
+}
+
+# check_label LABEL (D14, Q14): the owner file is one line, so a label is
+# accepted only when it can be read back and compared: printable ASCII (space
+# to tilde) under LC_ALL=C, which excludes a newline and every control
+# character, and at most 128 bytes. ${#label} counts bytes because LC_ALL=C is
+# exported above. A refusal is exit 2 and happens before anything is taken.
+check_label() {
+  cl_bytes=${#1}
+  if [ "$cl_bytes" -gt 128 ]; then
+    die "the lane label must be at most 128 bytes, got $cl_bytes; the owner file is one line of the slot and is compared byte for byte"
+  fi
+  case $1 in
+  *[!\ -~]*)
+    die "the lane label must be printable ASCII (space to ~, so no newline and no control character); it is written to the slot's owner file as one line"
+    ;;
+  esac
 }
 
 # need_caller WHAT: GATE_LOCK_CALLER_PID is required (C6) and must be a pid of
@@ -889,7 +943,9 @@ remove_if_ours() {
     put_back "$aside" "$ri_slot" "$4" different || :
     return 1
   fi
-  # GL2b hook point: H7 (before-release), after the owner and pid check.
+  # H7 (before-release): after the owner and pid check, before the removal, so
+  # a test can hold the process in the window a second signal used to break.
+  pause_at GATE_LOCK_TEST_PAUSE_BEFORE_RELEASE
   rm -rf "${aside:?}" 2>/dev/null
   if [ -e "$aside" ] || [ -h "$aside" ]; then
     put_back "$aside" "$ri_slot" "$4" failed || :
@@ -913,6 +969,310 @@ names_in() {
 # lossy but always valid encoding); backslash and double quote are escaped.
 json_str() {
   printf '"%s"' "$(printf '%s' "$1" | tr -c ' -~' '?' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+# ---------------------------------------------------------------------------
+# The janitor (D16, Q16): the `clean` subcommand, also run at the start of
+# acquire and never on status (C27).
+#
+# A transient (F20, F23) goes only when its embedded pid is dead AND it is at
+# least a stale threshold old. The age is judged with `touch -t` on a reference
+# file plus `find <x> -prune ! -newer <ref>`, so no `stat` is needed and the
+# threshold is the same one every reader uses (F35). A `.reclaim.*` aside goes
+# only when, additionally, F40 judges what it holds not alive: the recorded
+# holder is dead, or its beat is stale.
+# ---------------------------------------------------------------------------
+# touch_stamp EPOCH: a `touch -t` stamp for EPOCH, in $stamp. Both sides are UTC
+# (L7 has no monotonic source either), so a daylight-saving transition between
+# now and the reference cannot shift the reference by an hour: a local stamp
+# read from one zone and written in another is not an instant, and a wall clock
+# inside a spring-forward gap does not exist at all.
+# `date +%s` is portable, converting an epoch to a broken-down time is not:
+# GNU and busybox read `date -d @N`, BSD and macOS `date -r N`. When neither is
+# available the janitor removes nothing at all, which is the safe answer (the
+# age half of the condition cannot be judged, so nothing is).
+touch_stamp() {
+  stamp=$(TZ=UTC0 date -u -d "@$1" +%Y%m%d%H%M.%S 2>/dev/null) || stamp=
+  if [ -z "$stamp" ]; then
+    stamp=$(TZ=UTC0 date -u -r "$1" +%Y%m%d%H%M.%S 2>/dev/null) || stamp=
+  fi
+}
+
+# janitor_ref: create the age reference file and set $ja_ref to its path.
+# Returns 1 when it cannot be created or aged, which makes the whole pass a
+# no-op. The file lives in a temp directory, not in the pool: it is not a
+# transient, so a leftover in the pool would never be cleaned up (Q16). The
+# directory is the same one the pool resolver trusts (tmp_trusted), because a
+# reference another user could replace would make every transient look old.
+janitor_ref() {
+  touch_stamp "$((now - stale_seconds))"
+  [ -n "$stamp" ] || return 1
+  tmp_root || return 1
+  [ -n "$tmp_phys" ] || return 1
+  ja_ref=$tmp_phys/.gate-lock-janitor.$$
+  ja_k=0
+  while [ "$ja_k" -le 20 ]; do
+    if [ "$ja_k" -eq 0 ]; then
+      ja_try=$ja_ref
+    else
+      ja_try=$ja_ref.$ja_k
+    fi
+    # noclobber: a name that is already there is somebody else's, and is never
+    # removed. A leftover of a dead process that had our pid just costs the
+    # next free suffix.
+    if [ ! -e "$ja_try" ] && [ ! -h "$ja_try" ]; then
+      if (
+        set -C
+        : >"$ja_try"
+      ) 2>/dev/null; then
+        chmod 0600 "$ja_try" 2>/dev/null
+        ja_ref=$ja_try
+        if ! TZ=UTC0 touch -t "$stamp" "$ja_ref" 2>/dev/null; then
+          rm -f "$ja_ref" 2>/dev/null
+          return 1
+        fi
+        # The last chance to notice a replaced reference: what we are about to
+        # trust is a plain, private file of ours, not a link and not a
+        # directory (the tmp_trusted directory already makes a plant hard, and
+        # a same-uid plant is out of this tool's threat model, P7).
+        pause_at GATE_LOCK_TEST_PAUSE_AFTER_JANITOR_REF
+        if [ -h "$ja_ref" ] || [ ! -f "$ja_ref" ] || ! owned_by "$ja_ref" "$real_uid"; then
+          rm -f "$ja_ref" 2>/dev/null
+          return 1
+        fi
+        return 0
+      fi
+    fi
+    ja_k=$((ja_k + 1))
+  done
+  return 1
+}
+
+# janitor_name NAME (D16, F19-F23): sets $j_kind (cand, beatnew, formattmp or
+# reclaim), $j_pid (the creating process) and $j_slot when NAME is a transient
+# of a canonical slot, or of the pool marker. $j_kind is empty for everything
+# else, and then nothing is ever done with the name: a name that merely looks
+# like a transient is somebody else's.
+janitor_name() {
+  j_kind=
+  j_pid=
+  j_slot=
+  case $1 in
+  .format.tmp.*)
+    # F23: the marker temp lives in the pool root, not beside a slot.
+    j_kind=formattmp
+    j_tail=${1#.format.tmp.}
+    ;;
+  *.cand.*)
+    j_kind=cand
+    j_slot=${1%%.cand.*}
+    j_tail=${1#*.cand.}
+    ;;
+  *.beatnew.*)
+    j_kind=beatnew
+    j_slot=${1%%.beatnew.*}
+    j_tail=${1#*.beatnew.}
+    ;;
+  *.reclaim.*)
+    # `.reclaim.<pid>.<pass>`, where the token after the pid is opaque (D12):
+    # readers match the pid only and never assume the shape of the token.
+    j_kind=reclaim
+    j_slot=${1%%.reclaim.*}
+    j_rest=${1#*.reclaim.*}
+    case $j_rest in
+    *.*) j_tail=${j_rest%%.*} ;;
+    *) j_kind= ;;
+    esac
+    ;;
+  *) j_kind= ;;
+  esac
+  [ -n "$j_kind" ] || return 0
+  if [ "$j_kind" != formattmp ]; then
+    # A transient hangs off a canonical slot name (F19, F21): the shape rule,
+    # not the position, is what keeps a transient out of the slot set.
+    canonical_slot "$pool/$j_slot" || j_kind=
+    [ -n "$j_kind" ] || return 0
+  fi
+  is_digits "$j_tail" || j_kind=
+  [ -n "$j_kind" ] || return 0
+  strip_zeros "$j_tail"
+  # A pid of zero is not a process, so the name is not one of ours.
+  [ "$norm" != 0 ] || j_kind=
+  [ -n "$j_kind" ] || return 0
+  j_pid=$norm
+}
+
+# janitor_put_back ORIGINAL (D16): put the private copy back under the name it
+# had, when that name is free again. When the name has been taken again the copy
+# stays where it is - it is a transient, so a later pass removes it - and says
+# so. Never deletes, and never moves anything that is not still the plain
+# directory of ours that was moved.
+janitor_put_back() {
+  if [ ! -e "$jp_priv" ] && [ ! -h "$jp_priv" ]; then
+    return 0
+  fi
+  if ! aside_ok "$jp_priv"; then
+    printf 'gate-lock: janitor: left %s alone: it is not the directory this pass moved\n' "$jp_priv" >&2
+    return 0
+  fi
+  if [ -e "$1" ] || [ -h "$1" ]; then
+    printf 'gate-lock: janitor: left %s: %s was taken again while it was judged\n' "$jp_priv" "$1" >&2
+    return 0
+  fi
+  mv "$jp_priv" "$1" 2>/dev/null || :
+  return 0
+}
+
+# janitor_take ASIDE (D16): move a reclaim aside to a name this pass owns before
+# anything is read or removed through it, and set $jp_priv to that name.
+#
+# Two janitor passes can overlap, and a reclaimer whose pid was recycled can
+# recreate the old name with the same pass token. Reading and removing through a
+# name only this process knows means whatever appears at the old name is neither
+# judged nor removed by this pass. The new name is itself a transient
+# (`.reclaim.<pid>.<token>`), so a later pass can clean it up once this process
+# is gone and the entry is old enough.
+#
+# Returns 1 with the aside left exactly where it was when the name is taken, the
+# rename fails, it nests, or what moved is not a plain directory of ours; the
+# caller then judges nothing and removes nothing.
+janitor_take() {
+  jt_slot=${1%.reclaim.*}
+  jt_k=0
+  while :; do
+    if [ "$jt_k" -eq 0 ]; then
+      jp_priv=$jt_slot.reclaim.$$.j
+    else
+      jp_priv=$jt_slot.reclaim.$$.j$jt_k
+    fi
+    if [ ! -e "$jp_priv" ] && [ ! -h "$jp_priv" ]; then
+      break
+    fi
+    jt_k=$((jt_k + 1))
+    [ "$jt_k" -le 99 ] || return 1
+  done
+  # A symlink is never moved through, and never moved.
+  if [ -h "$1" ]; then
+    return 1
+  fi
+  mv "$1" "$jp_priv" 2>/dev/null || return 1
+  # mv onto an existing directory nests the source inside it and exits 0 (D11):
+  # the source itself goes back where it was, never the destination, never
+  # deleted.
+  if [ -d "$jp_priv/${1##*/}" ]; then
+    if [ ! -e "$1" ] && [ ! -h "$1" ]; then
+      mv "$jp_priv/${1##*/}" "$1" 2>/dev/null || :
+    fi
+    return 1
+  fi
+  # The same provenance an aside is judged by: a real directory, not a link,
+  # ours. Anything else stays at the private name, which is a transient, and is
+  # left for a later pass.
+  if ! aside_ok "$jp_priv"; then
+    return 1
+  fi
+  return 0
+}
+
+# janitor_pass: one pass over the pool's entries. Prints `janitor: removed
+# <name>` for each removal.
+janitor_pass() {
+  now_s
+  janitor_ref || return 0
+  for jp_path in "$pool"/* "$pool"/.[!.]*; do
+    if [ ! -e "$jp_path" ] && [ ! -h "$jp_path" ]; then
+      continue
+    fi
+    jp_name=${jp_path##*/}
+    janitor_name "$jp_name"
+    [ -n "$j_kind" ] || continue
+    jp_file=$pool/$jp_name
+    # Provenance first, so nothing is even looked at that is a symlink or is
+    # not ours: nothing is ever deleted through a link or a foreign directory.
+    if [ "$j_kind" = cand ] || [ "$j_kind" = reclaim ]; then
+      aside_ok "$jp_file" || continue
+    else
+      [ ! -h "$jp_file" ] || continue
+      [ -f "$jp_file" ] || continue
+      owned_by "$jp_file" "$slot_uid" || continue
+    fi
+    # The creator must be gone. A recycled pid makes this judge a new process
+    # dead, and the transient it is filling is taken: its write then fails
+    # (F31), create_slot answers "not won", and the creator retries the pass
+    # (D16). Nothing is lost, and no slot was ever misjudged.
+    if pid_alive "$j_pid"; then
+      continue
+    fi
+    # Older than the stale threshold: mtime at or before the reference.
+    if [ -z "$(find "$jp_file" -prune ! -newer "$ja_ref" -print 2>/dev/null)" ]; then
+      continue
+    fi
+    if [ "$j_kind" = reclaim ]; then
+      # Judged and removed through a name this pass owns alone: an overlapping
+      # pass, and a reclaimer with a recycled pid that recreated the old name,
+      # can then never have their directory read or deleted here.
+      jp_orig=$jp_file
+      if ! janitor_take "$jp_orig"; then
+        continue
+      fi
+      jp_file=$jp_priv
+      pause_at GATE_LOCK_TEST_PAUSE_AFTER_JANITOR_RENAME
+      # What the aside holds is judged by F40, exactly as any other reader
+      # would: a dead holder, or a beat that is stale or missing. The two values
+      # are read and read again, and only a pair of reads that agree is judged,
+      # so a slot replaced under the janitor is never removed on a half-read.
+      rdf "$jp_file/pid"
+      jp_pid=$rd
+      rdf "$jp_file/beat"
+      jp_beat=$rd
+      pause_at GATE_LOCK_TEST_PAUSE_AFTER_JANITOR_CONTENTS
+      rdf "$jp_file/pid"
+      if [ "$rd" != "$jp_pid" ]; then
+        janitor_put_back "$jp_orig"
+        continue
+      fi
+      rdf "$jp_file/beat"
+      if [ "$rd" != "$jp_beat" ]; then
+        janitor_put_back "$jp_orig"
+        continue
+      fi
+      jp_alive=0
+      pid_alive "$jp_pid" && jp_alive=1
+      judge_beat "$jp_beat"
+      if [ "$jp_alive" = 1 ] && [ "$beat_fresh" = 1 ]; then
+        janitor_put_back "$jp_orig"
+        continue
+      fi
+    fi
+    # The last look before removing: the name must still be the transient this
+    # pass judged, still a plain thing of ours. Anything else is left alone and
+    # judged on its own turn.
+    pause_at GATE_LOCK_TEST_PAUSE_BEFORE_JANITOR_REMOVE
+    if [ "$j_kind" = cand ] || [ "$j_kind" = reclaim ]; then
+      if ! aside_ok "$jp_file"; then
+        # A copy this pass moved goes back under the name it had; anything else
+        # is left exactly as it is.
+        if [ "$j_kind" = reclaim ]; then
+          janitor_put_back "$jp_orig"
+        fi
+        continue
+      fi
+    else
+      [ ! -h "$jp_file" ] || continue
+      [ -f "$jp_file" ] || continue
+      owned_by "$jp_file" "$slot_uid" || continue
+    fi
+    if [ "$j_kind" = cand ] || [ "$j_kind" = reclaim ]; then
+      rm -rf "${jp_file:?}" 2>/dev/null
+    else
+      rm -f "$jp_file" 2>/dev/null
+    fi
+    if [ ! -e "$jp_file" ] && [ ! -h "$jp_file" ]; then
+      printf 'gate-lock: janitor: removed %s\n' "$jp_name"
+    fi
+  done
+  rm -f "$ja_ref" 2>/dev/null
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1066,14 +1426,20 @@ remember_holder() {
   h_kind=$5
 }
 
-# put_file NAME VALUE: one line into the candidate, mode 0600 (D23).
+# put_file NAME VALUE: one line into the candidate, mode 0600 (D23). The whole
+# write is a group with stderr redirected: a redirection into a candidate that
+# has just been removed is reported by the shell itself, before the command
+# runs, and `2>/dev/null` on the command alone would not hide that.
 put_file() {
-  printf '%s\n' "$2" >"$cs_cand/$1" 2>/dev/null && chmod 0600 "$cs_cand/$1" 2>/dev/null
+  {
+    printf '%s\n' "$2" >"$cs_cand/$1" && chmod 0600 "$cs_cand/$1" 2>/dev/null
+  } 2>/dev/null
 }
 
 # create_slot SLOT (F31-F32, R1, R2): fill a candidate with the six files, rename
 # it onto the slot name, detect nesting, read back. Returns 0 when the name was
-# won, 1 when not.
+# won, 1 when not (try again on the next pass), 2 when the candidate could not
+# even be made here, which is a pool problem and not a busy name.
 create_slot() {
   cs_slot=$1
   cs_cand=$cs_slot.cand.$$
@@ -1081,10 +1447,18 @@ create_slot() {
   rm -rf "$cs_cand" 2>/dev/null
   mkdir -m 0700 "$cs_cand" 2>/dev/null || return 2
   now_s
+  pause_at GATE_LOCK_TEST_PAUSE_AFTER_CANDIDATE_MKDIR
   if ! {
     put_file owner "$lane" && put_file pid "$caller" && put_file started "$now" &&
       put_file beat "$now" && put_file worktree "$wt" && put_file project "${wt##*/}"
   }; then
+    if [ ! -d "$cs_cand" ]; then
+      # The candidate is gone and we did not remove it: a janitor pass of another
+      # process judged this pid dead - it had not been reused by this process
+      # yet - and took the directory (D16). The pool is writable, so this is
+      # "not won", not a refusal: the next pass makes a new candidate.
+      return 1
+    fi
     rm -rf "${cs_cand:?}" 2>/dev/null
     return 2
   fi
@@ -1216,27 +1590,117 @@ acquire_one() {
   done
 }
 
+# same_worktree_scan MYSLOT (F56, F56a): after the read-back that proved the
+# slot was won, scan every OTHER canonical, provenance-valid slot - including
+# slots beyond the configured count, in either direction, because yielding only
+# downwards lets a release re-order two acquirers into one worktree. A rival
+# blocks only when its worktree is the caller's and its holder is answering
+# (F40: a live pid AND a fresh beat). The scan reads; it never reclaims and
+# never alters.
+#
+# A slot is judged on one *confirmed* generation: its worktree, owner, pid and
+# beat are read, read again, and only a pair of reads that agree is judged. A
+# slot released and replaced between the reads would otherwise be read as the
+# caller's own worktree together with the new holder's live pid and fresh beat,
+# and the caller would give its slot back for a rival that is not there. Sets
+# $sw_found and, when it is 1, $sw_slot $sw_owner $sw_pid $sw_beat.
+same_worktree_scan() {
+  sw_found=0
+  sw_slot=
+  sw_owner=
+  sw_pid=
+  sw_beat=
+  sw_n=0
+  while [ "$sw_n" -lt 64 ]; do
+    slot_path "$sw_n"
+    if [ "$sp" != "$1" ] && slot_valid "$sp"; then
+      read_slot "$sp"
+      sw_wt=$s_worktree
+      sw_owner=$s_owner
+      sw_pid=$s_pid
+      sw_beat=$s_beat
+      if [ -n "$sw_wt" ] && [ "$sw_wt" = "$wt" ]; then
+        pause_at GATE_LOCK_TEST_PAUSE_BEFORE_SAME_WORKTREE_CONFIRM
+        read_slot "$sp"
+        if [ "$s_worktree" != "$sw_wt" ] || [ "$s_owner" != "$sw_owner" ] ||
+          [ "$s_pid" != "$sw_pid" ] || [ "$s_beat" != "$sw_beat" ]; then
+          # The slot changed hands between the two reads. Nothing is judged on
+          # a half-read slot: the generation now there is judged on its own if
+          # the scan reaches it again, and its holder is an acquirer that scans
+          # us in turn (F56c), so no two gates can run in one worktree.
+          sw_n=$((sw_n + 1))
+          continue
+        fi
+        now_s
+        sw_alive=0
+        pid_alive "$sw_pid" && sw_alive=1
+        judge_beat "$sw_beat"
+        if [ "$sw_alive" = 1 ] && [ "$beat_fresh" = 1 ]; then
+          sw_slot=$sp
+          sw_found=1
+          return 0
+        fi
+      fi
+    fi
+    sw_n=$((sw_n + 1))
+  done
+}
+
+# give_back MYSLOT (F56, F60): hand a slot this invocation won back to the pool
+# because a rival in the same worktree answers. The removal is conditional (the
+# owner and pid must still be ours), so a contender that took the name in the
+# window keeps its slot; the refusal answer is the same either way (R5).
+give_back() {
+  pause_at GATE_LOCK_TEST_PAUSE_BEFORE_SAME_WORKTREE_GIVE_BACK
+  remove_if_ours "$1" "$lane" "$caller" give-back
+  case $? in
+  0 | 4) return 0 ;;
+  1)
+    printf 'gate-lock: %s changed hands before it could be given back and was left alone\n' "$1" >&2
+    ;;
+  *)
+    printf 'gate-lock: %s could not be given back and still holds this lock (pid %s); release it with GATE_LOCK_CALLER_PID=%s\n' "$1" "$caller" "$caller" >&2
+    ;;
+  esac
+  return 0
+}
+
 do_acquire() {
   lane=$1
+  # D14: a label that cannot be stored in a one-line file is refused before
+  # anything is taken, so nothing is ever written with it.
+  check_label "$lane"
   need_caller acquire
   self_held_check
   resolve_identity
   slot_out_check
-  # GL2b hooks: the janitor (D16) runs here, and the lane label is validated
-  # (D14) before this point.
+  # D16: the janitor runs here, before the slot loop, so a transient left by a
+  # dead process is gone before this invocation makes one of its own.
+  janitor_pass
   n=0
   while [ "$n" -lt "$slot_count" ]; do
     slot_path "$n"
     if acquire_one "$sp"; then
-      # GL2b hooks: the same-worktree scan (F56) runs here, with the F60
-      # give-back and the H5 pause; both come before anything is printed.
-      printf 'gate-lock: acquired by %s pid %s at %s\n' "$lane" "$caller" "$sp"
-      if ! write_slot_out "$sp"; then
-        remove_if_ours "$sp" "$lane" "$caller" give-back
+      # The slot just won is kept in its own variable: the scan below walks the
+      # slot numbers and overwrites the loop's $sp.
+      won=$sp
+      # F56: the same-worktree scan, the conditional give-back and the busy
+      # line all come before anything is printed or recorded (F56b).
+      pause_at GATE_LOCK_TEST_PAUSE_BEFORE_SAME_WORKTREE_SCAN
+      same_worktree_scan "$won"
+      if [ "$sw_found" = 1 ]; then
+        # F56b: no `acquired` line and no slot-path file on this answer.
+        give_back "$won"
+        printf 'gate-lock: busy: %s is held by %s (pid %s, beat %s) in the same worktree %s; sleep and retry, and never remove the lock by hand\n' "$sw_slot" "${sw_owner:-unknown}" "$sw_pid" "$sw_beat" "$wt" >&2
+        exit 75
+      fi
+      printf 'gate-lock: acquired by %s pid %s at %s\n' "$lane" "$caller" "$won"
+      if ! write_slot_out "$won"; then
+        remove_if_ours "$won" "$lane" "$caller" give-back
         case $? in
         0 | 4) die "the slot path cannot be recorded in GATE_LOCK_SLOT_OUT=$out; the lock was given back" ;;
         1) die "the slot path cannot be recorded in GATE_LOCK_SLOT_OUT=$out; the slot changed hands and was left alone" ;;
-        *) die "the slot path cannot be recorded in GATE_LOCK_SLOT_OUT=$out, and the lock was NOT given back: $sp still holds it; run 'gate-lock release $lane' (with GATE_LOCK_CALLER_PID=$caller) to remove it" ;;
+        *) die "the slot path cannot be recorded in GATE_LOCK_SLOT_OUT=$out, and the lock was NOT given back: $won still holds it; run 'gate-lock release $lane' (with GATE_LOCK_CALLER_PID=$caller) to remove it" ;;
         esac
       fi
       exit 0
@@ -1482,6 +1946,17 @@ do_status() {
 }
 
 # ---------------------------------------------------------------------------
+# clean (D16): the janitor as a subcommand of its own, so an operator can run
+# the same pass that every acquire runs. Read-only otherwise, and it never
+# touches a slot.
+# ---------------------------------------------------------------------------
+
+do_clean() {
+  janitor_pass
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch (C2): usage errors come after configuration (C1, D9).
 # ---------------------------------------------------------------------------
 
@@ -1510,7 +1985,11 @@ status)
   *) usage_error "status takes no arguments but --json" ;;
   esac
   ;;
-clean | run)
+clean)
+  [ "$#" -eq 1 ] || usage_error "clean takes no arguments"
+  do_clean
+  ;;
+run)
   echo "gate-lock: not implemented yet" >&2
   exit 2
   ;;

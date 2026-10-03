@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { freshPool, runBin, scratchOf } from './harness.js';
 
-/** What `clean` and `run` still print once configuration has resolved (GL2b and GL3 replace it). */
+/** What `run` still prints once configuration has resolved (GL3 replaces it). */
 export const NOT_IMPL = 'gate-lock: not implemented yet\n';
 
 export const UID = process.getuid();
@@ -24,13 +24,13 @@ let lastPool;
 
 /**
  * Configuration was accepted: the subcommand then ran (`status` exits 0 with
- * nothing on stderr), or was refused on its own terms (a usage error, the
- * missing caller pid), or is not built yet (`clean`, `run`); and, for an
- * explicit pool, the pool now holds its .format marker.
+ * nothing on stderr, `clean` exits 0 silently), or was refused on its own
+ * terms (a usage error, the missing caller pid), or is not built yet (`run`);
+ * and, for an explicit pool, the pool now holds its .format marker.
  */
 export function accepted(r) {
   const said =
-    (r.status === 0 && r.stderr === '' && /^(free|\/)/.test(r.stdout)) ||
+    (r.status === 0 && r.stderr === '' && (r.stdout === '' || /^(free|\/)/.test(r.stdout))) ||
     (r.status === 2 &&
       r.stdout === '' &&
       (r.stderr === NOT_IMPL ||
