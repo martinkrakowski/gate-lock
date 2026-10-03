@@ -2329,6 +2329,7 @@ run_supervise() {
   sv_dir=$5
   sv_alive=$sv_dir/beat-alive
   sv_status=$sv_dir/beat-status
+  sv_beat=$sv_dir/beat.pid
   sv_stop=0
   sv_seen=0
   sv_restart=0
@@ -2337,10 +2338,11 @@ run_supervise() {
     rm -f "$sv_status" 2>/dev/null
     run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" &
     sv_loop=$!
-    # C31: the heartbeat's pid is announced on stdout. It is the loop's own pid,
-    # so a caller that signals it stops the beats, and the supervisor restarts it
-    # (D10) rather than leaving the slot unrefreshed.
+    # C31: the heartbeat's pid is announced on stdout, and published to this run's
+    # private directory straight after, so `run` cannot tear the supervisor down
+    # before it has said anything. A restarted loop is announced the same way.
     printf 'gate-lock: heartbeat pid %s every %ss while %s runs\n' "$sv_loop" "$sv_period" "$sv_lane"
+    printf '%s\n' "$sv_loop" >"$sv_beat" 2>/dev/null
     sv_mark=
     sv_stale=0
     sv_asked=0
@@ -2359,15 +2361,25 @@ run_supervise() {
         sv_stale=0
       fi
       # A stop is pending: the loop is asked again and again, because it may be
-      # inside a refresh that must not be cut off (C41, R7) and the only thing
-      # that ends that wait is the loop itself. This never falls through to a
-      # bare `wait`, which would block on a loop nobody had stopped.
+      # inside a refresh that must not be cut off (C41, R7) and only the loop can
+      # end that wait. Three seconds is enough for a refresh to land; a loop that
+      # has not stopped by then is either gone without leaving a status (a signal
+      # between its fork and its trap) or wedged, and both are answered by the
+      # KILL below - so the cleanup never waits a whole heartbeat period.
       if [ "$sv_stop" = 1 ]; then
         kill -TERM "$sv_loop" 2>/dev/null
         sv_asked=$((sv_asked + 1))
-        if [ "$sv_asked" -ge 30 ]; then
+        if [ "$sv_asked" -ge 3 ]; then
+          kill -KILL "$sv_loop" 2>/dev/null
           break
         fi
+        # A loop that was in its pause answers in milliseconds, so its status is
+        # looked for before a second is spent waiting for it.
+        sv_spin=0
+        while [ ! -e "$sv_status" ] && [ "$sv_spin" -lt 20000 ]; do
+          sv_spin=$((sv_spin + 1))
+        done
+        [ -e "$sv_status" ] && break
         sleep 1
         continue
       fi
@@ -2618,6 +2630,20 @@ do_run() {
   run_cmd_pid=$!
   run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" &
   run_sup_pid=$!
+  # C31: the heartbeat is started before the command is waited for, and the
+  # supervisor's announcement is waited for here - before anything can tear it
+  # down - so a command that ends at once still leaves the "heartbeat pid" line
+  # on stdout. The supervisor publishes the pid to this run's private directory
+  # straight after printing it, so the file is proof the line is out.
+  run_polls=0
+  while [ ! -s "$run_dir/beat.pid" ] && [ "$run_polls" -lt 2000 ]; do
+    run_polls=$((run_polls + 1))
+  done
+  run_polls=0
+  while [ ! -s "$run_dir/beat.pid" ] && [ "$run_polls" -lt 3 ]; do
+    run_polls=$((run_polls + 1))
+    sleep 1
+  done
   if [ -n "$run_sig" ]; then
     run_exit_code=$run_sig_code
     exit "$run_sig_code"
