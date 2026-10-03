@@ -2092,9 +2092,11 @@ run_forward_term() {
 # signal at all, and D15 wants a second signal ignored, which is not the same
 # thing as having no handler.
 #
-# The second it sleeps in is published by name, so that cancelling this watchdog
-# can stop that second too and leave nothing behind: a reparented `sleep` would
-# outlive the run by a whole grace period.
+# The grace is slept a second at a time, checking the stop file between the steps,
+# so a cancel is noticed within a second. It matters that it is not one long sleep:
+# cancelling kills this subshell, and the `sleep` it is inside would then be
+# reparented and live for the rest of the grace. One step means an orphan lives at
+# most a second, and no pid needs publishing for it.
 #
 # RUNPID is this run's own pid, passed in rather than read from `$PPID`: inside a
 # subshell `$PPID` is not reliably the process that forked it, and a watchdog that
@@ -2103,12 +2105,16 @@ run_escalator() {
   (
     exec >/dev/null 2>&1
     trap '' TERM INT HUP QUIT
-    sleep "$1" &
-    esc_sleep=$!
-    printf '%s\n' "$esc_sleep" >"$3/escalator.sleep" 2>/dev/null
-    wait "$esc_sleep" 2>/dev/null
-    # Cancelled: the second this watchdog was sleeping in was stopped by name.
-    [ -e "$3/escalator.stop" ] && exit 0
+    esc_grace=$1
+    esc_cmd=$2
+    esc_dir=$3
+    esc_run=$4
+    while [ "$esc_grace" -gt 0 ]; do
+      [ -e "$esc_dir/escalator.stop" ] && exit 0
+      sleep 1
+      esc_grace=$((esc_grace - 1))
+    done
+    [ -e "$esc_dir/escalator.stop" ] && exit 0
     # The grace is up, so the KILL is due - but only while this run is still here
     # to want it. A run that was KILLed itself is gone, its command may have been
     # reaped, and that pid may since have been given to somebody else, so a KILL
@@ -2116,29 +2122,27 @@ run_escalator() {
     # that tells the two apart; the residual window is the one command this
     # subshell still has to run, so it is microseconds, and a pid would have to be
     # recycled inside it.
-    kill -0 "$4" 2>/dev/null || exit 0
-    kill -KILL "$2" 2>/dev/null
+    kill -0 "$esc_run" 2>/dev/null || exit 0
+    kill -KILL "$esc_cmd" 2>/dev/null
   ) &
   run_escalator_pid=$!
+  # The watchdog's own pid, published by the only process that knows it: a
+  # subshell cannot portably name itself, and a test that has to say the watchdog
+  # is gone after the run needs something to name.
+  printf '%s\n' "$run_escalator_pid" >"$run_dir/escalator.pid" 2>/dev/null
 }
 
 # run_cancel_escalator: the command is gone, so the watchdog has nothing left to
-# do - and nothing of ours may outlive this run. It is told to stop, the second it
-# is sleeping in is stopped by name, and the watchdog itself is reaped.
+# do - and nothing of ours may outlive this run. It is told to stop, so the step it
+# is in ends with it, and then it is killed and reaped: a step that is already
+# running would otherwise be reparented and live for up to a second.
 run_cancel_escalator() {
   [ -n "$run_escalator_pid" ] || return 0
   : >"$run_dir/escalator.stop" 2>/dev/null
-  esc_sleep=$(cat "$run_dir/escalator.sleep" 2>/dev/null)
-  case ${esc_sleep:-} in
-  '' | *[!0-9]*) ;;
-  # KILL and not TERM: the watchdog ignores TERM before it starts this second, so
-  # the second is born ignoring it, and an ignored signal survives the exec.
-  *) kill -KILL "$esc_sleep" 2>/dev/null ;;
-  esac
   kill -KILL "$run_escalator_pid" 2>/dev/null
   wait "$run_escalator_pid" 2>/dev/null
   run_escalator_pid=
-  rm -f "$run_dir/escalator.sleep" "$run_dir/escalator.stop" 2>/dev/null
+  rm -f "$run_dir/escalator.pid" "$run_dir/escalator.stop" 2>/dev/null
 }
 
 # run_wait_pid PID: wait for a child, waiting again when our own handler

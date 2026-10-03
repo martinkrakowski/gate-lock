@@ -6,11 +6,10 @@
 // runner.test.js. Every window here is a file handshake: a wrapped command
 // announces itself and then blocks reading a fifo, so no test sleeps to
 // synchronise.
-import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { BIN, listing, releaseHook, scratchOf, waitForFile } from './harness.js';
+import { listing, releaseHook, scratchOf, startBin, waitForFile } from './harness.js';
 import {
   TM,
   acquire,
@@ -25,7 +24,6 @@ import {
 } from './slots.js';
 import {
   beatPids,
-  alive,
   blocker,
   freshPool,
   runOnce,
@@ -573,39 +571,50 @@ describe('D10 the supervisor stops a command that ignores TERM', () => {
 });
 
 describe('a probe like the one that hung for 77 minutes', () => {
-  it('D10 under `timeout`, a run around a command that ignores TERM ends by itself: it exits inside the grace, and no lock outlives it', () => {
+  it('D10 around a command that ignores TERM, a run ends by itself: it exits inside the grace, and no lock outlives it', async () => {
     const pool = freshPool();
     const slot = path.join(pool, 'gate.lock');
     // The shape that hung: `timeout 30 gate-lock run lane -- <a command that
     // ignores TERM>`, with the command taking its own slot away so the loop
     // stops it. Which internal path answers depends on whether the loop or the
     // command is first to notice, so the test says what must always be true: the
-    // run ends by itself, well inside the probe's own budget, says the lock was
-    // lost or that it could not give it back, kills the command and leaves the
-    // pool as it found it.
+    // run ends by itself, well inside the budget, says the lock was lost or that
+    // it could not give it back, kills the command and leaves the pool as it
+    // found it.
+    //
+    // The deadline `timeout 30` used to enforce is enforced from node instead:
+    // macOS ships no GNU `timeout`, and a test must not depend on one. A run that
+    // needs this signal is a run that did not end by itself, and that is what the
+    // first assertion below says.
     const block = blocker(pool, 'deaf', { ignoreTerm: true, pre: 'rm -rf "$2"', args: [slot] });
     const status = out(pool, 'probe-status');
-    const probe = spawnSync(
-      'timeout',
-      ['30', BIN, 'run', '--status-file', status, 'lane', '--', ...block.cmd],
-      {
-        env: {
-          PATH: process.env.PATH,
-          HOME: process.env.HOME,
-          GATE_LOCK_DIR: pool,
-          GATE_LOCK_HEARTBEAT_SECONDS: '1',
-          GATE_LOCK_TEST_MODE: '1',
-          GATE_LOCK_TEST_KILL_GRACE: '2',
-        },
-        encoding: 'utf8',
-        timeout: 40000,
+    const gate = startBin(['run', '--status-file', status, 'lane', '--', ...block.cmd], {
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        GATE_LOCK_DIR: pool,
+        GATE_LOCK_SLOTS: '1',
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_MODE: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '2',
       },
-    );
-    // `timeout` answers 124 when its child overran it: this is the whole point
-    // of the test, and the run's own status is what it should be instead.
-    expect(probe.status).not.toBe(124);
-    expect(probe.status).toBe(2);
-    expect(probe.stderr).toMatch(/lock lost|FAILED to release the lock/);
+      cwd: wtDir(pool, 'wt0'),
+    });
+    let neededTheSignal = false;
+    const timer = setTimeout(() => {
+      neededTheSignal = true;
+      gate.child.kill('SIGTERM');
+    }, 30000);
+    let r;
+    try {
+      r = await gate.done;
+    } finally {
+      clearTimeout(timer);
+    }
+    expect(neededTheSignal).toBe(false);
+    expect(r.signal).toBe(null);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/lock lost|FAILED to release the lock/);
     expect(fs.readFileSync(status, 'utf8')).toBe('tool:2\n');
     // The command is dead and the pool is as it was: no slot for the next
     // caller to reclaim, and no transient left in the pool.
@@ -613,7 +622,7 @@ describe('a probe like the one that hung for 77 minutes', () => {
     expect(names(pool)).toEqual(['.format']);
     const pid = Number(fs.readFileSync(`${block.dir}/ready`, 'utf8'));
     expect(track(pid)).toBe(pid);
-    expect(alive(pid)).toBe(false);
+    await waitForDead(pid, 10000);
   }, 60_000);
 });
 

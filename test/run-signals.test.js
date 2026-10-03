@@ -206,7 +206,7 @@ describe('C40 a command that will not stop', () => {
     }
   }, 60_000);
 
-  it('D10 the watchdog and the second it sleeps in are gone once a signalled run ends', async () => {
+  it('D10 the watchdog is gone once a signalled run ends', async () => {
     const pool = freshPool();
     // The private directory is named from the temp root, which a test can point
     // somewhere it owns, so the watchdog's published pids can be read while the
@@ -228,25 +228,24 @@ describe('C40 a command that will not stop', () => {
       await up(deaf);
       track(deaf.pid());
       gate.child.kill('SIGTERM');
-      await until(() => runDirWith(tmpRoot, 'escalator.sleep'), 15000);
+      await until(() => runDirWith(tmpRoot, 'escalator.pid'), 15000);
       const [name] = fs.readdirSync(tmpRoot).filter((n) => n.startsWith('gate-lock-run.'));
       const dir = path.join(tmpRoot, name);
-      const sleepPid = Number(fs.readFileSync(path.join(dir, 'escalator.sleep'), 'utf8'));
-      expect(Number.isInteger(sleepPid)).toBe(true);
+      const watchPid = Number(fs.readFileSync(path.join(dir, 'escalator.pid'), 'utf8'));
+      expect(Number.isInteger(watchPid)).toBe(true);
       const r = await gate.done;
       // The run was signalled, so the signal's own code is what it answers with -
       // the lock was lost as well, and a signal outranks that.
       expect(r.status).toBe(143);
       expect(r.stdout).toContain('released by lane');
-      expect(gone(sleepPid)).toBe(true);
+      expect(stopped(watchPid), 'the watchdog outlived the run').toBe(true);
       expect(fs.existsSync(dir)).toBe(false);
     }
 
-    // (b) The watchdog is cancelled, because the command stopped on its own. The
-    // second it was sleeping in has to go with it: nothing of ours may outlive
-    // the run, and a reparented `sleep` would live for the whole grace. The
-    // command takes two seconds to stop, so the watchdog is still armed while the
-    // test reads what it published.
+    // (b) The watchdog is cancelled, because the command stopped on its own. It
+    // has to go with the run: nothing of ours may outlive it. The command takes
+    // two seconds to stop, so the watchdog is still armed while the test reads
+    // the pid it published.
     {
       const dir = path.join(scratchOf(pool), 'slow-cancel');
       // A long grace, so the watchdog is still sleeping when the cancel runs:
@@ -258,14 +257,14 @@ describe('C40 a command that will not stop', () => {
       await waitForFile(path.join(dir, 'ready'));
       const victim = track(Number(fs.readFileSync(path.join(dir, 'ready'), 'utf8')));
       gate.child.kill('SIGTERM');
-      await until(() => runDirWith(tmpRoot, 'escalator.sleep'), 15000);
+      await until(() => runDirWith(tmpRoot, 'escalator.pid'), 15000);
       const [name] = fs.readdirSync(tmpRoot).filter((n) => n.startsWith('gate-lock-run.'));
       const runDir2 = path.join(tmpRoot, name);
-      const sleepPid = Number(fs.readFileSync(path.join(runDir2, 'escalator.sleep'), 'utf8'));
+      const watchPid = Number(fs.readFileSync(path.join(runDir2, 'escalator.pid'), 'utf8'));
       const r = await gate.done;
       expect(r.status).toBe(143);
       await waitForDead(victim);
-      expect(stopped(sleepPid), 'the watchdog second outlived the run').toBe(true);
+      expect(stopped(watchPid), 'the watchdog outlived the run').toBe(true);
       expect(fs.existsSync(runDir2)).toBe(false);
       expect(names(pool)).toEqual(['.format']);
     }
@@ -288,7 +287,7 @@ describe('C40 a command that will not stop', () => {
     const victim = track(block.pid());
     const dir = path.join(tmpRoot, `gate-lock-run.${gate.child.pid}`);
     gate.child.kill('SIGTERM');
-    await waitForFile(path.join(dir, 'escalator.sleep'), 15000);
+    await waitForFile(path.join(dir, 'escalator.pid'), 15000);
     // KILL the run itself: the lock is now nobody's, and the command's pid may
     // be reused at any moment. The watchdog must notice that its parent is gone
     // and leave the command alone rather than aim a KILL at a stranger.
