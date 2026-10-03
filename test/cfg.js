@@ -13,12 +13,23 @@ export const TM = { GATE_LOCK_TEST_MODE: '1' };
 
 /** Run `status` (any subcommand that is not --format/--version/workers resolves configuration). */
 export function cfg(env = {}, args = ['status']) {
+  const dir = env.GATE_LOCK_DIR;
+  lastPool = typeof dir === 'string' && dir !== '' ? dir.replace(/\/+$/, '') : undefined;
   return runBin(args, { env });
 }
 
-/** Configuration was accepted: exit 2 only because the subcommand is not built yet. */
+// The pool of the latest cfg() call, so accepted() can prove the tool really did
+// its work: a stub that only exits 2 with "not implemented yet" must not pass.
+let lastPool;
+
+/**
+ * Configuration was accepted: exit 2 only because the subcommand is not built
+ * yet, and (for an explicit pool) the pool now holds its .format marker.
+ */
 export function accepted(r) {
-  return r.status === 2 && r.stderr === NOT_IMPL && r.stdout === '';
+  const said = r.status === 2 && r.stderr === NOT_IMPL && r.stdout === '';
+  if (!said || lastPool === undefined) return said;
+  return fs.existsSync(path.join(lastPool, '.format'));
 }
 
 /** A configuration refusal: exit 2, nothing on stdout, one gate-lock: line on stderr. */

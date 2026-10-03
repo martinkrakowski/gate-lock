@@ -646,3 +646,16 @@ describe('D23 umask and explicit modes', () => {
     expect(text).toMatch(/^umask 077$/m);
   });
 });
+
+describe('D1 refusals on a derived pool still point at GATE_LOCK_DIR', () => {
+  it('F8/F13 a bad default pool or marker says to set GATE_LOCK_DIR', () => {
+    const xdg = scratchOf(freshPool(ABSENT));
+    const env = { GATE_LOCK_DIR: undefined, XDG_RUNTIME_DIR: xdg, TMPDIR: undefined };
+    const pool = path.join(xdg, 'gate-lock');
+    mkdirMode(pool, 0o775);
+    refusal(cfg(env), pool, 'set GATE_LOCK_DIR');
+    fs.chmodSync(pool, 0o700);
+    fs.writeFileSync(path.join(pool, '.format'), '2\n');
+    refusal(cfg(env), 'lock format', 'set GATE_LOCK_DIR');
+  });
+});

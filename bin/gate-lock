@@ -272,6 +272,7 @@ if [ -n "${GATE_LOCK_DIR:-}" ]; then
   esac
   pool_label="GATE_LOCK_DIR=$pool"
   parent_label="GATE_LOCK_DIR's parent"
+  pool_hint=
 else
   pool=
   # XDG_RUNTIME_DIR, when it is a plain, absolute, existing 0700 directory of
@@ -325,6 +326,7 @@ else
   fi
   pool_label="the default pool $pool"
   parent_label="the default pool's parent"
+  pool_hint="; set GATE_LOCK_DIR to use another pool"
 fi
 
 # --- Directory rules (F4-F8) --------------------------------------------------
@@ -347,7 +349,7 @@ done
 # including "already exists", are ignored; the judgement below decides.
 mkdir -m 0700 "$pool" 2>/dev/null
 if [ -h "$pool" ] || [ ! -d "$pool" ] || ! owned_by "$pool" "$leaf_uid" || ! not_group_other_writable "$pool"; then
-  die "$pool_label is not safe to use: it must be a directory, not a symlink, owned by uid $leaf_uid, and neither group- nor world-writable; no lock was taken"
+  die "$pool_label is not safe to use: it must be a directory, not a symlink, owned by uid $leaf_uid, and neither group- nor world-writable; no lock was taken$pool_hint"
 fi
 
 # --- The .format marker (F11-F15, D2) -------------------------------------------
@@ -380,7 +382,7 @@ if [ "$found" != 1 ]; then
   else
     shown="'$(printf '%s' "$found" | tr '\n' ' ' | cut -c1-64)'"
   fi
-  die "$pool_label has lock format $shown, but this gate speaks 1; no lock was taken"
+  die "$pool_label has lock format $shown, but this gate speaks 1; no lock was taken$pool_hint"
 fi
 
 # --- Stale threshold (F36, V20) and heartbeat period (D5) ------------------------
