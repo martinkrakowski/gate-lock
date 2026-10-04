@@ -2704,6 +2704,14 @@ run_beat_loop() {
   # The status is written first, because what the supervisor is told must be how
   # this loop ended and not how it tidied up: `$?` is the status the trap was
   # entered with, and it is the only reading of it there is.
+  #
+  # The trap is left as a list of commands in one string, on purpose. `trap name EXIT`
+  # is accepted here, and moving the same statements into a function of their own was
+  # tried and rejected: shellcheck 0.11 reads no invocation through *any* form of it -
+  # a bare name, a quoted one, a double-quoted one - so a handler function is a
+  # function nothing calls (SC2329), and so is anything it calls and nothing else
+  # does. The way out is a caller outside the string, which is what the sweep after
+  # each refresh is.
   trap 'printf "%s\n" "$?" >"$rb_status" 2>/dev/null; trace "loop $$ exiting $(cat "$rb_status" 2>/dev/null)"; rb_sweep; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
   # A staged beat belongs to the heartbeat child that wrote it, and that child may be
   # KILLed - which runs no trap, so nothing removes the file it left. The loop knows
@@ -2800,6 +2808,12 @@ run_beat_loop() {
       printf 'gate-lock: heartbeat: the refresh of %s failed with status %s\n' "$rb_slot" "$rb_hb_st" >&2
     fi
     rm -f "$rb_hb_out" "$rb_inflight" 2>/dev/null
+    # A stage this refresh left behind - its heartbeat child was KILLed between
+    # staging and the rename, so no trap of its own ran - goes now, not at the loop's
+    # exit, so that a stage never outlives the refresh that wrote it while the run is
+    # still going. This is also the one call to rb_sweep that a reader - or a linter -
+    # can see, which is what keeps the function out of SC2329 without a directive.
+    rb_sweep
     if [ "$rb_hb_st" -ne 0 ]; then
       exit 1
     fi
