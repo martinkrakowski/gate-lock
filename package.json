@@ -1,6 +1,6 @@
 {
   "name": "@hexagen-monaco/gate-lock",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "A host-wide gate lock: a shared pool of test-runner slots across projects and worktrees on one host.",
   "license": "MIT",
   "type": "module",
