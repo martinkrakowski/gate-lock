@@ -15,6 +15,7 @@ import {
   blocker,
   childrenMatching,
   freshPool,
+  runDirOf,
   runOnce,
   script,
   startRun,
@@ -64,11 +65,50 @@ function gone(pid) {
 }
 
 /**
- * A hook directory holding the H8 seam of one heartbeat refresh. Releasing it by
- * removing the whole directory releases the parked refresh and, because the path
- * can no longer be created, lets every later refresh through: `pause_at` creates
- * the file it waits on, and a path it cannot create is a pause it does not take.
+ * A live view of a child's stdout, for text it has printed by now and will print
+ * later: the harness has a listener of its own on the same stream from the moment it
+ * starts, so a view that attaches later would miss whatever was printed before it -
+ * and the heartbeat line is printed before a test's first handshake can be waiting.
+ * Attach this as soon as the child is started, and read it whenever.
  */
+function liveStdout(child) {
+  let text = '';
+  child.stdout.setEncoding('utf8').on('data', (d) => {
+    text += d;
+  });
+  return () => text;
+}
+
+/** The staged beats in a pool, by the tool's own name pattern (F39). */
+const stagedBeats = (pool) =>
+  names(pool).filter((n) => /^gate\.lock(\.\d+)?\.beatnew\.\d+$/.test(n));
+
+/** The trace lines that say a refresh was begun, in order. */
+const refreshesIn = (file) =>
+  traceText(file)
+    .split('\n')
+    .filter((line) => line.includes('refreshing ') && line.includes('inflight published'));
+
+/** A hook whose seam takes exactly one refresh, for the tests that park a refresh. */
+function beatHook(pool, name = 'beat-hook') {
+  const dir = path.join(scratchOf(pool), name);
+  fs.mkdirSync(dir, { recursive: true });
+  return {
+    dir,
+    seam: path.join(dir, 'beat-rename'),
+    // The whole directory goes, not just the file in it, and that is what makes the
+    // seam one-shot: `pause_at` creates the file it waits on, so a refresh that comes
+    // after this one cannot be parked by a path that no longer has a directory to be
+    // created in. Removing the file alone would let the next refresh re-create it and
+    // park again - a second parked refresh, which is not what these tests mean, and
+    // which is what macOS CI saw on T36. The seam is one-shot by construction, and
+    // `reparked` is the assertion that keeps it that way.
+    release: () => fs.rmSync(dir, { recursive: true, force: true }),
+    /** Has any refresh parked on this seam since it was released? */
+    reparked: () => fs.existsSync(path.join(dir, 'beat-rename')),
+  };
+}
+
 /** The tool's decision trace, as it stands now, for a failure message. */
 function traceText(file) {
   try {
@@ -76,16 +116,6 @@ function traceText(file) {
   } catch {
     return '(no trace written)';
   }
-}
-
-function beatHook(pool, name = 'beat-hook') {
-  const dir = path.join(scratchOf(pool), name);
-  fs.mkdirSync(dir, { recursive: true });
-  return {
-    dir,
-    seam: path.join(dir, 'beat-rename'),
-    release: () => fs.rmSync(dir, { recursive: true, force: true }),
-  };
 }
 
 /**
@@ -689,8 +719,103 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
+    expect(hook.reparked(), 'a later refresh parked on the released seam').toBe(false);
     expect(gone(beatPids(r.stdout)[0])).toBe(true);
   });
+
+  it('R7 a refresh parked at the seam is the only one: one refresh, and the loop ends clean', async () => {
+    const pool = freshPool();
+    const hook = beatHook(pool);
+    const parked = blocker(pool, 'parked');
+    const trace = path.join(scratchOf(pool), 'trace.log');
+    const gate = startRun(pool, 'lane', parked.cmd, {
+      env: {
+        GATE_LOCK_TEST_MODE: '1',
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '2',
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        GATE_LOCK_TEST_TRACE: trace,
+      },
+    });
+    // The one refresh this test parks, waiting at the rename.
+    await waitForFile(hook.seam);
+    gate.child.kill('SIGTERM');
+    // The ask is the handshake: the supervisor traces every ask, and it makes one only
+    // once the teardown has got as far as stopping the heartbeat. Waiting for that line
+    // rather than for a second is what makes the rest of this test a fact about the tool
+    // and not about how fast this host is.
+    await until(() => /asks loop \d+ \(1\)/.test(traceText(trace)), 20000);
+    // Only now is the parked refresh let go, with the loop already asked to stop. It may
+    // finish it - a refresh in flight is never cut short (C41, R7) - and then it is
+    // done: a stop is asked for and never unasked, so no refresh may begin after it.
+    // This is the shape macOS CI reported, where a second refresh was begun against a
+    // slot that was on its way out and left a staged beat behind.
+    hook.release();
+    const r = await gate.done;
+    expect(refreshesIn(trace), traceText(trace)).toHaveLength(1);
+    expect(traceText(trace), traceText(trace)).toContain('exiting 0');
+    expect(hook.reparked(), 'a second refresh parked on the released seam').toBe(false);
+    expect(r.status, traceText(trace)).toBe(143);
+    expect(r.stderr, `${JSON.stringify(r.stderr)}\n${traceText(trace)}`).toBe('');
+    expect(r.stdout, traceText(trace)).toContain('released by lane');
+    expect(names(pool), traceText(trace)).toEqual(['.format']);
+  }, 60_000);
+
+  it('R7 a loop asked to stop on its way into a refresh starts no refresh at all', async () => {
+    const pool = freshPool();
+    const block = blocker(pool, 'parked');
+    const trace = path.join(scratchOf(pool), 'trace.log');
+    const tmpRoot = scratchOf(pool);
+    // The wedge seam parks the loop in the one place where it has already read its
+    // stop file for this pass and has not yet begun the refresh - which is the whole
+    // window a stop has to be read in twice for. The seam sits between them on
+    // purpose: parked there, the loop's second reading of the stop file is the only
+    // thing between it and a refresh nobody asked for.
+    const wedge = path.join(tmpRoot, 'loop-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        GATE_LOCK_TEST_MODE: '1',
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_LOOP_WEDGE: wedge,
+        GATE_LOCK_TEST_TRACE: trace,
+        GATE_LOCK_TEST_TMP_ROOT: tmpRoot,
+      },
+    });
+    const printed = liveStdout(gate.child);
+    await up(block);
+    // The run announces its loop before the loop can do anything, and the command
+    // coming up says nothing about the heartbeat - so the announcement is waited for,
+    // not assumed to have been printed already.
+    await until(() => beatPids(printed()).length > 0, 10000);
+    const loop = beatPids(printed())[0];
+    expect(loop, printed()).toBeGreaterThan(0);
+    await until(() => childrenMatching(loop, 'sleep 3600').length > 0, 10000);
+    // Asked, not signalled: this is the file `run` writes when it stops the heartbeat,
+    // written here so that the ask is in the past by the time the loop goes on.
+    fs.writeFileSync(path.join(runDirOf(gate.child.pid, tmpRoot), 'loop.stop'), '');
+    // The wedge is a sleep, not a poll, so it is not released by taking the file away -
+    // which is what lets the loop be wedged long enough to be KILLed in the test that
+    // is about that. What releases it here is ending that sleep: the loop then carries
+    // on through the very window this test is about.
+    const [sleeper] = childrenMatching(loop, 'sleep 3600');
+    process.kill(Number(sleeper), 'SIGKILL');
+    // It can act in exactly one of two ways: end, or refresh a slot whose run has
+    // already been told the beat is not wanted.
+    await until(() => refreshesIn(trace).length > 0 || /exiting 0/.test(traceText(trace)), 15000);
+    expect(refreshesIn(trace), traceText(trace)).toEqual([]);
+    block.release();
+    const r = await gate.done;
+    expect(r.status, traceText(trace)).toBe(0);
+    // The run itself has nothing to report: not one of its own lines is here. What may
+    // be is the shell's own notice about the sleep this test just killed - `Killed` on
+    // dash, and `bin/gate-lock: line N: <pid> Killed sleep 3600` on bash - which is
+    // about a job of the loop's and not about the lock.
+    expect(r.stderr, traceText(trace)).not.toMatch(/^gate-lock: /m);
+    expect(r.stdout, traceText(trace)).toContain('released by lane');
+    expect(names(pool), traceText(trace)).toEqual(['.format']);
+    expect(gone(loop), traceText(trace)).toBe(true);
+  }, 60_000);
 
   it('T36 a refresh held longer than the teardown bound is waited for, not cut off', async () => {
     const pool = freshPool();
@@ -736,8 +861,121 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     expect(r.stderr, `${JSON.stringify(r.stderr)}\n${traceText(trace)}`).toBe('');
     expect(r.stdout, traceText(trace)).toContain('released by lane');
     expect(names(pool), traceText(trace)).toEqual(['.format']);
+    // One parked refresh, which is what this test means: a seam that re-parked would
+    // have taken a second refresh and the trace would say so.
+    expect(refreshesIn(trace), traceText(trace)).toHaveLength(1);
+    expect(hook.reparked(), 'a second refresh parked on the released seam').toBe(false);
     expect(gone(beatPids(r.stdout)[0])).toBe(true);
   }, 90_000);
+
+  const aimed = it.skipIf(!HAS_PGREP);
+
+  aimed(
+    'D23 a heartbeat KILLed with its staged beat on disk leaves the pool clean, and says why',
+    async () => {
+      const pool = freshPool();
+      const hook = beatHook(pool);
+      // Deaf to TERM, and a grace long enough to matter: this run is still waiting for
+      // its command for ten seconds after the refresh dies, so nothing of the run's own
+      // cleanup can be what clears the pool in the seconds below. What has to clear it
+      // is the loop that started the refresh.
+      const block = blocker(pool, 'parked', { ignoreTerm: true });
+      const gate = startRun(pool, 'lane', block.cmd, {
+        env: {
+          GATE_LOCK_TEST_MODE: '1',
+          GATE_LOCK_HEARTBEAT_SECONDS: '1',
+          GATE_LOCK_TEST_KILL_GRACE: '10',
+          GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        },
+      });
+      const printed = liveStdout(gate.child);
+      await up(block);
+      // The refresh is parked at the rename with its staged beat written beside the
+      // slot, which is the window C23 is about: a heartbeat that dies there runs no
+      // trap, so nothing of its own removes the file and the pool keeps a transient
+      // that belongs to nobody. The child is found by what it is - the loop's own child
+      // running `heartbeat` - and KILLed, which is the only way to end a process in the
+      // middle of that window.
+      await waitForFile(hook.seam);
+      const loop = beatPids(printed())[0] ?? 0;
+      expect(loop).toBeGreaterThan(0);
+      await until(() => childrenMatching(loop, 'heartbeat').length > 0, 10000);
+      const [child] = childrenMatching(loop, 'heartbeat');
+      expect(stagedBeats(pool), 'the refresh is parked with its stage').toHaveLength(1);
+      process.kill(Number(child), 'SIGKILL');
+      // The stage goes at once, and while the run is still demonstrably busy with its
+      // command: the loop that started the heartbeat sweeps the stages beside its own
+      // slot once that heartbeat is gone, and `run` sweeps them again after the
+      // release. The test below is what tells the two sweeps apart.
+      await until(() => stagedBeats(pool).length === 0, 5000);
+      expect(stagedBeats(pool), 'the stage outlived the heartbeat that wrote it').toEqual([]);
+      hook.release();
+      const r = await gate.done;
+      // A refresh that died is a refresh that failed, so the run says the lock is lost
+      // and answers 2 - that is the verdict, and it is right: nothing is beating the
+      // slot any more. What it must not do is leave the stage behind.
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain('lock lost');
+      // C23: the child was KILLed, so it said nothing about why it failed, and a
+      // non-zero heartbeat that says nothing is a failure nobody can act on. The loop
+      // says it in its own words, with the status the child ended with - and what it
+      // does not hand on is the line the child's own shell wrote about its bookkeeping,
+      // which would otherwise be the only word the caller ever saw.
+      expect(r.stderr).toMatch(/heartbeat: the refresh of .* failed with status 137/);
+      expect(r.stderr, JSON.stringify(r.stderr)).not.toMatch(/^Killed$/m);
+      expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
+      await waitForDead(block.pid(), 10000);
+    },
+    60_000,
+  );
+
+  aimed(
+    'D23 a loop KILLed with its staged beat on disk leaves the pool clean too',
+    async () => {
+      const pool = freshPool();
+      const hook = beatHook(pool);
+      const block = blocker(pool, 'parked');
+      const gate = startRun(pool, 'lane', block.cmd, {
+        env: {
+          GATE_LOCK_TEST_MODE: '1',
+          GATE_LOCK_HEARTBEAT_SECONDS: '1',
+          GATE_LOCK_TEST_KILL_GRACE: '2',
+          GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        },
+      });
+      const printed = liveStdout(gate.child);
+      await up(block);
+      await waitForFile(hook.seam);
+      const loop = beatPids(printed())[0] ?? 0;
+      expect(loop).toBeGreaterThan(0);
+      await until(() => childrenMatching(loop, 'heartbeat').length > 0, 10000);
+      expect(stagedBeats(pool), 'the refresh is parked with its stage').toHaveLength(1);
+      // Both ends of this refresh are KILLed, so nothing that wrote the file is left to
+      // remove it: the heartbeat's own trap cannot run, the loop's sweep is an EXIT trap
+      // and cannot run either, and there is no orphan left to fail its rename and clean
+      // up after itself. The only thing that can clear the pool is `run`, sweeping the
+      // stages beside the slot it is about to give back - which is what makes this the
+      // test that tells the two sweeps apart.
+      const [child] = childrenMatching(loop, 'heartbeat');
+      process.kill(Number(child), 'SIGKILL');
+      process.kill(loop, 'SIGKILL');
+      expect(stagedBeats(pool), 'both ends of the refresh are gone, the stage is not').toHaveLength(
+        1,
+      );
+      hook.release();
+      block.release();
+      const r = await gate.done;
+      // The verdict is the one a hard stop now gets: unproven, and the slot is still
+      // this run's, so the command's own status stands with the warning saying the
+      // supervisor was stopped the hard way. The orphan of the KILLed loop may also
+      // have said that it could not replace a beat in a slot that had gone, which is
+      // its own news and not this run's to hide.
+      expect(r.status, JSON.stringify(r.stderr)).toBe(0);
+      expect(r.stderr).toContain('stopped the hard way');
+      expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
+    },
+    60_000,
+  );
 
   it('T36 a second TERM while the release is waiting leaves run alive and still holding, then released: 143, empty stderr', async () => {
     const pool = freshPool();

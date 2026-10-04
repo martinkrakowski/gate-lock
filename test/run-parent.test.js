@@ -9,10 +9,11 @@
 //
 // Nothing here synchronises with a sleep in the tool: the run is started, the loop
 // is named from the line it printed, and the waits are polls of a condition.
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { scratchOf } from './harness.js';
+import { scratchOf, waitForFile } from './harness.js';
 import { TM, names, readSlot, until } from './slots.js';
 import {
   beatPids,
@@ -20,6 +21,7 @@ import {
   freshPool,
   runDirOf,
   startRun,
+  stopHelpers,
   stopped,
   track,
   up,
@@ -37,6 +39,66 @@ function parentOf(pid) {
 async function untilGone(pid, timeoutMs) {
   await until(() => stopped(pid), timeoutMs);
 }
+
+describe('D25 nothing a test starts outlives the test', () => {
+  it('a waiting command is stopped by the cleanup, whether or not the test learned its pid', async () => {
+    const pool = freshPool();
+    const block = blocker(pool);
+    // The command is started here rather than through `run`, because the guarantee
+    // under test is the harness's own and nothing else's: a blocker parks in open(2)
+    // on its fifo and never ends by itself, so a test that fails, times out or throws
+    // before it tracks the pid used to leave it running for ever. Four of them were
+    // found on this host eleven hours after the runs that made them, each one a
+    // `block.sh` waiting on a fifo whose scratch directory had been taken away.
+    const child = spawn(block.cmd[0], block.cmd.slice(1), { stdio: 'ignore' });
+    const closed = new Promise((resolve) => child.on('close', resolve));
+    // The handshake the command itself writes: the pid in this file is the one the
+    // cleanup has to find, and the test never calls track() or pid().
+    await waitForFile(block.ready);
+    expect(stopped(child.pid)).toBe(false);
+    stopHelpers();
+    await closed;
+    expect(stopped(child.pid), 'the cleanup left the command running').toBe(true);
+  }, 30_000);
+
+  it('the cleanup stops a wedged run and its helpers, which nothing else would', async () => {
+    const pool = freshPool();
+    const wedge = path.join(scratchOf(pool), 'loop-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '1', GATE_LOCK_TEST_LOOP_WEDGE: wedge },
+    });
+    let out = '';
+    gate.child.stdout.setEncoding('utf8').on('data', (d) => {
+      out += d;
+    });
+    await up(block);
+    await until(() => beatPids(out).length > 0, 10000);
+    const loop = beatPids(out)[0];
+    // The loop is the supervisor's child and the supervisor is the run's, so the two
+    // pids name every helper this run started.
+    const supervisor = parentOf(loop);
+    expect(parentOf(supervisor), `the supervisor is a child of the run: ${out}`).toBe(
+      gate.child.pid,
+    );
+    // The loop is wedged where it reads no stop file, so this is the shape that leaks:
+    // a run that is KILLed takes none of its helpers with it, and this supervisor is
+    // already waiting on that loop - which is the one wait in it that nothing times
+    // out. Left alone it is still there an hour later with an hour of `sleep` under it.
+    stopHelpers();
+    await until(() => stopped(gate.child.pid), 5000);
+    await until(() => stopped(supervisor), 5000);
+    await until(() => stopped(loop), 5000);
+    expect(stopped(supervisor), 'the supervisor outlived the test').toBe(true);
+    expect(stopped(loop), 'the wedged loop outlived the test').toBe(true);
+    // A run that is KILLed cannot take its private directory with it, and every helper
+    // of it was KILLed here too, so the last one that could have removed it is gone
+    // too. The test does it instead, so that a cleanup of the tests is a cleanup of
+    // the host as well.
+    fs.rmSync(runDirOf(gate.child.pid), { recursive: true, force: true });
+  }, 30_000);
+});
 
 describe('D25 a helper does not outlive the run', () => {
   it('a KILLed run leaves no supervisor and no loop, and the slot stops beating', async () => {

@@ -31,6 +31,14 @@ export function script(pool, name, body) {
  * A fifo a wrapped command can block on, plus the handshake files around it.
  * `ready` appears when the command is up (and holds its pid), `done` when it has
  * run to its end. `release()` lets it finish; nothing here polls.
+ *
+ * The command is registered with the afterEach below, so a test that fails, times
+ * out or throws before it ever asks for the pid still cannot leave it running: a
+ * blocker parked in open(2) on its fifo waits for ever, and four of them were found
+ * on this host eleven hours after the runs that made them, each waiting on a fifo
+ * whose scratch directory had already been taken away. `track()` is not enough on
+ * its own, because it needs the pid and the pid is what a test that never got as far
+ * as the handshake does not have.
  */
 export function waiting(pool, name = 'block') {
   const dir = `${scratchOf(pool)}/${name}`;
@@ -39,7 +47,7 @@ export function waiting(pool, name = 'block') {
   // Node has no mkfifo, but mkfifo(1) is everywhere a POSIX shell is.
   const made = spawnSync('mkfifo', [`${dir}/go`], { stdio: 'ignore' });
   if (made.error || made.status !== 0) throw new Error(`mkfifo failed for ${dir}/go`);
-  return {
+  const w = {
     dir,
     ready: `${dir}/ready`,
     done: `${dir}/done`,
@@ -60,6 +68,34 @@ export function waiting(pool, name = 'block') {
       }
     },
   };
+  waitingCommands.push(dir);
+  return w;
+}
+
+/**
+ * Stop one registered command, given only the directory it waits in. The pid is
+ * read out of the handshake the command wrote itself, and it is only signalled while
+ * it is still running *this* command's script: where the kernel has recycled a pid
+ * between the test ending and this running, the argument vector says so, and a
+ * stranger's process is not ours to kill. Where `ps` is missing there is nothing to
+ * cross-check with, and the pid came out of a file this test wrote, so it is killed
+ * on the strength of that.
+ */
+function stopWaiting(dir) {
+  let pid;
+  try {
+    pid = Number(fs.readFileSync(`${dir}/ready`, 'utf8'));
+  } catch {
+    return; // the command never came up; there is nothing of it to stop
+  }
+  if (!Number.isInteger(pid) || pid <= 0 || !alive(pid)) return;
+  const listed = spawnSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8' });
+  if (listed.stdout && !listed.stdout.includes(dir)) return; // a recycled pid
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    /* already gone */
+  }
 }
 
 /** The body of a command that announces itself, blocks, and then finishes, with the
@@ -117,25 +153,78 @@ export function afterBeat(pool, slot, name, then, args = []) {
 // Pids the tests learned about (the wrapped commands), killed after each test
 // so a failing assertion cannot leave a gate running.
 const pids = [];
+// The waiting directories of every wrapped command made in this file, for the same
+// reason and with the difference spelled out in waiting(): a command whose pid a test
+// never learned is found by the handshake it wrote instead.
+const waitingCommands = [];
 // Runs this file started, stopped after each test for the same reason.
 const startedRuns = [];
-afterEach(() => {
+afterEach(stopHelpers);
+
+/**
+ * Everything a test may have started, stopped now: the runs it started with their own
+ * helpers, the commands that wait on a fifo, and every pid it tracked. The afterEach
+ * above is this, and a test that has to see the effect itself calls it directly: it is
+ * exported so the guarantee can be tested rather than only relied on.
+ *
+ * The order is not an accident: vitest runs `after` hooks in reverse order of
+ * registration (`sequence.hooks` defaults to "stack"), and this file is imported
+ * after harness.js, so this runs before the scratches are removed - which is what
+ * lets the handshake files be read.
+ */
+export function stopHelpers() {
   while (startedRuns.length > 0) {
-    const pid = startedRuns.pop();
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch {
-      /* already gone */
-    }
+    stopRun(startedRuns.pop());
+  }
+  while (waitingCommands.length > 0) {
+    stopWaiting(waitingCommands.pop());
   }
   while (pids.length > 0) {
-    try {
-      process.kill(pids.pop(), 'SIGKILL');
-    } catch {
-      /* already gone */
-    }
+    killPid(pids.pop());
   }
-});
+}
+
+/** Signal one pid, and shrug at one that has gone. */
+function killPid(pid) {
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
+ * Stop a run this file started, helpers and all. Killing the run alone is not enough:
+ * its helpers - the supervisor, the command, the watchdog, and the loop inside the
+ * supervisor - are its children, and a run that is KILLed takes none of them with it.
+ * They are listed *before* it is signalled, because a child of a dead process is
+ * reparented at once and its parent link - the only thing that says whose it was - is
+ * gone with it. A helper of a run whose test has ended is a helper with nothing left
+ * to stop it, and one that has to be KILLed to go is the shape that was found on this
+ * host hours after the test that made it.
+ */
+function stopRun(pid) {
+  const helpers = descendants(pid);
+  for (const helper of helpers) killPid(helper);
+  killPid(pid);
+}
+
+/**
+ * The pids below `pid`, three levels deep, which is as deep as a run goes: run ->
+ * supervisor -> loop -> the heartbeat child of that loop. Where `pgrep` is missing the
+ * answer is an empty list and the run is signalled on its own, as it always was.
+ */
+function descendants(pid, depth = 3) {
+  if (depth < 1) return [];
+  const listed = spawnSync('pgrep', ['-P', String(pid)], { encoding: 'utf8' });
+  if (listed.error || listed.status !== 0) return [];
+  const kids = listed.stdout
+    .split('\n')
+    .filter(Boolean)
+    .map(Number)
+    .filter((kid) => Number.isInteger(kid) && kid > 0);
+  return kids.flatMap((kid) => [kid, ...descendants(kid, depth - 1)]);
+}
 
 /** Remember a pid so it is killed after the test, even if the test fails. */
 export function track(pid) {

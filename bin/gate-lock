@@ -1806,6 +1806,14 @@ do_heartbeat() {
   now_s
   hb_stage=$target.beatnew.$$
   rm -f "$hb_stage" 2>/dev/null
+  # From here on this caller owns a file in the pool, and the only thing that may
+  # leave it behind is the rename below. Every path that does not reach that rename
+  # removes it by hand, and this trap is what covers the ones nobody thought of: a
+  # shell that ends here for any other reason - an expansion error, a signal it was
+  # not ignoring, a future `exit` - takes the file with it (C23). A KILL cannot run
+  # a trap, so the loop that started this child sweeps up after one (see
+  # run_beat_loop).
+  trap 'rm -f "$hb_stage" 2>/dev/null' EXIT
   # Staged beside the slot, never under $TMPDIR (F39): a rename across
   # filesystems is copy-then-delete and the beat would be briefly absent.
   if ! (
@@ -2589,6 +2597,31 @@ run_record_status() {
   fi
 }
 
+# run_sweep_stages: the staging files a heartbeat wrote beside this run's own slot,
+# `<slot>.beatnew.<pid>`, whose writer is not a live process.
+#
+# A heartbeat KILLed between staging its beat and renaming it runs no trap, so nothing
+# removes the file it left and the pool keeps a transient that belongs to nobody (C23).
+# The loop that started it sweeps after it; this is the backstop for the case where the
+# loop itself was KILLed - by the time a run has given its slot back, every staging file
+# beside that slot with a dead pid is this run's rubbish.
+#
+# Only dead pids are touched, and only beside this run's own slot: a live writer is
+# somebody else's refresh in flight - a reclaimer may have given this slot to another
+# run while this one was being torn down - and that stage is not ours to remove.
+run_sweep_stages() {
+  [ -n "$run_slot" ] || return 0
+  for run_s in "$run_slot".beatnew.*; do
+    [ -e "$run_s" ] || continue
+    run_sp=${run_s##*beatnew.}
+    case $run_sp in
+    '' | *[!0-9]*) continue ;;
+    esac
+    kill -0 "$run_sp" 2>/dev/null || rm -f "$run_s" 2>/dev/null
+  done
+  return 0
+}
+
 # run_scratch_rm: the private directory and everything in it. Only what this
 # process created is ever removed, and a name that has become a link is left.
 run_scratch_rm() {
@@ -2671,7 +2704,21 @@ run_beat_loop() {
   # The status is written first, because what the supervisor is told must be how
   # this loop ended and not how it tidied up: `$?` is the status the trap was
   # entered with, and it is the only reading of it there is.
-  trap 'printf "%s\n" "$?" >"$rb_status" 2>/dev/null; trace "loop $$ exiting $(cat "$rb_status" 2>/dev/null)"; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
+  trap 'printf "%s\n" "$?" >"$rb_status" 2>/dev/null; trace "loop $$ exiting $(cat "$rb_status" 2>/dev/null)"; rb_sweep; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
+  # A staged beat belongs to the heartbeat child that wrote it, and that child may be
+  # KILLed - which runs no trap, so nothing removes the file it left. The loop knows
+  # every stage beside its own slot, and it runs one refresh at a time, so a stage
+  # whose pid is not a live process is this run's rubbish and goes.
+  rb_sweep() {
+    for rb_s in "$rb_slot".beatnew.*; do
+      [ -e "$rb_s" ] || continue
+      rb_p=${rb_s##*beatnew.}
+      case $rb_p in
+      '' | *[!0-9]*) continue ;;
+      esac
+      kill -0 "$rb_p" 2>/dev/null || rm -f "$rb_s" 2>/dev/null
+    done
+  }
   while [ ! -e "$rb_stop" ]; do
     if ! kill -0 "$rb_run" 2>/dev/null; then
       trace "loop $$ sees run $rb_run gone"
@@ -2710,6 +2757,18 @@ run_beat_loop() {
     # Published for as long as the refresh runs, so that a stop asking this loop to
     # end can tell "wedged" from "busy" and never cuts a refresh short (C41, R7).
     # It is the loop's own file, and it is removed on every way out of the refresh.
+    #
+    # The stop file is asked for and never unasked, so a loop that is asked to stop
+    # must not begin another refresh: it may finish the one in flight, and then it is
+    # done. The `while` above already reads it once per pass; this is the same test
+    # again at the last moment before the child is started, because between those two
+    # reads the whole world can happen and a refresh that is begun after the stop is
+    # a refresh nobody asked for (C41, R7).
+    if [ -e "$rb_stop" ]; then
+      trace "loop $$ finds the stop file before a refresh and ends clean"
+      rm -f "$rb_stop"
+      exit 0
+    fi
     : >"$rb_inflight" 2>/dev/null
     trace "loop $$ refreshing $rb_slot, inflight published"
     # The child's answer is captured rather than read straight off the caller's
@@ -2726,7 +2785,19 @@ run_beat_loop() {
     rb_hb_err=$(tr '\n' '|' <"$rb_hb_out" 2>/dev/null)
     trace "loop $$ refresh status $rb_hb_st stderr [$rb_hb_err]"
     if [ "$rb_hb_st" -ne 0 ]; then
-      cat "$rb_hb_out" >&2
+      # The child's own refusals are the news and are handed on unchanged (T18). What
+      # is not handed on is the line a shell writes about its own bookkeeping - "Killed",
+      # "Terminated" - which lands in the child's stderr because the redirection below
+      # is still open when the shell flushes it: that is the shell talking about a job
+      # of its own, not this tool's word about a lock (D15), and passing it on would
+      # make it the only thing the caller is told about a failed refresh.
+      rb_said=$(sed -n 's/^\(gate-lock: .*\)$/\1/p' <"$rb_hb_out" 2>/dev/null)
+      [ -z "$rb_said" ] || printf '%s\n' "$rb_said" >&2
+      # And then the loop says what it knows for itself, so that no non-zero exit of a
+      # refresh is ever silent (C23): the slot it could not refresh, and the status the
+      # child ended with. A child that was KILLed says nothing at all - it cannot - and
+      # this is the only word that failure gets.
+      printf 'gate-lock: heartbeat: the refresh of %s failed with status %s\n' "$rb_slot" "$rb_hb_st" >&2
     fi
     rm -f "$rb_hb_out" "$rb_inflight" 2>/dev/null
     if [ "$rb_hb_st" -ne 0 ]; then
@@ -2943,14 +3014,22 @@ run_supervise() {
     kill -0 "$sv_run" 2>/dev/null || sv_orphaned
     wait "$sv_loop" 2>/dev/null
     sv_st=$?
+    rm -f "$sv_alive" "$sv_status" 2>/dev/null
+    # The loop is reaped, so nothing will take its in-flight marker away: the loop took
+    # it in its own EXIT trap, and a loop that was KILLed runs no trap. It is this
+    # supervisor's to clear, and `run` waits on it - an uncleared marker would spend
+    # the whole of that wait on a refresh that is not going to happen. Read for the
+    # trace first, or the trace would only ever be able to say "no".
+    sv_busy=no
+    [ -e "$sv_inflight" ] && sv_busy=yes
+    rm -f "$sv_inflight" 2>/dev/null
     if [ -e "$sv_status" ]; then
       sv_st=$(cat "$sv_status" 2>/dev/null)
       case ${sv_st:-} in
       '' | *[!0-9]*) sv_st=1 ;;
       esac
     fi
-    rm -f "$sv_alive" "$sv_status" 2>/dev/null
-    trace "supervisor $$ sees loop $sv_loop status $sv_st, stop requested: $( [ -e "$sv_stop" ] && echo yes || echo no ), inflight: $( [ -e "$sv_inflight" ] && echo yes || echo no )"
+    trace "supervisor $$ sees loop $sv_loop status $sv_st, stop requested: $( [ -e "$sv_stop" ] && echo yes || echo no ), inflight: $sv_busy"
     # The verdict is the loop's own status, never the stop request. A stop request can
     # never turn one of these into a quiet exit - a run cleaning up must never answer 0
     # for a lock it cannot account for - and when one is requested it also cannot be
@@ -3135,6 +3214,7 @@ run_finish() {
   fi
   run_lost_lock
   run_release_lock
+  run_sweep_stages
   run_finished=1
   # A signal outranks everything (C38). Then a lost lock (D10). Then a verify that
   # failed or a lock that was not released (C35, C36): non-zero, and the
@@ -3185,6 +3265,7 @@ run_cleanup() {
       fi
     fi
     run_release_lock
+    run_sweep_stages
     if [ "$run_exit_code" -eq 0 ] && [ "$run_removed" = 0 ]; then
       run_exit_code=1
     fi
