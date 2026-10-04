@@ -210,6 +210,23 @@ trace() {
   return 0
 }
 
+# touch_file PATH: create PATH, empty, if it is not there. Answers with whether it is
+# there afterwards; no caller here cares about anything else.
+#
+# Not `: >"$1"`. A redirection that cannot be done is fatal to the shell in more than
+# one shell - dash ends the script with status 2, bash in POSIX mode (which is what
+# /bin/sh is on macOS) ends it with status 1 - and every caller here turns the error
+# away, so that failure is silent. That is how a seam pointing into a directory that has
+# gone ended a heartbeat with status 1 and no words at all: the EXIT trap took its staged
+# beat with it, the pool looked clean, and the run reported a lock it had lost (C23).
+# `touch` is a command, so the same failure is a status like any other.
+touch_file() {
+  {
+    touch "$1"
+  } 2>/dev/null
+  [ -e "$1" ]
+}
+
 # pause_at SEAM (H1-H8, D20): in test mode, when the seam names a file, create
 # it, then wait (whole seconds, L10) for as long as it exists. Defined here,
 # before the first window it opens (H1, the marker publication), so every
@@ -217,12 +234,10 @@ trace() {
 pause_at() {
   seam "$1"
   [ -n "$seam_value" ] || return 0
-  # The create is a group with stderr redirected: a redirection into a path whose
-  # directory has gone is reported by the shell itself, before the command runs,
-  # and `2>/dev/null` on the command alone would not hide that.
-  {
-    : >"$seam_value"
-  } 2>/dev/null
+  # A path whose directory is not there cannot be parked on, and asking for one must
+  # not be able to end anything: touch_file answers with a status, so a seam a test has
+  # released by taking its directory away is simply not taken.
+  touch_file "$seam_value" || true
   while [ -e "$seam_value" ]; do
     sleep 1
   done
@@ -1060,6 +1075,9 @@ janitor_ref() {
     # removed. A leftover of a dead process that had our pid just costs the
     # next free suffix.
     if [ ! -e "$ja_try" ] && [ ! -h "$ja_try" ]; then
+      # In a subshell of its own, where a redirection that cannot be done ends it and
+      # not this: `set -C` has to be a redirection, and the `if` below is what this
+      # shape's status is for.
       if (
         set -C
         : >"$ja_try"
@@ -1606,7 +1624,7 @@ acquire_one() {
       if { [ -z "$j_pid" ] && [ -z "$j_beat" ]; } || { [ "$j_alive" = 1 ] && [ -z "$j_beat" ]; }; then
         seam GATE_LOCK_TEST_MARK_PATIENCE
         if [ -n "$seam_value" ]; then
-          : >"$seam_value" 2>/dev/null
+          touch_file "$seam_value" || true
         fi
         sleep 1
         ao_pass=$((ao_pass + 1))
@@ -2177,7 +2195,7 @@ run_stop_helper() {
   {
     [ -e "$2" ] && return 0
     kill -0 "$3" 2>/dev/null || return 0
-    : >"$1" 2>/dev/null
+    touch_file "$1" || true
     run_stop_waited=0
     run_stop_busy=0
     run_stop_spin=0
@@ -2331,7 +2349,7 @@ run_escalator() {
     esc_run=$4
     # Every exit takes the stop file away and says it has gone, so the cleanup
     # that stops it is never left waiting on a marker nobody will remove.
-    trap 'rm -f "$esc_dir/escalator.stop" 2>/dev/null; : >"$esc_dir/escalator.gone" 2>/dev/null' EXIT
+    trap 'rm -f "$esc_dir/escalator.stop" 2>/dev/null; touch_file "$esc_dir/escalator.gone" || true' EXIT
     esc_kill() {
       # The grace is up, so the KILL is due - but only while this run is still here
       # to want it. A run that was KILLed itself is gone, its command may have been
@@ -2502,7 +2520,7 @@ run_stop_supervisor() {
   # waiting for it and cannot pass the word on until that is gone. Either may have
   # exited already - a lost lock ends the run before the cleanup does - so the files
   # are removed once the pids are reaped.
-  : >"$run_dir/loop.stop" 2>/dev/null
+  touch_file "$run_dir/loop.stop" || true
   run_stop_helper "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" "$run_sup" "$run_dir/beat-inflight" "$run_dir/supervisor.alive"
   run_wait_supervisor "$run_sup"
   rm -f "$run_dir/loop.stop" "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" 2>/dev/null
@@ -2794,6 +2812,13 @@ run_beat_loop() {
   # `rb_ended` before anything else runs, and the trace below says that rather than
   # reading the file back, which would fork on every way out of a loop.
   #
+  # The write is in a group with this shell's stderr turned away: a redirection into a
+  # path whose directory has gone is reported by the shell itself, before the command
+  # runs, and `2>/dev/null` on the command alone does not hide that. A loop that outlived
+  # the run whose directory it writes its ending into is exactly the case where it has
+  # gone, and that line is about a bookkeeping file, on a run that has already answered
+  # its caller (D15).
+  #
   # The trap is left as a list of commands in one string, on purpose. `trap name EXIT`
   # is accepted here, and moving the same statements into a function of their own was
   # tried and rejected: shellcheck 0.11 reads no invocation through *any* form of it -
@@ -2801,7 +2826,7 @@ run_beat_loop() {
   # function nothing calls (SC2329), and so is anything it calls and nothing else
   # does. The way out is a caller outside the string, which is what the sweep after
   # each refresh is.
-  trap 'rb_ended=$?; printf "%s\n" "$rb_ended" >"$rb_status" 2>/dev/null; trace "loop $$ exiting $rb_ended"; rb_sweep; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
+  trap 'rb_ended=$?; { printf "%s\n" "$rb_ended" >"$rb_status"; } 2>/dev/null; trace "loop $$ exiting $rb_ended"; rb_sweep; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
   # A staged beat belongs to the heartbeat child that wrote it, and that child may be
   # KILLed - which runs no trap, so nothing removes the file it left. The loop knows
   # every stage beside its own slot, and it runs one refresh at a time, so a stage
@@ -2871,7 +2896,7 @@ run_beat_loop() {
       rm -f "$rb_stop"
       exit 0
     fi
-    : >"$rb_inflight" 2>/dev/null
+    touch_file "$rb_inflight" || true
     trace "loop $$ refreshing $rb_slot, inflight published"
     # The child's answer is captured rather than read straight off the caller's
     # stderr, so that the trace can carry its status *and* its message - and it is
@@ -2886,6 +2911,15 @@ run_beat_loop() {
     # by an earlier refresh must never be read as this one's, and an empty file is the
     # one thing that says there is nothing to signal.
     { printf '\n' >"$rb_child"; } 2>/dev/null
+    # A loop whose run has taken its private directory away has nothing to capture
+    # into, and a redirection into a path that is gone is reported by the shell itself -
+    # and under bash in POSIX mode it ends the shell (C23's twin). So that is checked
+    # rather than tried, and the loop ends: a run that has taken its directory away is a
+    # run on its way out, which is the case the top of this pass reports as 3.
+    if [ ! -d "$rb_dir" ]; then
+      trace "loop $$ finds its private directory $rb_dir gone, and ends"
+      exit 3
+    fi
     GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$rb_slot" "$self" heartbeat \
       </dev/null >"$rb_hb_out" 2>&1 &
     rb_hb_pid=$!
@@ -3126,7 +3160,7 @@ run_supervise() {
   # temp root. A straggler - the loop, the watchdog - writing into it afterwards
   # writes into a name that is gone, which fails quietly and is why every write
   # here and in them is already redirected.
-  trap 'rm -f "$sv_stop" "$sv_pass" 2>/dev/null; : >"$sv_dir/supervisor.gone" 2>/dev/null; kill -0 "$sv_run" 2>/dev/null || rm -rf "$sv_dir" 2>/dev/null' EXIT
+  trap 'rm -f "$sv_stop" "$sv_pass" 2>/dev/null; touch_file "$sv_dir/supervisor.gone" || true; kill -0 "$sv_run" 2>/dev/null || rm -rf "$sv_dir" 2>/dev/null' EXIT
   while :; do
     rm -f "$sv_status" 2>/dev/null
     # One stop file for every loop this supervisor owns: the supervisor may be
@@ -3223,7 +3257,7 @@ run_supervise() {
       # not stopped by then is wedged, and the KILL answers that - so the cleanup
       # never waits a whole heartbeat period.
       if [ -e "$sv_stop" ]; then
-        : >"$sv_ready" 2>/dev/null
+        touch_file "$sv_ready" || true
         sv_asked=$((sv_asked + 1))
         sv_asked_busy=no
         [ -e "$sv_inflight" ] && sv_asked_busy=yes

@@ -423,17 +423,31 @@ export async function untilGone(pid, timeoutMs = 10000) {
  * longer be created, lets every later refresh through: `pause_at` creates the file it
  * waits on, and a path it cannot create is a pause it does not take. So the seam takes
  * exactly one refresh, which is what a test that parks a refresh means; `reparked` is
- * the assertion that keeps it that way.
+ * the assertion that keeps it that way, and `released` says the property holds rather
+ * than that it did once.
+ *
+ * The directory goes rather than the file in it on purpose. Removing only the file
+ * would let the next refresh re-create it and park again - a second parked refresh, which
+ * is not what these tests mean, and which is what macOS CI saw on T36. And a seam whose
+ * directory is gone must be *passed over*, not failed: that is the path a released seam
+ * leaves behind, and a tool that ended a heartbeat there would end a run's beat and call
+ * it a lost lock (see C23 in slots-ops).
  */
 export function beatHook(pool, name = 'beat-hook') {
+  let released = false;
   const dir = `${scratchOf(pool)}/${name}`;
   fs.mkdirSync(dir, { recursive: true });
   return {
     dir,
     seam: path.join(dir, 'beat-rename'),
-    release: () => fs.rmSync(dir, { recursive: true, force: true }),
+    release: () => {
+      fs.rmSync(dir, { recursive: true, force: true });
+      released = true;
+    },
     /** Has any refresh parked on this seam since it was released? */
     reparked: () => fs.existsSync(path.join(dir, 'beat-rename')),
+    /** Is the seam still able to park a refresh? False once it has been released. */
+    released: () => released,
   };
 }
 

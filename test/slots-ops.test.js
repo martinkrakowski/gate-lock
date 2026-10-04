@@ -95,6 +95,38 @@ describe('T17-T18 heartbeat', () => {
     expect(names(pool)).toEqual(['.format']);
   });
 
+  it('C23 a seam whose path cannot be created is passed over, not failed: the beat still moves and the exit says nothing is wrong', () => {
+    const pool = freshPool();
+    const pid = livePid();
+    seedOld(pool, 'gate.lock', { owner: 'lane', pid });
+    const trace = path.join(scratchOf(pool), 'trace.log');
+    // A seam pointing into a directory that is not there - which is what a test's
+    // released seam leaves behind, and what T36's second refresh met on macOS. The create
+    // cannot succeed, and that must not be the end of the refresh: a redirection that
+    // cannot be done ends the shell itself in more than one shell - bash in POSIX mode
+    // (which is what /bin/sh is on macOS) with status 1, dash with status 2 - and every
+    // seam turns the error away, so the failure was silent: an EXIT trap took the staged
+    // beat with it, the pool looked clean, and the run reported a lock it had lost
+    // (C23). This is that shape, run directly: the beat must still move, and the exit
+    // must say what happened if anything went wrong.
+    const gone = path.join(scratchOf(pool), 'no-such-dir', 'seam');
+    const r = sub(pool, ['heartbeat'], pid, {
+      env: {
+        ...TM,
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: gone,
+        GATE_LOCK_TEST_TRACE: trace,
+      },
+    });
+    expect({ ...r, trace: fs.readFileSync(trace, 'utf8') }).toMatchObject({
+      status: 0,
+      stderr: '',
+      stdout: '',
+      trace: expect.stringContaining('past the rename seam'),
+    });
+    expect(Number(readSlot(pool, 'gate.lock').beat)).toBeGreaterThan(1000);
+    expect(names(pool)).toEqual(['.format', 'gate.lock']);
+  });
+
   it('D24 a slot given away while this beat was staged is not refreshed: nothing of the old holder is written', async () => {
     const pool = freshPool();
     const pid = livePid();

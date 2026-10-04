@@ -140,7 +140,7 @@ describe('T24 the heartbeat loop', () => {
 i=0
 while [ "$i" -lt 20 ]; do
   b=$(cat "$1/beat" 2>/dev/null || printf '')
-  if [ -n "$b" ] && [ "$b" -gt "$started" ]; then printf '%s\\n' "$b" >"$2"; break; fi
+  if [ -n "$b" ] && [ "$b" -gt "$started" ]; then printf '%s %s\\n' "$started" "$b" >"$2"; break; fi
   i=$((i + 1))
   sleep 1
 done`,
@@ -153,7 +153,17 @@ done`,
     expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(r.stdout).toContain('heartbeat pid');
     expect(r.stdout).toContain('every 1s while lane runs');
-    expect(Number(fs.readFileSync(moved, 'utf8').trim())).toBeGreaterThan(nowS() - 5);
+    // Both values are the ones the command read: the beat it saw, and the start it
+    // was compared against. The property is that the beat *moved* - strictly past the
+    // start, not equal to it - and that is what this says, with no window in it: a
+    // comparison against the wall clock is a statement about how fast this host is, and
+    // a loaded one moves the beat several seconds into a five-second window (T24 failed
+    // that way at 329efa1).
+    const [started, beat] = fs.readFileSync(moved, 'utf8').trim().split(/\s+/).map(Number);
+    expect(beat, 'the beat moved past the start').toBeGreaterThan(started);
+    // And it is a timestamp of this refresh, not one from before it: a beat can never
+    // be in the future, whatever the host was doing.
+    expect(beat).toBeLessThanOrEqual(nowS());
     expect(beatPids(r.stdout)).toHaveLength(1);
     expect(names(pool)).toEqual(['.format']);
   });
