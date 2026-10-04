@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0]
+## [0.1.0] - 2026-10-04
 
 The first release: a host-wide gate lock with a shared pool of slots, on-disk
 format 1, and a wrapper that holds a slot around one command.
@@ -62,3 +62,15 @@ format 1, and a wrapper that holds a slot around one command.
   memory, and a run is a holder, not a server.
 - One pool belongs to one uid, and every participant must share one pid
   namespace. Both limits are documented in the README rather than worked around.
+- The on-disk format 1 is specified in docs/requirements.md, whose section 2 is
+  frozen: what another client observes on disk does not change without a format
+  bump.
+- CI runs the suite under dash, `bash --posix` and the system shell on Linux and
+  macOS, with eslint, shellcheck, a formatting check and an assertion of the
+  published file list on every leg.
+- 0.1.0 was checked against an independent format-1 client on one shared pool,
+  in both directions: each side saw the other's held slots as busy (exit 75),
+  refused to reclaim the other's live holder and reclaimed its dead one, the
+  same worktree blocked with byte-equal identity, each side's `status` listed
+  the other's slot with the project, and a 4-client storm into 2 slots never
+  held more than two complete slots - every scenario passed.
