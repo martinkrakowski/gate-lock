@@ -184,6 +184,29 @@ seam() {
   fi
 }
 
+# trace TEXT...: one line per decision, appended to the file the test seam names.
+#
+# The decisions this file makes are the ones nobody can see from outside: a loop's
+# exit status, the status and the stderr of each heartbeat child, what the supervisor
+# saw when it decided to ask again or to KILL, and the verdict with the reason. When a
+# run answers differently on one machine than on another - which is what macOS CI's
+# bash 3.2 under stress kept showing - the difference is in here, and a test that
+# passes the seam can put the trace in its own failure message.
+#
+# Nothing is written unless test mode is on and the seam is set (D20): the seam is
+# read through `seam`, which only reads anything in test mode, and every caller is on
+# a path a production run does not take in the first place.
+trace() {
+  seam GATE_LOCK_TEST_TRACE
+  [ -n "$seam_value" ] || return 0
+  # The group is a redirection around a printf, so a trace line can never itself fail
+  # the run: a trace that cannot be written is a trace nobody reads.
+  {
+    printf 'gate-lock trace: %s\n' "$*"
+  } >>"$seam_value" 2>/dev/null || true
+  return 0
+}
+
 # pause_at SEAM (H1-H8, D20): in test mode, when the seam names a file, create
 # it, then wait (whole seconds, L10) for as long as it exists. Defined here,
 # before the first window it opens (H1, the marker publication), so every
@@ -2430,9 +2453,15 @@ run_sup_verdict() {
   run_sup_lost=0
   run_sup_unproven=0
   case ${run_sup_status:-0} in
-  0) ;;
-  1) run_sup_lost=1 ;;
-  *) run_sup_unproven=1 ;;
+  0) trace "verdict: supervisor status $run_sup_status, clean" ;;
+  1)
+    run_sup_lost=1
+    trace "verdict: supervisor status $run_sup_status, a refresh failed: lost"
+    ;;
+  *)
+    run_sup_unproven=1
+    trace "verdict: supervisor status $run_sup_status, unproven"
+    ;;
   esac
   return 0
 }
@@ -2632,6 +2661,7 @@ run_beat_loop() {
   rb_stop=$5
   rb_run=$6
   rb_inflight=$7
+  rb_dir=$8
   rb_tick=0
   # Nothing to catch: these four signals are ignored for this subshell's whole
   # life, so one from a terminal's process group is never pending against a trap
@@ -2641,9 +2671,12 @@ run_beat_loop() {
   # The status is written first, because what the supervisor is told must be how
   # this loop ended and not how it tidied up: `$?` is the status the trap was
   # entered with, and it is the only reading of it there is.
-  trap 'printf "%s\n" "$?" >"$rb_status" 2>/dev/null; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
+  trap 'printf "%s\n" "$?" >"$rb_status" 2>/dev/null; trace "loop $$ exiting $(cat "$rb_status" 2>/dev/null)"; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
   while [ ! -e "$rb_stop" ]; do
-    kill -0 "$rb_run" 2>/dev/null || exit 3
+    if ! kill -0 "$rb_run" 2>/dev/null; then
+      trace "loop $$ sees run $rb_run gone"
+      exit 3
+    fi
     rb_tick=$((rb_tick + 1))
     { printf '%s\n' "$rb_tick" >"$rb_alive"; } 2>/dev/null
     # A test seam that parks this loop where it reads no stop file, so the
@@ -2678,11 +2711,27 @@ run_beat_loop() {
     # end can tell "wedged" from "busy" and never cuts a refresh short (C41, R7).
     # It is the loop's own file, and it is removed on every way out of the refresh.
     : >"$rb_inflight" 2>/dev/null
-    if ! GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$rb_slot" "$self" heartbeat; then
-      rm -f "$rb_inflight" 2>/dev/null
+    trace "loop $$ refreshing $rb_slot, inflight published"
+    # The child's answer is captured rather than read straight off the caller's
+    # stderr, so that the trace can carry its status *and* its message - and it is
+    # handed straight on when it failed, because a refusal is the news (T18) and the
+    # caller reads it on the run's own stderr.
+    rb_hb_out=$rb_dir/beat-hb.$$
+    if GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$rb_slot" "$self" heartbeat \
+      >"$rb_hb_out" 2>&1; then
+      rb_hb_st=0
+    else
+      rb_hb_st=$?
+    fi
+    rb_hb_err=$(tr '\n' '|' <"$rb_hb_out" 2>/dev/null)
+    trace "loop $$ refresh status $rb_hb_st stderr [$rb_hb_err]"
+    if [ "$rb_hb_st" -ne 0 ]; then
+      cat "$rb_hb_out" >&2
+    fi
+    rm -f "$rb_hb_out" "$rb_inflight" 2>/dev/null
+    if [ "$rb_hb_st" -ne 0 ]; then
       exit 1
     fi
-    rm -f "$rb_inflight" 2>/dev/null
     rb_left=$rb_period
     while [ "$rb_left" -gt 0 ]; do
       rb_tick=$((rb_tick + 1))
@@ -2692,6 +2741,7 @@ run_beat_loop() {
       # Asked, not signalled: the supervisor writes this file, and a loop in its
       # pause sees it within a second and takes it away as it goes.
       if [ -e "$rb_stop" ]; then
+        trace "loop $$ takes the stop file and exits clean"
         rm -f "$rb_stop"
         exit 0
       fi
@@ -2764,6 +2814,7 @@ run_supervise() {
       sleep 1
       sv_o=$((sv_o + 1))
     done
+    trace "supervisor $$ stopping command $sv_cmd: run $sv_run is gone"
     kill -KILL "$sv_cmd" 2>/dev/null
     exit 3
   }
@@ -2790,7 +2841,7 @@ run_supervise() {
     # file has to be one `run` can write once. A file left by an earlier loop is
     # removed before the next one starts.
     rm -f "$sv_ready" 2>/dev/null
-    run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" "$sv_ready" "$sv_run" "$sv_inflight" &
+    run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" "$sv_ready" "$sv_run" "$sv_inflight" "$sv_dir" &
     sv_loop=$!
     # C31: the heartbeat's pid is announced on stdout, and published to this run's
     # private directory straight after, so `run` cannot tear the supervisor down
@@ -2801,6 +2852,7 @@ run_supervise() {
     sv_stale=0
     sv_asked=0
     sv_waited=0
+    sv_stale_busy=0
     while :; do
       if [ -e "$sv_status" ]; then
         break
@@ -2820,10 +2872,25 @@ run_supervise() {
         IFS= read -r sv_now <"$sv_alive"
       } 2>/dev/null
       if [ "$sv_now" = "$sv_mark" ]; then
-        sv_stale=$((sv_stale + 1))
+        # This watch is for a loop that has stopped saying anything. A loop waiting for
+        # a heartbeat child is busy and not gone, and it says nothing while it waits:
+        # `beat-alive` moves on the loop's ticks, not on the child's, and under load a
+        # refresh can take longer than the three seconds this allows. So while a
+        # refresh is published the quiet seconds are counted apart and capped, exactly
+        # as the stop path does - a marker that is never taken away still ends.
+        if [ -e "$sv_inflight" ]; then
+          sv_stale_busy=$((sv_stale_busy + 1))
+          if [ "$sv_stale_busy" -ge "$sv_wait_cap" ]; then
+            trace "supervisor $$ stops waiting for a quiet loop: $sv_stale_busy seconds with a refresh in flight"
+            sv_stale=3
+          fi
+        else
+          sv_stale=$((sv_stale + 1))
+        fi
       else
         sv_mark=$sv_now
         sv_stale=0
+        sv_stale_busy=0
       fi
       # A stop is pending: the loop is asked again and again, because it may be
       # inside a refresh that must not be cut off (C41, R7) and only the loop can
@@ -2833,6 +2900,7 @@ run_supervise() {
       if [ -e "$sv_stop" ]; then
         : >"$sv_ready" 2>/dev/null
         sv_asked=$((sv_asked + 1))
+        trace "supervisor $$ asks loop $sv_loop ($sv_asked), inflight: $( [ -e "$sv_inflight" ] && echo yes || echo no )"
         # Three asks is enough for a refresh to land - unless one is in flight, in
         # which case this loop is busy and not wedged, and a refresh is never cut
         # short (C41, R7). So the KILL waits for the refresh, and the wait is
@@ -2843,11 +2911,13 @@ run_supervise() {
             sv_waited=$((sv_waited + 1))
             if [ "$sv_waited" -ge "$sv_wait_cap" ]; then
               rm -f "$sv_ready" 2>/dev/null
+              trace "supervisor $$ KILLs loop $sv_loop after $sv_waited seconds with a refresh in flight"
               kill -KILL "$sv_loop" 2>/dev/null
               break
             fi
           else
             rm -f "$sv_ready" 2>/dev/null
+            trace "supervisor $$ KILLs loop $sv_loop, no refresh in flight"
             kill -KILL "$sv_loop" 2>/dev/null
             break
           fi
@@ -2880,17 +2950,38 @@ run_supervise() {
       esac
     fi
     rm -f "$sv_alive" "$sv_status" 2>/dev/null
-    # The verdict is the loop's own status, never the stop request: 1 means a refresh
-    # failed and the lock is gone; 3 means this loop found its run gone; anything else
-    # that is not a clean stop means the loop itself died, which is restarted exactly
-    # once (D10) - but only when nobody asked it to stop, since a KILL because a
-    # cleanup's request was not honoured is not a reason to start another loop that
-    # would be KILLed again. A stop request must never turn one of those into a quiet
-    # exit, or a run cleaning up would answer 0 for a lost lock.
+    trace "supervisor $$ sees loop $sv_loop status $sv_st, stop requested: $( [ -e "$sv_stop" ] && echo yes || echo no ), inflight: $( [ -e "$sv_inflight" ] && echo yes || echo no )"
+    # The verdict is the loop's own status, never the stop request. A stop request can
+    # never turn one of these into a quiet exit - a run cleaning up must never answer 0
+    # for a lock it cannot account for - and when one is requested it also cannot be
+    # read as proof, because the teardown produces these statuses itself.
     if [ "$sv_st" -ne 0 ]; then
-      # A refresh that failed is proof: the lock is gone, and the tail below stops the
-      # command for it (D10).
+      # A stop was asked for, so `run` is already tearing this supervisor down, and
+      # nothing about the lock can be settled here. The command it may still be reaping
+      # is not ours to signal - that pid is free the moment `run` reaps it and can
+      # belong to a stranger by the time a KILL from here arrives - and the loop's
+      # status is not evidence either: a loop that would not stop, a loop that died,
+      # and a refresh that failed while the teardown was in progress all arrive here,
+      # and under load - a heartbeat child taking seconds on a busy machine - they are
+      # the same shape. So every one of them leaves unproven, and `run` decides from
+      # the slot before the release (C35): still this run's means the command's status
+      # stands, and not this run's means the lock is gone and the run answers 2. That
+      # is the only way this path can report a lost lock, and it reports it from the
+      # slot rather than from a status the teardown itself produced.
+      #
+      # It used to leave with 1, which is proof of a lost lock. That is how a run whose
+      # command finished perfectly was told it had lost a lock it held and released:
+      # the teardown's own KILL and the teardown's own interleaving were read as
+      # evidence about the lock.
+      if [ -e "$sv_stop" ]; then
+        rm -f "$sv_stop" 2>/dev/null
+        trace "supervisor $$ exits unproven: a stop was requested and the loop ended $sv_st"
+        exit 3
+      fi
+      # A refresh that failed, with nobody having asked for any of this, is proof: the
+      # lock is gone, and the tail below stops the command for it (D10).
       if [ "$sv_st" -eq 1 ]; then
+        trace "supervisor $$ takes the lost-lock tail: a refresh failed"
         break
       fi
       # This loop found its run gone. The check above has already dealt with that, so
@@ -2898,36 +2989,21 @@ run_supervise() {
       if [ "$sv_st" -eq 3 ]; then
         break
       fi
-      # Anything else is the loop itself dying, or being KILLed because a cleanup's
-      # request was not honoured. Two things follow from that. Restart-once is for an
-      # unrequested death, so a KILL during the cleanup starts no second loop that
-      # would be KILLed again. And a stop means `run` is already tearing this
-      # supervisor down, so the command it may still be reaping is not ours to signal
-      # - that pid is free the moment `run` reaps it and can belong to a stranger by
-      # the time a KILL from here arrives; nothing is lost by leaving it alone, since
-      # the run that asked has forwarded the TERM itself and its watchdog escalates
-      # (C38, C40).
-      #
-      # The status is 3, not 1, and that is the correction: a hard stop is not
-      # evidence about the lock in either direction - the loop may have been busy with
-      # a refresh rather than wedged - so this leaves unproven and `run` decides from
-      # the slot (C35). It used to leave with 1, which is proof of a lost lock, and
-      # that is how a run whose command finished perfectly was told it had lost a
-      # lock it held and released: the teardown's own KILL became the evidence.
-      if [ -e "$sv_stop" ]; then
-        rm -f "$sv_stop" 2>/dev/null
-        exit 3
-      fi
+      # Anything else is the loop itself dying, unasked for. Restart-once (D10) covers
+      # that, and a second such death is the tail's business.
       if [ "$sv_restart" -eq 0 ]; then
         sv_restart=1
+        trace "supervisor $$ restarts the loop once after status $sv_st"
         continue
       fi
+      trace "supervisor $$ gives up on the loop after status $sv_st"
       break
     fi
     # The loop is gone and nothing is wrong: either it was stopped on purpose, or
     # run's cleanup asked it to stop. Either way this supervisor is done, and no
     # refresh of ours is in flight when the slot is removed (C41, R7).
     rm -f "$sv_stop" 2>/dev/null
+    trace "supervisor $$ exits clean: the loop stopped as asked"
     exit 0
   done
   # The lock is gone and the command is still running: TERM it, then KILL it after
@@ -2949,6 +3025,7 @@ run_supervise() {
     sleep 1
     sv_n=$((sv_n + 1))
   done
+  trace "supervisor $$ ends the command after a lost lock: $sv_cmd"
   kill -KILL "$sv_cmd" 2>/dev/null
   exit 1
 }
@@ -3043,6 +3120,7 @@ run_finish() {
   # about the lock in either direction, and the slot does (C35).
   run_verify_lock
   if [ "$run_sup_unproven" = 1 ]; then
+    trace "evidence: the slot verified=$run_verify_ok, removed=$run_removed"
     if [ "$run_verify_ok" = 0 ]; then
       # The evidence settled it: the slot is not this run's, so this is a lost lock
       # after all, and the table's own rows take over from here.

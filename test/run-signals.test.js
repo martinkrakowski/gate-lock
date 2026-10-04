@@ -69,6 +69,15 @@ function gone(pid) {
  * can no longer be created, lets every later refresh through: `pause_at` creates
  * the file it waits on, and a path it cannot create is a pause it does not take.
  */
+/** The tool's decision trace, as it stands now, for a failure message. */
+function traceText(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return '(no trace written)';
+  }
+}
+
 function beatHook(pool, name = 'beat-hook') {
   const dir = path.join(scratchOf(pool), name);
   fs.mkdirSync(dir, { recursive: true });
@@ -687,12 +696,19 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     const pool = freshPool();
     const hook = beatHook(pool);
     const parked = blocker(pool, 'parked');
+    // The trace is the tool's own account of every decision it made: each loop exit
+    // status, each heartbeat child's status and message, each ask, each KILL, the
+    // restart, the verdict and the reason. This test has only ever failed on one
+    // machine under load, so the trace goes into every assertion below - when it goes
+    // red again, the reason is in there rather than in a guess.
+    const trace = path.join(scratchOf(pool), 'trace.log');
     const gate = startRun(pool, 'lane', parked.cmd, {
       env: {
         GATE_LOCK_TEST_MODE: '1',
         GATE_LOCK_HEARTBEAT_SECONDS: '1',
         GATE_LOCK_TEST_KILL_GRACE: '2',
         GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        GATE_LOCK_TEST_TRACE: trace,
       },
     });
     // The refresh is parked at the rename, which is where a teardown finds it if the
@@ -710,14 +726,16 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     // asks the supervisor gives a loop that will not stop, with room to spare for a
     // loaded runner afterwards.
     await new Promise((r) => setTimeout(r, 10000));
-    expect(gate.child.exitCode, 'the run gave up on a refresh that was in flight').toBe(null);
+    expect(gate.child.exitCode, `the run gave up on a refresh in flight\n${traceText(trace)}`).toBe(
+      null,
+    );
     hook.release();
     const r = await gate.done;
     expect(Date.now() - held).toBeLessThan(30000);
-    expect(r.status).toBe(143);
-    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
-    expect(r.stdout).toContain('released by lane');
-    expect(names(pool)).toEqual(['.format']);
+    expect(r.status, traceText(trace)).toBe(143);
+    expect(r.stderr, `${JSON.stringify(r.stderr)}\n${traceText(trace)}`).toBe('');
+    expect(r.stdout, traceText(trace)).toContain('released by lane');
+    expect(names(pool), traceText(trace)).toEqual(['.format']);
     expect(gone(beatPids(r.stdout)[0])).toBe(true);
   }, 90_000);
 
@@ -725,27 +743,29 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     const pool = freshPool();
     const hook = beatHook(pool);
     const parked = blocker(pool, 'parked');
+    const trace = path.join(scratchOf(pool), 'trace.log');
     const gate = startRun(pool, 'lane', parked.cmd, {
       env: {
         GATE_LOCK_TEST_MODE: '1',
         GATE_LOCK_HEARTBEAT_SECONDS: '1',
         GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        GATE_LOCK_TEST_TRACE: trace,
       },
     });
     await waitForFile(hook.seam);
     gate.child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 500));
     // Still alive and still holding: the second signal did not cut the cleanup.
-    expect(gate.child.exitCode).toBe(null);
-    expect(gate.child.signalCode).toBe(null);
-    expect(readSlot(pool, 'gate.lock').owner).toBe('lane');
+    expect(gate.child.exitCode, traceText(trace)).toBe(null);
+    expect(gate.child.signalCode, traceText(trace)).toBe(null);
+    expect(readSlot(pool, 'gate.lock').owner, traceText(trace)).toBe('lane');
     gate.child.kill('SIGTERM');
     hook.release();
     const r = await gate.done;
-    expect(r.status).toBe(143);
-    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
-    expect(r.stdout).toContain('released by lane');
-    expect(names(pool)).toEqual(['.format']);
+    expect(r.status, traceText(trace)).toBe(143);
+    expect(r.stderr, `${JSON.stringify(r.stderr)}\n${traceText(trace)}`).toBe('');
+    expect(r.stdout, traceText(trace)).toContain('released by lane');
+    expect(names(pool), traceText(trace)).toEqual(['.format']);
     expect(gone(beatPids(r.stdout)[0])).toBe(true);
   });
 });
