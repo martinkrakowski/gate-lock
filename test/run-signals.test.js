@@ -22,6 +22,7 @@ import {
   track,
   up,
   waitForDead,
+  waitRunGone,
 } from './run.js';
 
 /** Is `shell` (e.g. "bash --posix") installed and runnable here? */
@@ -209,6 +210,35 @@ describe('C40 a command that will not stop', () => {
     await waitForDead(victim, 10000);
   }, 60_000);
 
+  it('D15 a line the signal handler writes while the run waits reaches the caller stderr', async () => {
+    const pool = freshPool();
+    // The handler runs while this run is inside the wait for a command that is not
+    // going to end, and that wait has the shell's own stderr turned away so the
+    // shell's notices cannot land there. The line the handler writes has to arrive
+    // all the same, and the only way that is true is the descriptor the run kept its
+    // own stderr on: a message written to the plain fd 2 from inside that wait goes
+    // nowhere. Round 12 shipped this test without the wiring and it passed anyway,
+    // because the line it watched was the heartbeat's - written by another process
+    // through the descriptor that process opened for itself, which no redirection
+    // in this one can touch. This line is written by this process, in the handler.
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '2',
+        GATE_LOCK_TEST_SIGNAL_LINE: 'the handler is here',
+      },
+    });
+    await up(block);
+    const victim = track(block.pid());
+    gate.child.kill('SIGTERM');
+    const r = await gate.done;
+    expect(r.status).toBe(143);
+    expect(r.stderr, JSON.stringify(r.stderr)).toContain('gate-lock: the handler is here');
+    await waitForDead(victim, 10000);
+  }, 60_000);
+
   it('D15 a second signal of any kind after the first is ignored: 143, the lock released, nothing killed', async () => {
     // The watchdog this run arms when it forwards the TERM must not take the
     // run's own signal handling with it: a run whose traps were replaced would
@@ -349,6 +379,12 @@ done`,
     // the only thing that could, and this test used the command's survival to watch
     // it not fire; the supervisor is what fires now, and the watchdog's own rule is
     // what the two assertions above say.
+    // The supervisor is still inside that grace when the command ends, and it writes
+    // into this run's private directory on the way out - so the test waits for it to
+    // leave, and for the directory it removes to go with it. Removing it earlier is
+    // what macOS CI saw: ENOTEMPTY, a helper writing into a directory being removed.
+    await waitRunGone(gate, { tmpRoot });
+    expect(fs.existsSync(dir), 'the private directory outlived its run').toBe(false);
     await waitForDead(victim, 20000);
     expect(stopped(victim), 'the command outlived the run and its lock').toBe(true);
   }, 90_000);

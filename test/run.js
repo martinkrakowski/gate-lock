@@ -6,6 +6,8 @@
 // every wait is a handshake on a file or a poll of a condition.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach } from 'vitest';
 import { runBin, scratchOf, startBin, waitForFile } from './harness.js';
 import { TM, freshPool as slotPool, livePid, until, wtDir } from './slots.js';
@@ -174,6 +176,30 @@ export async function waitForDead(pid, timeoutMs = 10000) {
   while (Date.now() < deadline && alive(pid)) {
     await new Promise((r) => setTimeout(r, 20));
   }
+}
+
+/**
+ * The private directory a run keeps in the temp root: `$tmpRoot/gate-lock-run.<pid>`
+ * of the run whose pid is `pid`. `tmpRoot` is the directory the run resolved, which
+ * a test knows when it sets `GATE_LOCK_TEST_TMP_ROOT` and otherwise is the system
+ * one.
+ */
+export function runDirOf(pid, tmpRoot) {
+  return path.join(tmpRoot ?? os.tmpdir(), `gate-lock-run.${pid}`);
+}
+
+/**
+ * Wait until a run that was KILLed has nothing left of itself.
+ *
+ * A KILLed run cannot clean up: the last of its helpers to leave removes the private
+ * directory instead (the janitor walks the pool, not the temp root - D16 against
+ * D21), and the loop and the watchdog leave within a second of the supervisor. A test
+ * that takes that directory away while a helper is still writing into it fails with
+ * ENOTEMPTY, which is what macOS CI saw, so this waits for the directory to be gone
+ * and therefore for every helper that writes into it to have left.
+ */
+export async function waitRunGone(gate, { tmpRoot, timeoutMs = 30000 } = {}) {
+  await until(() => !fs.existsSync(runDirOf(gate.child.pid, tmpRoot)), timeoutMs);
 }
 
 /** Run `run <lane> -- <cmd...>` synchronously (usage errors and refusals). */

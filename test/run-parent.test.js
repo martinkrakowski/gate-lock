@@ -14,7 +14,17 @@ import fs from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { scratchOf } from './harness.js';
 import { TM, names, readSlot, until } from './slots.js';
-import { beatPids, blocker, freshPool, startRun, stopped, track, up } from './run.js';
+import {
+  beatPids,
+  blocker,
+  freshPool,
+  runDirOf,
+  startRun,
+  stopped,
+  track,
+  up,
+  waitRunGone,
+} from './run.js';
 
 /** The parent of `pid`, or 0 when it is gone and cannot be asked. */
 function parentOf(pid) {
@@ -33,7 +43,11 @@ describe('D25 a helper does not outlive the run', () => {
     const pool = freshPool();
     const block = blocker(pool);
     const gate = startRun(pool, 'lane', block.cmd, {
-      env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '1' },
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_TMP_ROOT: scratchOf(pool),
+      },
     });
     // A live view of the run's stdout: the loop's pid is in the line it printed,
     // and that line is out before anything else is.
@@ -76,6 +90,13 @@ describe('D25 a helper does not outlive the run', () => {
     // this command was stopped by the TERM the supervisor sends as soon as it finds
     // its run gone.
     expect(Date.now() - killed, 'the command waited for the KILL').toBeLessThan(8000);
+    // The last helper to leave removes the private directory, so waiting for it to
+    // go is waiting for every helper of this run that writes into it.
+    await waitRunGone(gate, { tmpRoot: scratchOf(pool) });
+    expect(
+      fs.existsSync(runDirOf(gate.child.pid, scratchOf(pool))),
+      'the private directory outlived its run',
+    ).toBe(false);
     // Nothing of the run's is left in the pool either: the slot is there, reclaimable,
     // and nothing of the private directory is published.
     expect(names(pool)).toEqual(['.format', 'gate.lock']);
@@ -91,7 +112,12 @@ describe('D25 a helper does not outlive the run', () => {
     // is about to be lost because the beat stops with the loop.
     const block = blocker(pool, 'deaf', { ignoreTerm: true });
     const gate = startRun(pool, 'lane', block.cmd, {
-      env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '1', GATE_LOCK_TEST_KILL_GRACE: '2' },
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '2',
+        GATE_LOCK_TEST_TMP_ROOT: scratchOf(pool),
+      },
     });
     // A live view of the run's stdout, from before the command is up: the loop's
     // announcement is the proof that the heartbeat is running and will be the one to
@@ -112,5 +138,12 @@ describe('D25 a helper does not outlive the run', () => {
     expect(Date.now() - killed, 'the deaf command outlived the grace').toBeLessThan(15000);
     expect(stopped(command), 'the command is gone, one way or another').toBe(true);
     expect(fs.existsSync(block.done), 'it was stopped, not allowed to finish').toBe(false);
+    // The command ends inside the supervisor's grace, so that supervisor is still
+    // running here - inside the very directory this test's cleanup takes away.
+    await waitRunGone(gate, { tmpRoot: scratchOf(pool) });
+    expect(
+      fs.existsSync(runDirOf(gate.child.pid, scratchOf(pool))),
+      'the private directory outlived its run',
+    ).toBe(false);
   }, 60_000);
 });

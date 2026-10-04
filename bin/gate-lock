@@ -2155,6 +2155,12 @@ run_signal() {
 # process can escalate, because only it can wait for the command.
 run_forward_term() {
   [ -n "$run_cmd_pid" ] || return 0
+  # A test seam: a line from the signal handler itself. The handler runs while this
+  # run is inside a wait whose stderr is turned away (run_wait_pid), and this is the
+  # only thing that can show that a message written from there is not swallowed by
+  # that turn - which is what run_err_fd and the saved descriptor are for (D15).
+  seam GATE_LOCK_TEST_SIGNAL_LINE
+  [ -z "$seam_value" ] || printf 'gate-lock: %s\n' "$seam_value" >&"$run_err_fd"
   kill -TERM "$run_cmd_pid" 2>/dev/null
   [ -n "$run_escalator_pid" ] && return 0
   run_escalator_grace=$run_kill_grace
@@ -2732,7 +2738,18 @@ run_supervise() {
   # life, so one from a terminal's process group is never pending against a trap
   # list here. `run` stops this supervisor and the loop by writing the two files.
   trap '' TERM INT HUP QUIT
-  trap 'rm -f "$sv_stop" 2>/dev/null; : >"$sv_dir/supervisor.gone" 2>/dev/null' EXIT
+  # Every exit takes the stop file away and says it has gone, so the cleanup that
+  # stops this supervisor is never left waiting on a marker nobody will remove.
+  #
+  # And when the run is gone - KILLed, so it can never run its own cleanup - this
+  # supervisor is the last of that run's helpers standing, and the private directory
+  # is taken with it. The janitor does not: it walks the pool (D16), and this
+  # directory is deliberately outside it (D21). Nothing here is left to read it, and
+  # a directory that outlives every process that could remove it is a leak in the
+  # temp root. A straggler - the loop, the watchdog - writing into it afterwards
+  # writes into a name that is gone, which fails quietly and is why every write
+  # here and in them is already redirected.
+  trap 'rm -f "$sv_stop" 2>/dev/null; : >"$sv_dir/supervisor.gone" 2>/dev/null; kill -0 "$sv_run" 2>/dev/null || rm -rf "$sv_dir" 2>/dev/null' EXIT
   while :; do
     rm -f "$sv_status" 2>/dev/null
     # One stop file for every loop this supervisor owns: the supervisor may be
@@ -3060,6 +3077,7 @@ run_cleanup() {
 # says so.
 do_run() {
   exec 9>&2
+  run_err_fd=9
   # The options, then the lane, then the separator and the command. Anything else
   # is a usage error, which takes no lock. Only the first `--` separates: a later
   # one is an ordinary argument of the command (C29).
@@ -3153,6 +3171,10 @@ do_run() {
   fi
   run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" "$$" 9>&- &
   run_sup_pid=$!
+  # This supervisor's own pid, published beside the watchdog's for the same reason:
+  # a subshell cannot portably name itself, and a test that KILLs a run has to know
+  # when every helper of it is gone before it takes the run's private directory away.
+  printf '%s\n' "$run_sup_pid" >"$run_dir/supervisor.pid" 2>/dev/null
   # C31: the heartbeat is started before the command is waited for, and the
   # supervisor's announcement is waited for here - before anything can tear it
   # down - so a command that ends at once still leaves the "heartbeat pid" line
