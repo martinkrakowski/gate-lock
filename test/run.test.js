@@ -26,6 +26,7 @@ import {
   beatPids,
   blocker,
   freshPool,
+  heldListing,
   runOnce,
   runRaw,
   script,
@@ -172,9 +173,12 @@ done`,
     await up(block);
     const started = readSlot(pool, 'gate.lock').started;
     await until(() => readSlot(pool, 'gate.lock').beat !== started);
-    // While the command runs, the pool holds the marker and the slot and
-    // nothing else: no transient is ever left at the end of a refresh.
-    expect(names(pool).sort()).toEqual(['.format', 'gate.lock']);
+    // While the command runs, the pool holds the marker and the slot and nothing
+    // else - apart from a staged beat, which is what a refresh looks like from the
+    // outside between staging it and renaming it, and which is gone a moment later.
+    const held = heldListing(pool);
+    expect(held.held.sort(), `pool: ${held.listing}`).toEqual(['.format', 'gate.lock']);
+    expect(held.staged.length, `staged beats: ${held.listing}`).toBeLessThanOrEqual(1);
     block.release();
     expect((await gate.done).status).toBe(0);
     expect(names(pool)).toEqual(['.format']);
@@ -311,7 +315,11 @@ describe('T38 / R20 a nested run', () => {
     expect(fs.existsSync(inner.done)).toBe(false);
     // The outer run is untouched and still cleans up.
     expect(readSlot(pool, 'gate.lock').owner).toBe('outer-lane');
-    expect(names(pool)).toEqual(['.format', 'gate.lock']);
+    // The outer run is live and its heartbeat refreshes every period, so its first
+    // refresh can be staging its beat at this instant (D21).
+    const held = heldListing(pool);
+    expect(held.held, `pool: ${held.listing}`).toEqual(['.format', 'gate.lock']);
+    expect(held.staged.length, `staged beats: ${held.listing}`).toBeLessThanOrEqual(1);
     outer.release();
     const r = await a.done;
     expect(r.status).toBe(0);
@@ -921,9 +929,13 @@ describe('D21 the file recording the slot path', () => {
     const block = blocker(pool);
     const gate = startRun(pool, 'lane', block.cmd);
     await up(block);
-    // Nothing of run's own is published in the pool: the slot path was recorded
-    // in a private directory, which the acquire wrote through D21's own rules.
-    expect(names(pool), `pool: ${names(pool)}`).toEqual(['.format', 'gate.lock']);
+    // Nothing of run's own is published in the pool: the slot path was recorded in a
+    // private directory, which the acquire wrote through D21's own rules. A staged
+    // beat beside the slot is the one name that is not run's - it is a refresh in
+    // flight - so it is counted and named rather than listed.
+    const held = heldListing(pool);
+    expect(held.held, `pool: ${held.listing}`).toEqual(['.format', 'gate.lock']);
+    expect(held.staged.length, `staged beats: ${held.listing}`).toBeLessThanOrEqual(1);
     block.release();
     expect((await gate.done).status).toBe(0);
     // The exact listing, `.format` included. A staged beat is the tool's own name

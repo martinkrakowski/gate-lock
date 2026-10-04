@@ -27,6 +27,7 @@ import {
   seed,
   startAcquire,
   sub,
+  until,
   wtDir,
 } from './slots.js';
 
@@ -161,8 +162,14 @@ describe('R10 the .format publication race (H1)', () => {
     expect(names(pool).sort()).toEqual(
       [`.format.tmp.${pidA}`, `.format.tmp.${b.child.pid}`].sort(),
     );
-    releaseHook(`${link}.a`);
+    // lane-b is let through the window first, and the test waits for the slot that
+    // gives it before lane-a follows. That is the pairing the GitHub macOS runner
+    // produced by itself - lane-b holding slot 0 - and the one this test used to
+    // assume away. Doing it deliberately means every runner covers it, and the
+    // release loop below pairs by owner because of it.
     releaseHook(`${link}.b`);
+    await until(() => fs.existsSync(path.join(pool, 'gate.lock')), 15000);
+    releaseHook(`${link}.a`);
     const [ra, rb] = await Promise.all([a.done, b.done]);
     expect([ra.status, rb.status]).toEqual([0, 0]);
     expect(ra.stderr).toBe('');
@@ -183,12 +190,25 @@ describe('R10 the .format publication race (H1)', () => {
     // GATE_LOCK_DIR, which the harness hands over as one realpath'd string for the
     // acquire and every release alike - so the platform-dependent step left in
     // that path is `owned_by`, i.e. `find <path> -prune -user <uid> -print`.
+    //
+    // What that macOS failure actually was: not `owned_by`, but this loop below
+    // pairing a lane with a slot by its number. Either acquirer can win either slot,
+    // so on that runner lane-b won slot 0 and was released with lane-a's slot-0 pid,
+    // and the tool answered "nothing to release" - correctly. The diagnostics are
+    // kept, and each release is now also asked to say whose slot it gave back.
     const releases = [];
-    for (const [lane, holder] of [
-      ['lane-a', readSlot(pool, 'gate.lock').pid],
-      ['lane-b', readSlot(pool, 'gate.lock.1').pid],
-    ]) {
-      const cwd = wtDir(pool, 'wt-a');
+    for (const lane of ['lane-a', 'lane-b']) {
+      // Each lane releases *its own* slot, found by the owner recorded in it rather
+      // than by its number: in the publication race either acquirer can win either
+      // slot, so pairing a lane with a slot by number is a race with the test's own
+      // name for it. This has failed on the GitHub macOS runner for exactly that
+      // reason, and the tool's answer - "nothing to release", because it was handed
+      // the other lane's pid - was right: this was a bug in the test, not in the tool.
+      const held = names(pool)
+        .filter((n) => /^gate\.lock(\.\d+)?$/.test(n))
+        .find((n) => readSlot(pool, n).owner === lane);
+      const holder = readSlot(pool, held ?? 'gate.lock').pid;
+      const cwd = wtDir(pool, lane === 'lane-a' ? 'wt-a' : 'wt-b');
       const r = sub(pool, ['release', lane], holder, { cwd });
       const left = names(pool)
         .filter((n) => /^gate\.lock(\.\d+)?$/.test(n))
@@ -200,6 +220,9 @@ describe('R10 the .format publication race (H1)', () => {
         `${lane} caller pid=${holder} cwd=${cwd} -> status ${r.status} stdout ${JSON.stringify(r.stdout.trim())} stderr ${JSON.stringify(r.stderr.trim())} left ${JSON.stringify(left)}`,
       );
       expect(r.status, `${lane}: ${r.stderr}`).toBe(0);
+      expect(r.stdout, `${lane}: ${releases[releases.length - 1]}`).toContain(
+        `released by ${lane}`,
+      );
     }
     expect(names(pool), releases.join('; ')).toEqual(['.format']);
   });

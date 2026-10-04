@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach } from 'vitest';
 import { runBin, scratchOf, startBin, waitForFile } from './harness.js';
-import { TM, freshPool as slotPool, livePid, until, wtDir } from './slots.js';
+import { TM, freshPool as slotPool, livePid, names, until, wtDir } from './slots.js';
 
 export { TM, livePid, until };
 
@@ -200,6 +200,28 @@ export function runDirOf(pid, tmpRoot) {
  */
 export async function waitRunGone(gate, { tmpRoot, timeoutMs = 30000 } = {}) {
   await until(() => !fs.existsSync(runDirOf(gate.child.pid, tmpRoot)), timeoutMs);
+}
+
+/**
+ * The listing of a pool whose run still holds its slot: `.format`, the slot, and at
+ * most one staged beat.
+ *
+ * A staged beat is the tool's own name pattern beside the slot (`<slot>.beatnew.<pid>`,
+ * F39) and exists only while a refresh is between staging it and renaming it into
+ * place, so a listing taken in that instant sees a file that is gone a moment later.
+ * A pool whose run has ended has no such excuse and is listed exactly - that is the
+ * property - so this is for the listings taken while a run lives, and it says what
+ * the pool holds apart from that transient and how many it tolerates, with the whole
+ * listing in the failure message.
+ */
+export function heldListing(pool) {
+  const listing = names(pool);
+  const staged = listing.filter((n) => /^gate\.lock(\.\d+)?\.beatnew\.\d+$/.test(n));
+  return {
+    listing,
+    held: listing.filter((n) => !staged.includes(n)),
+    staged,
+  };
 }
 
 /** Run `run <lane> -- <cmd...>` synchronously (usage errors and refusals). */
