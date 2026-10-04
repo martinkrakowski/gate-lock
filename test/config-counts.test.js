@@ -478,7 +478,7 @@ describe('C1/D9 configuration is resolved once, for every subcommand, before the
     }
   });
 
-  it('after configuration resolves every subcommand runs on its own terms (usage, caller pid, status, clean, not built yet)', () => {
+  it('after configuration resolves every subcommand runs on its own terms (usage, caller pid, status, run, clean)', () => {
     for (const args of [
       [],
       ['acquire', 'x'],
@@ -489,6 +489,10 @@ describe('C1/D9 configuration is resolved once, for every subcommand, before the
     ]) {
       const pool = freshPool();
       expect(accepted(cfg({ GATE_LOCK_DIR: pool }, args)), args.join(' ')).toBe(true);
+      // `run` really ran: it took a slot and gave it back.
+      if (args[0] === 'run') {
+        expect(fs.readdirSync(pool), 'the slot was released').toEqual(['.format']);
+      }
     }
   });
 
