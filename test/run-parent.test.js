@@ -22,6 +22,7 @@ import {
   runDirOf,
   startRun,
   stopHelpers,
+  untilGone,
   stopped,
   track,
   up,
@@ -33,11 +34,6 @@ function parentOf(pid) {
   const listed = spawnSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8' });
   if (listed.error || listed.status !== 0) return 0;
   return Number(listed.stdout.trim());
-}
-
-/** Wait until `pid` is not a process at all (a zombie is still one). */
-async function untilGone(pid, timeoutMs) {
-  await until(() => stopped(pid), timeoutMs);
 }
 
 describe('D25 nothing a test starts outlives the test', () => {

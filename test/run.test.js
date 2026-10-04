@@ -23,6 +23,7 @@ import {
   wtDir,
 } from './slots.js';
 import {
+  beatHook,
   beatPids,
   blocker,
   freshPool,
@@ -33,8 +34,11 @@ import {
   slotsReported,
   startRun,
   stopped,
+  traceText,
   track,
   up,
+  untilGone,
+  untilTraced,
   waitForDead,
 } from './run.js';
 
@@ -849,13 +853,16 @@ describe('D10 a loop that keeps dying', () => {
     const pool = freshPool();
     const wedge = path.join(scratchOf(pool), 'loop-wedge');
     fs.writeFileSync(wedge, 'wedged\n');
+    const trace = path.join(scratchOf(pool), 'trace.log');
     const block = blocker(pool);
     const gate = startRun(pool, 'lane', block.cmd, {
       env: {
         ...TM,
+        GATE_LOCK_TEST_MODE: '1',
         GATE_LOCK_TEST_LOOP_WEDGE: wedge,
         GATE_LOCK_HEARTBEAT_SECONDS: '1',
         GATE_LOCK_TEST_KILL_GRACE: '2',
+        GATE_LOCK_TEST_TRACE: trace,
       },
     });
     await up(block);
@@ -869,14 +876,123 @@ describe('D10 a loop that keeps dying', () => {
     // supervisor was hard stopped. This used to be answered 2 with "lock lost": that
     // was the teardown's own KILL being read as proof, which is what made a run whose
     // command finished perfectly claim it had lost a lock it held and released.
+    //
+    // The trace is what says which of the two ways to that verdict was taken: the
+    // supervisor KILLs a loop that will not stop, and finds one that stopped. Without
+    // this assertion the test passes on either, so a change that moved the verdict onto
+    // the other path would not be noticed here.
     block.release();
     const r = await gate.done;
-    expect(r.status).toBe(0);
-    expect(r.stderr).toContain('stopped the hard way');
-    expect(r.stderr).not.toContain('lock lost');
+    expect(r.status, traceText(trace)).toBe(0);
+    expect(r.stderr, traceText(trace)).toContain('stopped the hard way');
+    expect(r.stderr, traceText(trace)).not.toContain('lock lost');
     expect(beatPids(r.stdout), 'one loop, not a restart and a second loop').toHaveLength(1);
-    expect(names(pool)).toEqual(['.format']);
+    expect(names(pool), traceText(trace)).toEqual(['.format']);
+    expect(traceText(trace), traceText(trace)).toMatch(
+      new RegExp(`KILLs loop ${beatPids(r.stdout)[0]}, no refresh in flight`),
+    );
   });
+
+  it('D10 a supervisor waiting on a loop that went quiet stops the command when its run is KILLed', async () => {
+    const pool = freshPool();
+    const wedge = path.join(scratchOf(pool), 'loop-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const trace = path.join(scratchOf(pool), 'trace.log');
+    // Deaf to TERM, so nothing but a KILL ends it: if the supervisor is not watching,
+    // nothing ends it at all, and that is the whole point of this test.
+    const block = blocker(pool, 'deaf', { ignoreTerm: true });
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_TEST_LOOP_WEDGE: wedge,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '2',
+        GATE_LOCK_TEST_TRACE: trace,
+      },
+    });
+    let out = '';
+    gate.child.stdout.setEncoding('utf8').on('data', (d) => {
+      out += d;
+    });
+    await up(block);
+    await until(() => beatPids(out).length > 0, 10000);
+    const loop = beatPids(out)[0];
+    // Three seconds without a word from the loop is what takes the supervisor out of
+    // its watch and onto the wait for a loop that is still live - the shape this test
+    // is about. Nothing has asked the supervisor to stop, so it is on the stale path
+    // alone, and the wait it used to enter there reads nothing at all: not its stop
+    // file, not its run's pid.
+    await untilTraced(() => /stops waiting for a quiet loop/.test(traceText(trace)), trace, 20000);
+    gate.child.kill('SIGKILL');
+    // With the run gone, the supervisor is what stops the command: TERM, the grace,
+    // KILL. It can only do that if it is still watching for the run, which is what the
+    // KILL before the wait is for.
+    await untilGone(block.pid(), 20000);
+    expect(stopped(block.pid()), 'the command outlived the run that held its slot').toBe(true);
+    await untilGone(loop, 10000);
+    expect(stopped(loop), 'the wedged loop outlived the run').toBe(true);
+    expect(stopped(gate.child.pid)).toBe(true);
+    expect(traceText(trace), traceText(trace)).toMatch(
+      new RegExp(`KILLs loop ${loop}, which left no status`),
+    );
+  }, 90_000);
+
+  it('D10 the teardown waits for a supervisor that is about to KILL its own loop', async () => {
+    const pool = freshPool();
+    const hook = beatHook(pool);
+    const trace = path.join(scratchOf(pool), 'trace.log');
+    // Deaf to TERM, so the run is still waiting for its command while the supervisor
+    // does its own waiting - and a long grace, because that is what makes the two
+    // budgets differ: the supervisor waits grace + 13 passes for a refresh it will not
+    // cut short, while the teardown's own budget for the same wait used to be a fixed
+    // twenty-five seconds. At a grace of twenty the supervisor is still eight passes
+    // from KILLing its loop when the teardown gave up on it and KILLed it instead,
+    // which leaves that loop behind with a heartbeat child under it and nothing to
+    // stop either. The wait below is generous because the supervisor's own pace is not
+    // ours to fix: a pass of its watch takes a second when the host is idle and several
+    // when it is loaded, and what this test is about is who gives up first, not how
+    // long either of them takes.
+    const block = blocker(pool, 'deaf', { ignoreTerm: true });
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '20',
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        GATE_LOCK_TEST_TRACE: trace,
+      },
+    });
+    // The refresh is parked at the rename with its in-flight marker published, which
+    // is what makes the supervisor wait rather than KILL: a refresh in flight is never
+    // cut short (C41, R7).
+    await waitForFile(hook.seam);
+    gate.child.kill('SIGTERM');
+    try {
+      // The supervisor ends its loop itself. `run` KILLs a helper only as a last
+      // resort, and with both budgets derived from the same grace it never gets there
+      // first - so this line is the supervisor's, and it is the only evidence that it
+      // was.
+      await untilTraced(
+        () => /KILLs loop \d+ after \d+ seconds with a refresh in flight/.test(traceText(trace)),
+        trace,
+        240000,
+      );
+      expect(traceText(trace), traceText(trace)).not.toMatch(/stopped the hard way \(status 137\)/);
+    } finally {
+      hook.release();
+    }
+    const r = await gate.done;
+    expect(r.status, traceText(trace)).toBe(143);
+    expect(r.stderr, `${JSON.stringify(r.stderr)}\n${traceText(trace)}`).toBe('');
+    expect(r.stdout, traceText(trace)).toContain('released by lane');
+    // The loop was KILLed with a refresh of its own in flight, and a KILL does not
+    // reach a foreground child: the heartbeat parked at the rename outlived the loop by
+    // about a second, and the stage it wrote went when it did. What must not happen is
+    // a stage outliving the process that wrote it - so the pool is read once the
+    // writer is gone, not at the instant the run ends.
+    await until(() => stagedBeats(pool).length === 0, 15000);
+    expect(names(pool), traceText(trace)).toEqual(['.format']);
+  }, 300_000);
 
   it('D10 a supervisor that will not be stopped at all is KILLed, and the slot decides: the command status stands', async () => {
     const pool = freshPool();

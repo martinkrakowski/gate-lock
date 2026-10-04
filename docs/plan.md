@@ -65,8 +65,11 @@ Rev 2 applies an adversarial plan review: 2 blockers, 10 should-fix items and th
   - `run` starts a supervisor subshell. The supervisor spawns the heartbeat loop as its own child, `wait`s on it, and restarts it once if it dies with a status other than 0 or 1.
   - On a second death, or a loop exit of 1 (a refresh failed), the supervisor sends TERM to the command, then KILL after a 10 s grace period, and exits 1.
   - `run` collects the supervisor's status in cleanup. A supervisor status of 1 makes `run` exit 2 with "lock lost".
+  - Every other status is **unproven**, and the slot decides: read before the release, and a slot still this run's (owner and pid) means the command's own status stands, with the hard stop reported on stderr; a slot that is not this run's means the lock is gone and the run answers 2.
+  - **A stop that was requested is never evidence, and it is never proof either.** A stop request can never turn a non-zero loop status into a quiet exit, so a run cleaning up never answers 0 for a lock it cannot account for; and because the teardown produces those statuses itself, a supervisor that was asked to stop and whose loop then ended non-cleanly leaves **unproven** (status 3) rather than lost. A failed refresh with nobody having asked for any of it is the one row that is proof.
+  - The supervisor never waits on a live loop: only `wait` may say that a child finished, so a loop that has stopped saying anything is KILLed before the `wait`, and a loop that has left a status is not signalled at all.
   - The supervisor's own death remains the documented gap (Q10).
-  - The tool never uses `kill -0` to decide that a child finished, because a zombie still answers the probe. Only `wait` decides that.
+  - The tool never uses `kill -0` to decide that a child finished, because a zombie still answers the probe. Only `wait` decides that. (`kill -0` is used only to ask whether a pid that wrote a file is still alive, which is a different question: see D16's janitor rule.)
 - **D11: keep rename semantics.** `mv` onto an existing directory nests on both GNU and BSD and never replaces, so the bounded patience of Q11 is preserved.
 - **D12: release by rename-aside.**
   - `release`, the F60 give-back and reclaim all pick an aside name that does not yet exist (`[ ! -e ]`, then a numeric retry suffix).

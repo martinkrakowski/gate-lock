@@ -11,6 +11,7 @@ import { listing, scratchOf, waitForFile } from './harness.js';
 import { TM, livePid, names, readSlot, until } from './slots.js';
 import {
   HAS_PGREP,
+  beatHook,
   beatPids,
   blocker,
   childrenMatching,
@@ -20,6 +21,7 @@ import {
   script,
   startRun,
   stopped,
+  traceText,
   track,
   up,
   waitForDead,
@@ -88,35 +90,6 @@ const refreshesIn = (file) =>
   traceText(file)
     .split('\n')
     .filter((line) => line.includes('refreshing ') && line.includes('inflight published'));
-
-/** A hook whose seam takes exactly one refresh, for the tests that park a refresh. */
-function beatHook(pool, name = 'beat-hook') {
-  const dir = path.join(scratchOf(pool), name);
-  fs.mkdirSync(dir, { recursive: true });
-  return {
-    dir,
-    seam: path.join(dir, 'beat-rename'),
-    // The whole directory goes, not just the file in it, and that is what makes the
-    // seam one-shot: `pause_at` creates the file it waits on, so a refresh that comes
-    // after this one cannot be parked by a path that no longer has a directory to be
-    // created in. Removing the file alone would let the next refresh re-create it and
-    // park again - a second parked refresh, which is not what these tests mean, and
-    // which is what macOS CI saw on T36. The seam is one-shot by construction, and
-    // `reparked` is the assertion that keeps it that way.
-    release: () => fs.rmSync(dir, { recursive: true, force: true }),
-    /** Has any refresh parked on this seam since it was released? */
-    reparked: () => fs.existsSync(path.join(dir, 'beat-rename')),
-  };
-}
-
-/** The tool's decision trace, as it stands now, for a failure message. */
-function traceText(file) {
-  try {
-    return fs.readFileSync(file, 'utf8');
-  } catch {
-    return '(no trace written)';
-  }
-}
 
 /**
  * Is there a run's private directory under `root` that holds `name`? The temp
@@ -790,16 +763,25 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     await until(() => beatPids(printed()).length > 0, 10000);
     const loop = beatPids(printed())[0];
     expect(loop, printed()).toBeGreaterThan(0);
-    await until(() => childrenMatching(loop, 'sleep 3600').length > 0, 10000);
+    const beatAlive = path.join(runDirOf(gate.child.pid, tmpRoot), 'beat-alive');
+    // The loop is parked: it has ticked, and its tick file has stopped moving while it
+    // is still alive. That is the same quiet the supervisor reads, polled here rather
+    // than waited out, so the stop file below is written while the loop is inside the
+    // wedge and not before it.
+    let mark = null;
+    await until(() => {
+      const now = fs.existsSync(beatAlive) ? fs.readFileSync(beatAlive, 'utf8') : '';
+      if (mark !== null && now === mark) return true;
+      mark = now;
+      return false;
+    }, 10000);
     // Asked, not signalled: this is the file `run` writes when it stops the heartbeat,
     // written here so that the ask is in the past by the time the loop goes on.
     fs.writeFileSync(path.join(runDirOf(gate.child.pid, tmpRoot), 'loop.stop'), '');
-    // The wedge is a sleep, not a poll, so it is not released by taking the file away -
-    // which is what lets the loop be wedged long enough to be KILLed in the test that
-    // is about that. What releases it here is ending that sleep: the loop then carries
-    // on through the very window this test is about.
-    const [sleeper] = childrenMatching(loop, 'sleep 3600');
-    process.kill(Number(sleeper), 'SIGKILL');
+    // The wedge is a poll now, so taking the file away is what releases it - and it
+    // releases the loop itself, one second later, instead of a KILL that could not
+    // reach the sleep the loop was in the foreground of.
+    fs.rmSync(wedge);
     // It can act in exactly one of two ways: end, or refresh a slot whose run has
     // already been told the beat is not wanted.
     await until(() => refreshesIn(trace).length > 0 || /exiting 0/.test(traceText(trace)), 15000);
@@ -807,11 +789,9 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     block.release();
     const r = await gate.done;
     expect(r.status, traceText(trace)).toBe(0);
-    // The run itself has nothing to report: not one of its own lines is here. What may
-    // be is the shell's own notice about the sleep this test just killed - `Killed` on
-    // dash, and `bin/gate-lock: line N: <pid> Killed sleep 3600` on bash - which is
-    // about a job of the loop's and not about the lock.
-    expect(r.stderr, traceText(trace)).not.toMatch(/^gate-lock: /m);
+    // Nothing of the run's own is on stderr: it has nothing to report, and the sleep
+    // this test used to kill is no longer there to be announced.
+    expect(r.stderr, `${JSON.stringify(r.stderr)}\n${traceText(trace)}`).toBe('');
     expect(r.stdout, traceText(trace)).toContain('released by lane');
     expect(names(pool), traceText(trace)).toEqual(['.format']);
     expect(gone(loop), traceText(trace)).toBe(true);

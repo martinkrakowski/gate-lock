@@ -366,6 +366,60 @@ export function slotsReported(stdout) {
   return [...stdout.matchAll(/^gate-lock: acquired by .* at (.*)$/gm)].map((m) => m[1]);
 }
 
+/**
+ * Wait until `pid` is not a process at all. `stopped`, not `alive`: a process this
+ * shell has not reaped yet is still a process, and a helper that has ended but has not
+ * been waited for would read as alive.
+ */
+export async function untilGone(pid, timeoutMs = 10000) {
+  await until(() => stopped(pid), timeoutMs);
+}
+
+/**
+ * A hook directory holding the H8 seam of one heartbeat refresh. Releasing it by
+ * removing the whole directory releases the parked refresh and, because the path can no
+ * longer be created, lets every later refresh through: `pause_at` creates the file it
+ * waits on, and a path it cannot create is a pause it does not take. So the seam takes
+ * exactly one refresh, which is what a test that parks a refresh means; `reparked` is
+ * the assertion that keeps it that way.
+ */
+export function beatHook(pool, name = 'beat-hook') {
+  const dir = `${scratchOf(pool)}/${name}`;
+  fs.mkdirSync(dir, { recursive: true });
+  return {
+    dir,
+    seam: path.join(dir, 'beat-rename'),
+    release: () => fs.rmSync(dir, { recursive: true, force: true }),
+    /** Has any refresh parked on this seam since it was released? */
+    reparked: () => fs.existsSync(path.join(dir, 'beat-rename')),
+  };
+}
+
+/**
+ * Wait for a condition, with the tool's own trace in the failure when there is one to
+ * show: a test that waits for a decision the tool has not made is exactly the case
+ * where "timed out" on its own says nothing.
+ */
+export async function untilTraced(seen, file, timeoutMs = 60000) {
+  try {
+    await until(seen, timeoutMs);
+  } catch (e) {
+    throw new Error(`${e.message}: ${traceText(file)}`, { cause: e });
+  }
+}
+
+/** The tool's decision trace, as it stands now, for a failure message: a test that
+ * fails on a decision the tool made can put the tool's own account of it in the
+ * message rather than a guess.
+ */
+export function traceText(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return '(no trace written)';
+  }
+}
+
 /** The heartbeat pids a run printed, one per heartbeat loop its supervisor started. */
 export function beatPids(stdout) {
   return [...stdout.matchAll(/^gate-lock: heartbeat pid (\d+) /gm)].map((m) => Number(m[1]));

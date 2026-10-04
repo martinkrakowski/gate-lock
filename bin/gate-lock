@@ -194,8 +194,11 @@ seam() {
 # passes the seam can put the trace in its own failure message.
 #
 # Nothing is written unless test mode is on and the seam is set (D20): the seam is
-# read through `seam`, which only reads anything in test mode, and every caller is on
-# a path a production run does not take in the first place.
+# read through `seam`, which only reads anything in test mode. The paths that reach
+# here are on a production run - the loop and the supervisor decide on every refresh -
+# so a caller may not fork to build a message for this: `$(...)` in the arguments
+# would run before this function could decline. Pass values, or a path to read, and
+# let the decision be made here.
 trace() {
   seam GATE_LOCK_TEST_TRACE
   [ -n "$seam_value" ] || return 0
@@ -2106,27 +2109,44 @@ run_release_done=0
 run_recorded=0
 run_finished=0
 # The seconds between the supervisor's TERM and its KILL (D10). A test seam may
-# shorten it; nothing else may.
+# shorten it; nothing else may. Read once, here, from the one place it is read: every
+# budget below is derived from it, so a seam that shortens the grace has to shorten
+# them all, or `run` and its supervisor end up counting to different numbers.
 run_kill_grace=10
+seam GATE_LOCK_TEST_KILL_GRACE
+case ${seam_value:-} in
+'' | *[!0-9]*) ;;
+*) run_kill_grace=$seam_value ;;
+esac
 # How long a teardown waits for a helper that will not stop, and how many of those
 # seconds may be spent with one of its own refreshes in flight. The first is the
 # bound that keeps a wedged helper from holding the run; the second is the same wait
 # again, counted apart, because a helper with a refresh in flight is busy rather than
-# wedged and a refresh is never cut short (C41, R7). The supervisor waits the same
-# thing for the loop it owns - the grace plus ten - and these are larger, so `run` is
-# never the side that gives up while the supervisor is still being careful.
+# wedged and a refresh is never cut short (C41, R7).
 run_stop_bound=8
-run_stop_cap=25
+# The busy count is arithmetic and not a round number, because it is not this side's
+# to choose. The supervisor's own worst case, measured from the ask that starts it, is
+# three asks of about a second each plus `sv_wait_cap` seconds waiting out a refresh it
+# will not cut short, and `sv_wait_cap` is the grace plus ten: the grace plus 13. This
+# must be larger than that, or `run` is the side that gives up while the supervisor is
+# still being careful - and a supervisor KILLed on its way to ending its loop leaves
+# that loop behind, with a heartbeat child of it under it and `beat-inflight` still on
+# disk for the next teardown to wait on. Five seconds of slack over the worst case:
+# 10 + 13 + 5.
+run_stop_cap=$((run_kill_grace + 18))
 
 # run_signal NAME CODE (D15, C38-C40): HUP, QUIT and TERM all forward TERM to
 # the command, and INT does too, because an asynchronous command starts with INT
 # and QUIT ignored: a forwarded INT would be a no-op for a plain shell command
 # (C39). A second signal, of any kind, is ignored - re-entering is the one thing
 # worse than ignoring it, because it can skip the release (C40).
-# run_stop_helper MARKER GONE PID: stop one of our helper subshells the way that
-# does not involve a signal. The file MARKER is written here and the subshell
-# takes it away as it goes, at its next step, which is a second away; GONE is the
-# file that subshell leaves behind when it has finished, on every one of its exits.
+# run_stop_helper MARKER GONE PID INFLIGHT [PROGRESS]: stop one of our helper
+# subshells the way that does not involve a signal. The file MARKER is written here
+# and the subshell takes it away as it goes, at its next step, which is a second
+# away; GONE is the file that subshell leaves behind when it has finished, on every
+# one of its exits. INFLIGHT is that helper's own refresh marker, or empty where it
+# has none; PROGRESS is the file it rewrites as it goes, or empty where it publishes
+# nothing.
 #
 # Both of those are checked before the wait and during it, which is what keeps a
 # helper that had already ended from costing anything: it has left GONE, so the
@@ -2154,12 +2174,33 @@ run_stop_helper() {
     run_stop_waited=0
     run_stop_busy=0
     run_stop_spin=0
+    run_stop_prog=
     while [ -e "$1" ] && [ ! -e "$2" ]; do
       run_stop_spin=$((run_stop_spin + 1))
       if [ "$run_stop_spin" -lt 200 ]; then
         continue
       fi
       run_stop_spin=0
+      # $5, where there is one, is the file that helper rewrites as it goes, and a
+      # change in it starts the busy budget again. It is what tells a helper that is
+      # slow from one that is wedged: the two sides count the same wait in different
+      # currencies - this one in seconds, the supervisor in passes of its own, and a
+      # pass takes more than a second whenever the host is loaded - so a supervisor
+      # that is still asking, still counting, still waiting out a refresh it will not
+      # cut short, is given up on by a clock alone at exactly the moment it was about
+      # to end that wait itself. What is left then is a helper that has stopped saying
+      # anything at all, and the budget below is the bound for that.
+      if [ -n "${5:-}" ]; then
+        run_stop_now=
+        {
+          IFS= read -r run_stop_now <"${5:-}"
+        } 2>/dev/null
+        if [ -n "$run_stop_now" ] && [ "$run_stop_now" != "$run_stop_prog" ]; then
+          run_stop_prog=$run_stop_now
+          run_stop_busy=0
+          continue
+        fi
+      fi
       # A refresh of the helper's own is in flight: it is busy, not wedged, and
       # C41 says that refresh is never cut short. Those seconds are counted apart
       # from the bound below, and the busy count has a cap of its own so that a
@@ -2307,7 +2348,10 @@ run_escalator() {
 # skipped rather than spent on a marker no live process is going to remove.
 run_cancel_escalator() {
   [ -n "$run_escalator_pid" ] || return 0
-  run_stop_helper "$run_dir/escalator.stop" "$run_dir/escalator.gone" "$run_escalator_pid" "$run_dir/beat-inflight"
+  # No fourth argument: this watchdog has nothing to do with a refresh, so a marker
+  # left behind by a loop that was hard stopped is not its business, and counting
+  # against a busy budget would make this wait for a refresh that is never coming.
+  run_stop_helper "$run_dir/escalator.stop" "$run_dir/escalator.gone" "$run_escalator_pid" ""
   wait "$run_escalator_pid" 2>/dev/null
   run_escalator_pid=
   rm -f "$run_dir/escalator.pid" "$run_dir/escalator.stop" "$run_dir/escalator.gone" 2>/dev/null
@@ -2421,7 +2465,7 @@ run_stop_supervisor() {
   # exited already - a lost lock ends the run before the cleanup does - so the files
   # are removed once the pids are reaped.
   : >"$run_dir/loop.stop" 2>/dev/null
-  run_stop_helper "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" "$run_sup" "$run_dir/beat-inflight"
+  run_stop_helper "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" "$run_sup" "$run_dir/beat-inflight" "$run_dir/supervisor.alive"
   run_wait_supervisor "$run_sup"
   rm -f "$run_dir/loop.stop" "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" 2>/dev/null
 }
@@ -2696,6 +2740,10 @@ run_beat_loop() {
   rb_inflight=$7
   rb_dir=$8
   rb_tick=0
+  # How this loop ended, for the EXIT trap below to write and trace. Empty until that
+  # trap runs, and assigned there before anything reads it; declared here because a
+  # reference inside the trap's own string is not an assignment anyone can see.
+  rb_ended=
   # Nothing to catch: these four signals are ignored for this subshell's whole
   # life, so one from a terminal's process group is never pending against a trap
   # list here - the state bash 3.2 mishandles. The loop is stopped by being asked,
@@ -2703,7 +2751,9 @@ run_beat_loop() {
   trap '' TERM INT HUP QUIT
   # The status is written first, because what the supervisor is told must be how
   # this loop ended and not how it tidied up: `$?` is the status the trap was
-  # entered with, and it is the only reading of it there is.
+  # entered with, and it is the only reading of it there is - so it is read into
+  # `rb_ended` before anything else runs, and the trace below says that rather than
+  # reading the file back, which would fork on every way out of a loop.
   #
   # The trap is left as a list of commands in one string, on purpose. `trap name EXIT`
   # is accepted here, and moving the same statements into a function of their own was
@@ -2712,7 +2762,7 @@ run_beat_loop() {
   # function nothing calls (SC2329), and so is anything it calls and nothing else
   # does. The way out is a caller outside the string, which is what the sweep after
   # each refresh is.
-  trap 'printf "%s\n" "$?" >"$rb_status" 2>/dev/null; trace "loop $$ exiting $(cat "$rb_status" 2>/dev/null)"; rb_sweep; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
+  trap 'rb_ended=$?; printf "%s\n" "$rb_ended" >"$rb_status" 2>/dev/null; trace "loop $$ exiting $rb_ended"; rb_sweep; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
   # A staged beat belongs to the heartbeat child that wrote it, and that child may be
   # KILLed - which runs no trap, so nothing removes the file it left. The loop knows
   # every stage beside its own slot, and it runs one refresh at a time, so a stage
@@ -2739,11 +2789,16 @@ run_beat_loop() {
     # driven rather than waited for.
     seam GATE_LOCK_TEST_LOOP_WEDGE
     rb_wedge=$seam_value
-    # The sleep is redirected because a parked helper must not hold the
-    # caller's own stdout and stderr open: a test harness waits for those pipes,
-    # and a helper parked for an hour would keep it waiting for an hour.
+    # The park is a poll and not one long sleep, and the sleep is redirected because a
+    # parked helper must not hold the caller's own stdout and stderr open. One second at
+    # a time is what makes it releasable at all: a `sleep 3600` here is not stopped by
+    # removing the file, and when a test that ends with this loop wedged has to KILL the
+    # loop, the KILL does not reach a sleep the loop is in the foreground of - an hour
+    # of `sleep 3600` left behind a KILLed loop by every test that used this seam.
     if [ -n "$rb_wedge" ] && [ -e "$rb_wedge" ]; then
-      sleep 3600 >/dev/null 2>&1
+      while [ -e "$rb_wedge" ]; do
+        sleep 1 >/dev/null 2>&1
+      done
     fi
     # A test seam that kills this loop with a status other than 0 or 1, as many
     # times as the file says, so the supervisor's restart-once rule is provable.
@@ -2790,8 +2845,16 @@ run_beat_loop() {
     else
       rb_hb_st=$?
     fi
-    rb_hb_err=$(tr '\n' '|' <"$rb_hb_out" 2>/dev/null)
-    trace "loop $$ refresh status $rb_hb_st stderr [$rb_hb_err]"
+    # What the child said is read for the trace alone, and only when there is a trace
+    # to read it for: `tr` is a process, and a refresh that succeeds in a production
+    # run must not fork one to answer a question nobody asked. `trace` says whether
+    # there is one; nothing before it may fork on its account.
+    seam GATE_LOCK_TEST_TRACE
+    rb_hb_err=
+    if [ -n "$seam_value" ]; then
+      rb_hb_err=$(tr '\n' '|' <"$rb_hb_out" 2>/dev/null)
+      trace "loop $$ refresh status $rb_hb_st stderr [$rb_hb_err]"
+    fi
     if [ "$rb_hb_st" -ne 0 ]; then
       # The child's own refusals are the news and are handed on unchanged (T18). What
       # is not handed on is the line a shell writes about its own bookkeeping - "Killed",
@@ -2864,6 +2927,15 @@ run_supervise() {
   sv_stop=$sv_dir/supervisor.stop
   sv_ready=$sv_dir/loop.stop
   sv_inflight=$sv_dir/beat-inflight
+  # This supervisor's own progress, rewritten once per pass of the watch below and
+  # read by `run` while it waits (run_stop_helper's fifth argument). It is how a
+  # supervisor that is slow is told apart from one that is wedged: `run` counts that
+  # wait in seconds and the supervisor counts it in passes of its own, and a pass
+  # takes more than a second whenever the host is loaded - so on a clock alone, `run`
+  # gives up on a supervisor that is still asking its loop to stop, and the KILL lands
+  # on it at the moment it was about to end that wait itself.
+  sv_pass=$sv_dir/supervisor.alive
+  sv_passes=0
   sv_restart=0
   # The grace between the TERM and the KILL that stops the command (D10), read once
   # because both places that stop it need it: the lost-lock tail below, and the tail
@@ -2918,7 +2990,7 @@ run_supervise() {
   # temp root. A straggler - the loop, the watchdog - writing into it afterwards
   # writes into a name that is gone, which fails quietly and is why every write
   # here and in them is already redirected.
-  trap 'rm -f "$sv_stop" 2>/dev/null; : >"$sv_dir/supervisor.gone" 2>/dev/null; kill -0 "$sv_run" 2>/dev/null || rm -rf "$sv_dir" 2>/dev/null' EXIT
+  trap 'rm -f "$sv_stop" "$sv_pass" 2>/dev/null; : >"$sv_dir/supervisor.gone" 2>/dev/null; kill -0 "$sv_run" 2>/dev/null || rm -rf "$sv_dir" 2>/dev/null' EXIT
   while :; do
     rm -f "$sv_status" 2>/dev/null
     # One stop file for every loop this supervisor owns: the supervisor may be
@@ -2947,14 +3019,26 @@ run_supervise() {
       # that ends a helper which will not be asked has a verdict to give.
       seam GATE_LOCK_TEST_SUP_WEDGE
       sv_wedge=$seam_value
-      # Redirected for the same reason as the loop's wedge above: a helper
-      # parked here must not hold the caller's stdout and stderr open.
+      # Redirected, and sliced a second at a time, for the two reasons the loop's own
+      # wedge above gives: a helper parked here must not hold the caller's stdout and
+      # stderr open, and a sleep of an hour is not stopped by removing the file, so a
+      # test that ends with this supervisor wedged and KILLs it leaves that sleep
+      # behind - the KILL does not reach a foreground child.
       if [ -n "$sv_wedge" ] && [ -e "$sv_wedge" ]; then
-        sleep 3600 >/dev/null 2>&1
+        while [ -e "$sv_wedge" ]; do
+          sleep 1 >/dev/null 2>&1
+        done
       fi
       sv_now=
       {
         IFS= read -r sv_now <"$sv_alive"
+      } 2>/dev/null
+      # This pass is a pass: the run waiting on it can see that this supervisor is
+      # still going. Published below the wedge above, so a supervisor parked there
+      # publishes nothing and is given up on as the wedged helper it is.
+      sv_passes=$((sv_passes + 1))
+      {
+        printf '%s\n' "$sv_passes" >"$sv_pass"
       } 2>/dev/null
       if [ "$sv_now" = "$sv_mark" ]; then
         # This watch is for a loop that has stopped saying anything. A loop waiting for
@@ -2962,7 +3046,8 @@ run_supervise() {
         # `beat-alive` moves on the loop's ticks, not on the child's, and under load a
         # refresh can take longer than the three seconds this allows. So while a
         # refresh is published the quiet seconds are counted apart and capped, exactly
-        # as the stop path does - a marker that is never taken away still ends.
+        # as the stop path does - a marker that is never taken away still ends, and what
+        # ends it is the KILL below the watch, never a wait on a loop that is alive.
         if [ -e "$sv_inflight" ]; then
           sv_stale_busy=$((sv_stale_busy + 1))
           if [ "$sv_stale_busy" -ge "$sv_wait_cap" ]; then
@@ -2985,7 +3070,9 @@ run_supervise() {
       if [ -e "$sv_stop" ]; then
         : >"$sv_ready" 2>/dev/null
         sv_asked=$((sv_asked + 1))
-        trace "supervisor $$ asks loop $sv_loop ($sv_asked), inflight: $( [ -e "$sv_inflight" ] && echo yes || echo no )"
+        sv_asked_busy=no
+        [ -e "$sv_inflight" ] && sv_asked_busy=yes
+        trace "supervisor $$ asks loop $sv_loop ($sv_asked), inflight: $sv_asked_busy"
         # Three asks is enough for a refresh to land - unless one is in flight, in
         # which case this loop is busy and not wedged, and a refresh is never cut
         # short (C41, R7). So the KILL waits for the refresh, and the wait is
@@ -3020,12 +3107,33 @@ run_supervise() {
       # Nothing is pending and the loop has left no trace for three seconds: only
       # `wait` can say it is gone (a loop killed outright leaves no status).
       if [ "$sv_stale" -ge 3 ]; then
+        trace "supervisor $$ stops waiting for a quiet loop: $sv_stale seconds without a word from it"
         break
       fi
       sleep 1
     done
     # The run is gone, so the tail below is the one that stops the command.
     kill -0 "$sv_run" 2>/dev/null || sv_orphaned
+    # The loop is KILLed here rather than waited for, and that is the whole point of
+    # this line. Only `wait` may say that a child has finished (D10), so the question
+    # cannot be asked any other way - but the way out of this watch is reached while the
+    # loop is still live: three quiet seconds say it has stopped talking, not that it has
+    # stopped. A `wait` from here reads nothing at all - not this supervisor's own stop
+    # file, not its run's pid - so a run KILLed in that second leaves its command with
+    # nobody to stop it, its beat going stale, and a second run free to take the slot
+    # while the first is still executing. That is D10's one unrecoverable case, and it
+    # is reachable in production by a heartbeat child hung on slow I/O.
+    #
+    # A loop that has left a status has ended, and its pid is about this supervisor's to
+    # reuse once `wait` has reaped it, so it is not signalled; the ask path above has
+    # usually KILLed it already, and signalling a pid that is on its way out is the one
+    # thing that could land on a stranger.
+    if [ -e "$sv_status" ]; then
+      trace "supervisor $$ finds loop $sv_loop ended, and waits for it"
+    else
+      trace "supervisor $$ KILLs loop $sv_loop, which left no status, rather than waiting for it"
+      kill -KILL "$sv_loop" 2>/dev/null
+    fi
     wait "$sv_loop" 2>/dev/null
     sv_st=$?
     rm -f "$sv_alive" "$sv_status" 2>/dev/null
@@ -3043,7 +3151,9 @@ run_supervise() {
       '' | *[!0-9]*) sv_st=1 ;;
       esac
     fi
-    trace "supervisor $$ sees loop $sv_loop status $sv_st, stop requested: $( [ -e "$sv_stop" ] && echo yes || echo no ), inflight: $sv_busy"
+    sv_stop_asked=no
+    [ -e "$sv_stop" ] && sv_stop_asked=yes
+    trace "supervisor $$ sees loop $sv_loop status $sv_st, stop requested: $sv_stop_asked, inflight: $sv_busy"
     # The verdict is the loop's own status, never the stop request. A stop request can
     # never turn one of these into a quiet exit - a run cleaning up must never answer 0
     # for a lock it cannot account for - and when one is requested it also cannot be
@@ -3213,7 +3323,10 @@ run_finish() {
   # about the lock in either direction, and the slot does (C35).
   run_verify_lock
   if [ "$run_sup_unproven" = 1 ]; then
-    trace "evidence: the slot verified=$run_verify_ok, removed=$run_removed"
+    # The `removed` half of this line is traced after the release below, not here: the
+    # release has not run yet at this point, so a trace written here could only ever
+    # report a zero, and a reader would take it for the answer.
+    trace "evidence: the slot verified=$run_verify_ok"
     if [ "$run_verify_ok" = 0 ]; then
       # The evidence settled it: the slot is not this run's, so this is a lost lock
       # after all, and the table's own rows take over from here.
@@ -3228,6 +3341,9 @@ run_finish() {
   fi
   run_lost_lock
   run_release_lock
+  if [ "$run_sup_unproven" = 1 ]; then
+    trace "evidence: the release removed=$run_removed"
+  fi
   run_sweep_stages
   run_finished=1
   # A signal outranks everything (C38). Then a lost lock (D10). Then a verify that
