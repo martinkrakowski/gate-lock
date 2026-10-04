@@ -1827,7 +1827,12 @@ do_heartbeat() {
     fail1 "heartbeat: cannot write the staged beat $hb_stage"
   fi
   chmod 0600 "$hb_stage" 2>/dev/null
+  # Each step of a refresh, in test mode only: a refresh that fails without saying why
+  # has to be traceable to the step it failed at, and this is what does that. The last
+  # line before a failure is the last thing that happened.
+  trace "heartbeat: staged $hb_stage for $target"
   pause_at GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME
+  trace "heartbeat: past the rename seam, about to check the holder"
   # Verified again here, immediately before the rename, because that is the last
   # moment it can be: the holder was read once, before anything was staged, and a
   # slot given away in between is somebody else's beat to write. Without this the
@@ -1858,6 +1863,7 @@ do_heartbeat() {
     rm -f "$hb_stage" 2>/dev/null
     fail1 "heartbeat: cannot replace the beat in $target (the lock may be gone)"
   fi
+  trace "heartbeat: the beat in $target is refreshed"
   # And once more after it: between the check above and the rename a holder can
   # still have taken the name. That is harmless to the file - a beat only says
   # "alive", and that holder is no less alive for it - but this caller no longer
@@ -1866,6 +1872,7 @@ do_heartbeat() {
   if ! pid_eq "$rd" "$caller"; then
     fail1 "heartbeat: no lock: $target is now held by another holder (pid ${rd:-none}); nothing of this caller's was refreshed"
   fi
+  trace "heartbeat: $target is still this caller's after the rename"
   exit 0
 }
 
@@ -2352,7 +2359,13 @@ run_cancel_escalator() {
   # left behind by a loop that was hard stopped is not its business, and counting
   # against a busy budget would make this wait for a refresh that is never coming.
   run_stop_helper "$run_dir/escalator.stop" "$run_dir/escalator.gone" "$run_escalator_pid" ""
-  wait "$run_escalator_pid" 2>/dev/null
+  # The group, for the reason run_wait_pid gives: a shell writes its line about a job of
+  # its own at the command boundary after the wait, and this is the shell that let the
+  # KILL that stopped this watchdog fall. Nothing is printed here, and `run` writes its
+  # own messages through descriptor 9.
+  {
+    wait "$run_escalator_pid" 2>/dev/null
+  } 2>/dev/null
   run_escalator_pid=
   rm -f "$run_dir/escalator.pid" "$run_dir/escalator.stop" "$run_dir/escalator.gone" 2>/dev/null
 }
@@ -2739,6 +2752,7 @@ run_beat_loop() {
   rb_run=$6
   rb_inflight=$7
   rb_dir=$8
+  rb_child=$rb_dir/beat-child
   rb_tick=0
   # How this loop ended, for the EXIT trap below to write and trace. Empty until that
   # trap runs, and assigned there before anything reads it; declared here because a
@@ -2839,12 +2853,24 @@ run_beat_loop() {
     # handed straight on when it failed, because a refusal is the news (T18) and the
     # caller reads it on the run's own stderr.
     rb_hb_out=$rb_dir/beat-hb.$$
-    if GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$rb_slot" "$self" heartbeat \
-      >"$rb_hb_out" 2>&1; then
+    # This refresh's child, published before it starts and taken away when it has
+    # ended. A KILL on the loop does not reach a child the loop is waiting for, so
+    # without this the supervisor could only end the loop and leave the refresh behind
+    # - still parked, still holding a stage beside the slot, for as long as whatever it
+    # was waiting on takes to answer. The file is emptied first on purpose: a value left
+    # by an earlier refresh must never be read as this one's, and an empty file is the
+    # one thing that says there is nothing to signal.
+    { printf '\n' >"$rb_child"; } 2>/dev/null
+    GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$rb_slot" "$self" heartbeat \
+      </dev/null >"$rb_hb_out" 2>&1 &
+    rb_hb_pid=$!
+    { printf '%s\n' "$rb_hb_pid" >"$rb_child"; } 2>/dev/null
+    if wait "$rb_hb_pid" 2>/dev/null; then
       rb_hb_st=0
     else
       rb_hb_st=$?
     fi
+    rm -f "$rb_child" 2>/dev/null
     # What the child said is read for the trace alone, and only when there is a trace
     # to read it for: `tr` is a process, and a refresh that succeeds in a production
     # run must not fork one to answer a question nobody asked. `trace` says whether
@@ -2869,6 +2895,25 @@ run_beat_loop() {
       # child ended with. A child that was KILLed says nothing at all - it cannot - and
       # this is the only word that failure gets.
       printf 'gate-lock: heartbeat: the refresh of %s failed with status %s\n' "$rb_slot" "$rb_hb_st" >&2
+      # Nothing of the child's came through, and that is worth saying out loud to
+      # whoever reads the trace next: either the child never spoke, or its words did not
+      # survive. What is left behind says which. A staged beat beside the slot is the
+      # second: the child wrote one and did not get as far as renaming it, so it died
+      # in the window between the two (C23) - and a `heartbeat:` line above, in this
+      # same file, says which step it reached.
+      rb_left_beats=
+      for rb_s in "$rb_slot".beatnew.*; do
+        [ -e "$rb_s" ] || continue
+        rb_left_beats="$rb_left_beats ${rb_s##*/}"
+      done
+      seam GATE_LOCK_TEST_TRACE
+      if [ -n "$seam_value" ]; then
+        if [ -e "$rb_hb_out" ]; then
+          trace "loop $$ refresh $rb_hb_st said nothing: $rb_hb_out is there with $(wc -c <"$rb_hb_out" 2>/dev/null) bytes; staged beside the slot:${rb_left_beats:- none}"
+        else
+          trace "loop $$ refresh $rb_hb_st said nothing and left no $rb_hb_out; staged beside the slot:${rb_left_beats:- none}"
+        fi
+      fi
     fi
     rm -f "$rb_hb_out" "$rb_inflight" 2>/dev/null
     # A stage this refresh left behind - its heartbeat child was KILLed between
@@ -2927,6 +2972,7 @@ run_supervise() {
   sv_stop=$sv_dir/supervisor.stop
   sv_ready=$sv_dir/loop.stop
   sv_inflight=$sv_dir/beat-inflight
+  sv_child=$sv_dir/beat-child
   # This supervisor's own progress, rewritten once per pass of the watch below and
   # read by `run` while it waits (run_stop_helper's fifth argument). It is how a
   # supervisor that is slow is told apart from one that is wedged: `run` counts that
@@ -2937,6 +2983,63 @@ run_supervise() {
   sv_pass=$sv_dir/supervisor.alive
   sv_passes=0
   sv_restart=0
+  # sv_kill_loop: end the loop, and the heartbeat it is waiting for, with one signal.
+  #
+  # One signal, not two in a row: the loop is this supervisor's child and the heartbeat
+  # is the loop's, so KILLing the loop first leaves the heartbeat alive and orphaned -
+  # still parked wherever it was parked, still holding its staged beat beside the slot -
+  # and signalling it afterwards is a second window in which its pid could have been
+  # reused. The heartbeat's pid is published by the loop (run_beat_loop's rb_child) and
+  # the file is emptied before each refresh and removed after it, so an empty or absent
+  # file means there is nothing of ours to signal. Where there is one, this is still a
+  # pid this supervisor never parented; the window is the microseconds between the loop
+  # writing it and this reading it, and the alternative is a refresh that outlives every
+  # process that could stop it.
+  sv_kill_loop() {
+    sv_k_pid=
+    {
+      IFS= read -r sv_k_pid <"$sv_child"
+    } 2>/dev/null
+    case ${sv_k_pid:-} in
+    '' | *[!0-9]*) sv_k_pid= ;;
+    esac
+    if [ -n "$sv_k_pid" ]; then
+      trace "supervisor $$ KILLs loop $sv_loop and its heartbeat $sv_k_pid"
+      kill -KILL "$sv_loop" "$sv_k_pid" 2>/dev/null
+    else
+      kill -KILL "$sv_loop" 2>/dev/null
+    fi
+    return 0
+  }
+  # sv_end_loop: leave the watch and end the loop, with this shell's own stderr turned
+  # away for the whole of it - the KILL and the reap together, not one and then the
+  # other.
+  #
+  # A shell writes a line about a job of its own - bash says `gate-lock: line 183:
+  # 83915 Killed: 9  run_beat_loop "$sv_slot" …` - at whatever command boundary comes
+  # after it reaps, and this supervisor is the shell that KILLed the loop it is about to
+  # reap. Redirection around the wait alone is not enough: the line can be flushed at
+  # any boundary between the KILL and the wait, and every one of those is outside it. So
+  # the KILL and the wait are one redirected region. Nothing is lost by that: this
+  # supervisor prints its own messages through the caller's real stderr, its trace goes
+  # to the trace file, and the only line a shell of its own would add here is about a
+  # job of its own, which is not the tool's news (D15).
+  sv_end_loop() {
+    {
+      # A loop that has left a status has ended, and its pid is about to be this
+      # supervisor's to reuse once it is reaped, so it is not signalled. Every other way
+      # out of the watch leaves the loop live, and a live loop is ended here rather than
+      # waited for.
+      if [ -e "$sv_status" ]; then
+        sv_kill=0
+        trace "supervisor $$ finds loop $sv_loop ended, and waits for it"
+      fi
+      [ "$sv_kill" = 0 ] || sv_kill_loop
+      wait "$sv_loop" 2>/dev/null
+      sv_st=$?
+    } 2>/dev/null
+    return 0
+  }
   # The grace between the TERM and the KILL that stops the command (D10), read once
   # because both places that stop it need it: the lost-lock tail below, and the tail
   # that runs when this run is gone.
@@ -3010,6 +3113,9 @@ run_supervise() {
     sv_asked=0
     sv_waited=0
     sv_stale_busy=0
+    # A loop this supervisor has just started is live, and every way out of the watch
+    # below that finds it still live ends it (sv_end_loop).
+    sv_kill=1
     while :; do
       if [ -e "$sv_status" ]; then
         break
@@ -3084,13 +3190,13 @@ run_supervise() {
             if [ "$sv_waited" -ge "$sv_wait_cap" ]; then
               rm -f "$sv_ready" 2>/dev/null
               trace "supervisor $$ KILLs loop $sv_loop after $sv_waited seconds with a refresh in flight"
-              kill -KILL "$sv_loop" 2>/dev/null
+              sv_kill=1
               break
             fi
           else
             rm -f "$sv_ready" 2>/dev/null
             trace "supervisor $$ KILLs loop $sv_loop, no refresh in flight"
-            kill -KILL "$sv_loop" 2>/dev/null
+            sv_kill=1
             break
           fi
         fi
@@ -3104,10 +3210,13 @@ run_supervise() {
         sleep 1
         continue
       fi
-      # Nothing is pending and the loop has left no trace for three seconds: only
-      # `wait` can say it is gone (a loop killed outright leaves no status).
+      # Nothing is pending and the loop has left no trace for three seconds. It has
+      # stopped talking, not stopped: only `wait` can say that a child has finished
+      # (D10), and it cannot say it about one that is still there. So this loop is
+      # ended below rather than waited for, and the KILL and the reap happen together.
       if [ "$sv_stale" -ge 3 ]; then
-        trace "supervisor $$ stops waiting for a quiet loop: $sv_stale seconds without a word from it"
+        trace "supervisor $$ stops waiting for a quiet loop: $sv_stale seconds without a word from it, and KILLs loop $sv_loop rather than waiting for a live one"
+        sv_kill=1
         break
       fi
       sleep 1
@@ -3123,19 +3232,7 @@ run_supervise() {
     # nobody to stop it, its beat going stale, and a second run free to take the slot
     # while the first is still executing. That is D10's one unrecoverable case, and it
     # is reachable in production by a heartbeat child hung on slow I/O.
-    #
-    # A loop that has left a status has ended, and its pid is about this supervisor's to
-    # reuse once `wait` has reaped it, so it is not signalled; the ask path above has
-    # usually KILLed it already, and signalling a pid that is on its way out is the one
-    # thing that could land on a stranger.
-    if [ -e "$sv_status" ]; then
-      trace "supervisor $$ finds loop $sv_loop ended, and waits for it"
-    else
-      trace "supervisor $$ KILLs loop $sv_loop, which left no status, rather than waiting for it"
-      kill -KILL "$sv_loop" 2>/dev/null
-    fi
-    wait "$sv_loop" 2>/dev/null
-    sv_st=$?
+    sv_end_loop
     rm -f "$sv_alive" "$sv_status" 2>/dev/null
     # The loop is reaped, so nothing will take its in-flight marker away: the loop took
     # it in its own EXIT trap, and a loop that was KILLed runs no trap. It is this

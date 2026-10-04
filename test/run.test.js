@@ -933,7 +933,7 @@ describe('D10 a loop that keeps dying', () => {
     expect(stopped(loop), 'the wedged loop outlived the run').toBe(true);
     expect(stopped(gate.child.pid)).toBe(true);
     expect(traceText(trace), traceText(trace)).toMatch(
-      new RegExp(`KILLs loop ${loop}, which left no status`),
+      new RegExp(`KILLs loop ${loop} rather than waiting for a live one`),
     );
   }, 90_000);
 
@@ -945,19 +945,19 @@ describe('D10 a loop that keeps dying', () => {
     // does its own waiting - and a long grace, because that is what makes the two
     // budgets differ: the supervisor waits grace + 13 passes for a refresh it will not
     // cut short, while the teardown's own budget for the same wait used to be a fixed
-    // twenty-five seconds. At a grace of twenty the supervisor is still eight passes
+    // twenty-five seconds. At a grace of sixteen the supervisor is still four passes
     // from KILLing its loop when the teardown gave up on it and KILLed it instead,
-    // which leaves that loop behind with a heartbeat child under it and nothing to
-    // stop either. The wait below is generous because the supervisor's own pace is not
-    // ours to fix: a pass of its watch takes a second when the host is idle and several
-    // when it is loaded, and what this test is about is who gives up first, not how
-    // long either of them takes.
+    // which leaves that loop behind with a heartbeat child of it under it, still
+    // holding its staged beat beside the slot. The wait below is generous because the
+    // supervisor's own pace is not ours to fix: a pass of its watch takes a second
+    // when the host is idle and several when it is loaded, and what this test is about
+    // is who gives up first, not how long either of them takes.
     const block = blocker(pool, 'deaf', { ignoreTerm: true });
     const gate = startRun(pool, 'lane', block.cmd, {
       env: {
         ...TM,
         GATE_LOCK_HEARTBEAT_SECONDS: '1',
-        GATE_LOCK_TEST_KILL_GRACE: '20',
+        GATE_LOCK_TEST_KILL_GRACE: '16',
         GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
         GATE_LOCK_TEST_TRACE: trace,
       },
@@ -978,20 +978,24 @@ describe('D10 a loop that keeps dying', () => {
         240000,
       );
       expect(traceText(trace), traceText(trace)).not.toMatch(/stopped the hard way \(status 137\)/);
+      const r = await gate.done;
+      expect(r.status, traceText(trace)).toBe(143);
+      expect(r.stderr, `${JSON.stringify(r.stderr)}\n${traceText(trace)}`).toBe('');
+      expect(r.stdout, traceText(trace)).toContain('released by lane');
+      // The loop was KILLed with a refresh of its own in flight, and the heartbeat
+      // under it was KILLed with it - one signal, both pids, because the loop is this
+      // supervisor's child and the heartbeat is the loop's. That is what makes this an
+      // exact reading rather than a poll, and the seam is still parked throughout: a
+      // heartbeat that outlived the loop would still be sitting on its staged beat at
+      // this point, for as long as it takes whatever it is waiting for to answer. A
+      // KILL runs no trap, so nothing of its own would have taken that file away; the
+      // run's sweep does, because the pid is dead by the time it looks - which is the
+      // second of the three closes on that window, and the only one left when the loop
+      // itself was KILLed.
+      expect(names(pool), traceText(trace)).toEqual(['.format']);
     } finally {
       hook.release();
     }
-    const r = await gate.done;
-    expect(r.status, traceText(trace)).toBe(143);
-    expect(r.stderr, `${JSON.stringify(r.stderr)}\n${traceText(trace)}`).toBe('');
-    expect(r.stdout, traceText(trace)).toContain('released by lane');
-    // The loop was KILLed with a refresh of its own in flight, and a KILL does not
-    // reach a foreground child: the heartbeat parked at the rename outlived the loop by
-    // about a second, and the stage it wrote went when it did. What must not happen is
-    // a stage outliving the process that wrote it - so the pool is read once the
-    // writer is gone, not at the instant the run ends.
-    await until(() => stagedBeats(pool).length === 0, 15000);
-    expect(names(pool), traceText(trace)).toEqual(['.format']);
   }, 300_000);
 
   it('D10 a supervisor that will not be stopped at all is KILLed, and the slot decides: the command status stands', async () => {
