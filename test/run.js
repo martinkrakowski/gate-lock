@@ -376,6 +376,31 @@ export function slotsReported(stdout) {
   return [...stdout.matchAll(/^gate-lock: acquired by .* at (.*)$/gm)].map((m) => m[1]);
 }
 
+/**
+ * Wait for a helper of a run to have said that it was gone, and then for the process
+ * itself.
+ *
+ * The marker is the helper's own word: every helper publishes `<name>` from its EXIT
+ * trap on every exit it takes of its own accord, and it is a much better thing to wait
+ * for than process absence. A helper nobody has reaped is still a process, so a poll of
+ * absence is a poll of a guess - and on a loaded host it is a guess that has outlasted
+ * the bound written beside it, which is how this shape failed twice in a row here.
+ *
+ * `dir` may already be gone, and that counts: when the run is gone, the last helper
+ * standing takes the private directory with it, and that is this helper's own last act.
+ * The short bound afterwards is the assertion the test actually wants - the process is
+ * gone - and a helper that published the marker and is still there is a fact worth
+ * failing on.
+ *
+ * This is for the helpers that end by being asked. A helper that was KILLed writes no
+ * marker, because a KILL runs no trap: the supervisor the teardown gives up on, and any
+ * helper of a run this file's cleanup stops, are waited for by process instead.
+ */
+export async function waitHelperGone(dir, name, pid, { timeoutMs = 60000, settleMs = 5000 } = {}) {
+  await until(() => fs.existsSync(path.join(dir, name)) || !fs.existsSync(dir), timeoutMs);
+  await untilGone(pid, settleMs);
+}
+
 /** The parent of `pid`, or 0 when it is gone and cannot be asked. */
 export function parentOf(pid) {
   const listed = spawnSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8' });

@@ -39,6 +39,7 @@ import {
   track,
   up,
   untilGone,
+  waitHelperGone,
   untilTraced,
   waitForDead,
 } from './run.js';
@@ -700,7 +701,10 @@ describe('D10 a helper that has already ended is not waited for', () => {
     const dir = path.join(scratch, `gate-lock-run.${gate.child.pid}`);
     await waitForFile(path.join(dir, 'escalator.pid'), 10000);
     const watchdog = Number(fs.readFileSync(path.join(dir, 'escalator.pid'), 'utf8'));
-    await until(() => stopped(watchdog), 10000);
+    // The seam retires the watchdog the moment it is armed, which is an exit of its own
+    // accord, so it publishes its own marker: that is what this waits for, and the
+    // process itself is checked after it with a short bound.
+    await waitHelperGone(dir, 'escalator.gone', watchdog, { timeoutMs: 30000 });
     expect(stopped(watchdog), 'the watchdog is gone before the command ends').toBe(true);
     block.release();
     const started = Date.now();

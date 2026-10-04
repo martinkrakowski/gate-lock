@@ -23,6 +23,8 @@ import {
   stopped,
   traceText,
   track,
+  untilTraced,
+  waitHelperGone,
   up,
   waitForDead,
   waitRunGone,
@@ -207,17 +209,31 @@ describe('C40 a command that will not stop', () => {
     // whose stderr is turned away so the shell cannot put a job notice there. Both
     // halves are the property: what the tool says still arrives, what the shell says
     // about itself does not.
+    const trace = path.join(scratchOf(pool), 'trace.log');
     const block = blocker(pool, 'deaf', { ignoreTerm: true, pre: 'rm -rf "$2"', args: [slot] });
     const gate = startRun(pool, 'lane', block.cmd, {
-      env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '1', GATE_LOCK_TEST_KILL_GRACE: '2' },
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '2',
+        GATE_LOCK_TEST_TRACE: trace,
+      },
     });
     await up(block);
     const victim = track(block.pid());
     await until(() => !fs.existsSync(slot));
+    // The failed refresh is waited for, not assumed: the slot being gone only says it
+    // *can* fail, and a run that is asked to stop first takes its stop file on its next
+    // tick and ends without ever refreshing - so the line this test is about would be
+    // missing whenever the signal arrived inside that second. The trace says the refresh
+    // has failed, which is what puts the refusal on the run's stderr.
+    await untilTraced(() => /refresh status 1/.test(traceText(trace)), trace, 20000);
     gate.child.kill('SIGTERM');
     const r = await gate.done;
-    expect(r.status).toBe(143);
-    expect(r.stderr, JSON.stringify(r.stderr)).toContain('heartbeat: no lock');
+    expect(r.status, traceText(trace)).toBe(143);
+    expect(r.stderr, `${JSON.stringify(r.stderr)}\n${traceText(trace)}`).toContain(
+      'heartbeat: no lock',
+    );
     expect(r.stderr).not.toContain('Killed');
     await waitForDead(victim, 10000);
   }, 60_000);
@@ -395,7 +411,11 @@ done`,
     // the command alone rather than aim a KILL at a stranger - and it must go, rather
     // than sit on an armed KILL for a run that is not coming back.
     gate.child.kill('SIGKILL');
-    await until(() => stopped(watchPid), 20000);
+    // The watchdog's own word that it is gone, with a generous bound - not a poll of
+    // process absence, which is a poll of a guess: this watchdog is nobody's child
+    // after the KILL above, so whether its pid is still a process is a question about
+    // who reaps an orphan rather than about the watchdog.
+    await waitHelperGone(dir, 'escalator.gone', watchPid, { timeoutMs: 60000 });
     expect(stopped(watchPid), 'the watchdog outlived its run').toBe(true);
     // The command is stopped all the same, and by the supervisor: a run that is gone
     // is a run whose lock is about to be lost, which is D10's case, and nothing else
