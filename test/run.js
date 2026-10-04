@@ -207,6 +207,16 @@ function stopRun(pid) {
   const helpers = descendants(pid);
   for (const helper of helpers) killPid(helper);
   killPid(pid);
+  // A run that is KILLed cannot remove its own private directory, and neither can the
+  // helpers this just ended - they were KILLed too, so the last one that could have
+  // taken it away is gone with them. Tests here KILL runs on purpose, so the harness
+  // takes that directory away instead; where a test pointed the run's temp root
+  // somewhere else, it removes that one itself.
+  try {
+    fs.rmSync(path.join(os.tmpdir(), `gate-lock-run.${pid}`), { recursive: true, force: true });
+  } catch {
+    /* already gone, or not ours to remove */
+  }
 }
 
 /**
