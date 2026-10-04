@@ -366,6 +366,13 @@ export function slotsReported(stdout) {
   return [...stdout.matchAll(/^gate-lock: acquired by .* at (.*)$/gm)].map((m) => m[1]);
 }
 
+/** The parent of `pid`, or 0 when it is gone and cannot be asked. */
+export function parentOf(pid) {
+  const listed = spawnSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8' });
+  if (listed.error || listed.status !== 0) return 0;
+  return Number(listed.stdout.trim());
+}
+
 /**
  * Wait until `pid` is not a process at all. `stopped`, not `alive`: a process this
  * shell has not reaped yet is still a process, and a helper that has ended but has not

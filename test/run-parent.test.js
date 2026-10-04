@@ -9,7 +9,7 @@
 //
 // Nothing here synchronises with a sleep in the tool: the run is started, the loop
 // is named from the line it printed, and the waits are polls of a condition.
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -19,6 +19,7 @@ import {
   beatPids,
   blocker,
   freshPool,
+  parentOf,
   runDirOf,
   startRun,
   stopHelpers,
@@ -30,11 +31,6 @@ import {
 } from './run.js';
 
 /** The parent of `pid`, or 0 when it is gone and cannot be asked. */
-function parentOf(pid) {
-  const listed = spawnSync('ps', ['-o', 'ppid=', '-p', String(pid)], { encoding: 'utf8' });
-  if (listed.error || listed.status !== 0) return 0;
-  return Number(listed.stdout.trim());
-}
 
 describe('D25 nothing a test starts outlives the test', () => {
   it('a waiting command is stopped by the cleanup, whether or not the test learned its pid', async () => {

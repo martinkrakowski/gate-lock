@@ -2182,6 +2182,8 @@ run_stop_helper() {
     run_stop_busy=0
     run_stop_spin=0
     run_stop_prog=
+    run_stop_resets=0
+    run_stop_why=
     while [ -e "$1" ] && [ ! -e "$2" ]; do
       run_stop_spin=$((run_stop_spin + 1))
       if [ "$run_stop_spin" -lt 200 ]; then
@@ -2195,8 +2197,16 @@ run_stop_helper() {
       # pass takes more than a second whenever the host is loaded - so a supervisor
       # that is still asking, still counting, still waiting out a refresh it will not
       # cut short, is given up on by a clock alone at exactly the moment it was about
-      # to end that wait itself. What is left then is a helper that has stopped saying
-      # anything at all, and the budget below is the bound for that.
+      # to end that wait itself.
+      #
+      # And it is bounded as well, or a helper that publishes progress without ever
+      # finishing - a supervisor bug, or a wedged loop behind a supervisor that counts
+      # forever - would hold this teardown for as long as it liked. So the resets are
+      # counted too, against the same budget: a helper has to be both silent and
+      # finished, or neither for more than run_stop_cap, and a run that cannot get that
+      # answer is ended rather than waited for. The supervisor's own worst case is the
+      # grace plus thirteen (see run_stop_cap), so thirteen-plus does not come close to
+      # the cap and the counting supervisor is never given up on.
       if [ -n "${5:-}" ]; then
         run_stop_now=
         {
@@ -2204,6 +2214,11 @@ run_stop_helper() {
         } 2>/dev/null
         if [ -n "$run_stop_now" ] && [ "$run_stop_now" != "$run_stop_prog" ]; then
           run_stop_prog=$run_stop_now
+          run_stop_resets=$((run_stop_resets + 1))
+          if [ "$run_stop_resets" -ge "$run_stop_cap" ]; then
+            run_stop_why="published $run_stop_resets times without finishing"
+            break
+          fi
           run_stop_busy=0
           continue
         fi
@@ -2215,14 +2230,24 @@ run_stop_helper() {
       # ever - still ends. $4 is that marker's path, or empty where there is none.
       if [ -n "$4" ] && [ -e "$4" ]; then
         run_stop_busy=$((run_stop_busy + 1))
-        [ "$run_stop_busy" -lt "$run_stop_cap" ] || break
+        if [ "$run_stop_busy" -ge "$run_stop_cap" ]; then
+          run_stop_why="$run_stop_busy seconds with a refresh in flight"
+          break
+        fi
         sleep 1
         continue
       fi
       run_stop_waited=$((run_stop_waited + 1))
-      [ "$run_stop_waited" -lt "$run_stop_bound" ] || break
+      if [ "$run_stop_waited" -ge "$run_stop_bound" ]; then
+        run_stop_why="$run_stop_waited seconds without a refresh in flight"
+        break
+      fi
       sleep 1
     done
+    # Which of the three bounds it was, in the trace: they are the same size on purpose
+    # and a wait that ends is a wait whose reason nobody will otherwise know.
+    [ -z "${run_stop_why:-}" ] ||
+      trace "run $$ gives up on the helper $3: $run_stop_why"
     # Last resort: the subshell has neither taken the file away nor said it went.
     # KILL cannot be trapped, so this is the one signal that cannot make a shell
     # print anything about itself. It is not sent to a subshell that has finished:
@@ -2989,12 +3014,20 @@ run_supervise() {
   # is the loop's, so KILLing the loop first leaves the heartbeat alive and orphaned -
   # still parked wherever it was parked, still holding its staged beat beside the slot -
   # and signalling it afterwards is a second window in which its pid could have been
-  # reused. The heartbeat's pid is published by the loop (run_beat_loop's rb_child) and
-  # the file is emptied before each refresh and removed after it, so an empty or absent
-  # file means there is nothing of ours to signal. Where there is one, this is still a
-  # pid this supervisor never parented; the window is the microseconds between the loop
-  # writing it and this reading it, and the alternative is a refresh that outlives every
-  # process that could stop it.
+  # reused. The heartbeat's pid is published by the loop (run_beat_loop's rb_child),
+  # which empties the file before each refresh and removes it after the refresh ends, so
+  # an empty or absent file means there is nothing of ours to signal.
+  #
+  # Two windows, both narrow, and both worth naming. On the write side, between the loop
+  # writing the pid and this reading it: the heartbeat may have ended in between, and
+  # its pid is a zombie this supervisor never parented, so the KILL would land on a
+  # number the kernel is free to have reused. On the reap side, between the `wait`
+  # returning and the file being taken away: the loop is gone, its heartbeat is
+  # reparented, and anything it wrote is gone with it - so this is what the supervisor
+  # takes away after every reap, whatever the reap was.
+  #
+  # Where there is a pid, this is still a pid this supervisor never parented; the
+  # alternative is a refresh that outlives every process that could stop it.
   sv_kill_loop() {
     sv_k_pid=
     {
@@ -3135,6 +3168,22 @@ run_supervise() {
           sleep 1 >/dev/null 2>&1
         done
       fi
+      # A test seam for the one shape a wait cannot otherwise tell from progress: a
+      # supervisor that keeps publishing and never finishes. It exists so that the cap
+      # on the resets in run_stop_helper can be driven rather than waited for - a
+      # supervisor that only ever counts, forever, is a supervisor bug, and a run's
+      # teardown has to end anyway.
+      seam GATE_LOCK_TEST_SUP_PROGRESS
+      sv_stuck=$seam_value
+      if [ -n "$sv_stuck" ] && [ -e "$sv_stuck" ]; then
+        while [ -e "$sv_stuck" ]; do
+          sv_passes=$((sv_passes + 1))
+          {
+            printf '%s\n' "$sv_passes" >"$sv_pass"
+          } 2>/dev/null
+          sleep 1 >/dev/null 2>&1
+        done
+      fi
       sv_now=
       {
         IFS= read -r sv_now <"$sv_alive"
@@ -3221,27 +3270,40 @@ run_supervise() {
       fi
       sleep 1
     done
-    # The run is gone, so the tail below is the one that stops the command.
-    kill -0 "$sv_run" 2>/dev/null || sv_orphaned
-    # The loop is KILLed here rather than waited for, and that is the whole point of
-    # this line. Only `wait` may say that a child has finished (D10), so the question
-    # cannot be asked any other way - but the way out of this watch is reached while the
-    # loop is still live: three quiet seconds say it has stopped talking, not that it has
+    # The loop is ended here rather than waited for, and it is ended *first*.
+    #
+    # Only `wait` may say that a child has finished (D10), so the question cannot be
+    # asked any other way - but the way out of this watch is reached while the loop is
+    # still live: three quiet seconds say it has stopped talking, not that it has
     # stopped. A `wait` from here reads nothing at all - not this supervisor's own stop
     # file, not its run's pid - so a run KILLed in that second leaves its command with
     # nobody to stop it, its beat going stale, and a second run free to take the slot
     # while the first is still executing. That is D10's one unrecoverable case, and it
     # is reachable in production by a heartbeat child hung on slow I/O.
+    #
+    # First, because what comes after it can leave without waiting for anything: a run
+    # that is gone takes the tail below, which ends in an `exit`, and a loop still live at
+    # that point - with a heartbeat of its own parked on something - would outlive the
+    # only process that knew about it. So the loop and that heartbeat are ended and
+    # reaped before this supervisor asks anything else.
     sv_end_loop
+    # The run is gone, so the tail below is the one that stops the command.
+    kill -0 "$sv_run" 2>/dev/null || sv_orphaned
     rm -f "$sv_alive" "$sv_status" 2>/dev/null
     # The loop is reaped, so nothing will take its in-flight marker away: the loop took
     # it in its own EXIT trap, and a loop that was KILLed runs no trap. It is this
     # supervisor's to clear, and `run` waits on it - an uncleared marker would spend
     # the whole of that wait on a refresh that is not going to happen. Read for the
     # trace first, or the trace would only ever be able to say "no".
+    #
+    # `beat-child` goes with it, and for the same reason with more force: a KILLed loop
+    # runs no trap, so its pid stays in that file until the next loop's first refresh -
+    # and a restart's `sv_kill_loop` would then read a heartbeat that has been dead and
+    # reaped since the last loop ended, and signal a pid the kernel is free to have
+    # given to somebody else.
     sv_busy=no
     [ -e "$sv_inflight" ] && sv_busy=yes
-    rm -f "$sv_inflight" 2>/dev/null
+    rm -f "$sv_inflight" "$sv_child" 2>/dev/null
     if [ -e "$sv_status" ]; then
       sv_st=$(cat "$sv_status" 2>/dev/null)
       case ${sv_st:-} in
