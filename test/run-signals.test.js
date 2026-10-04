@@ -271,7 +271,19 @@ done`,
       gate.child.kill('SIGTERM');
       // The first signal has been forwarded and taken effect; only now is the
       // second one a *second* signal.
-      await waitForFile(path.join(dir, 'got'));
+      //
+      // Thirty seconds, not the harness's ten. This handshake is the whole chain of
+      // the signal path on a loaded runner: the run's shell runs its handler between
+      // two commands, the handler signals the command, and the command's own shell
+      // runs *its* handler when the `sleep` it is inside ends or is interrupted, and
+      // then writes this file. macOS CI timed the ten-second default out here on the
+      // SIGHUP leg of this loop, with nothing skipped and nothing deferred: no path
+      // in the forward can lose the TERM (it is sent from the handler, retried after
+      // the command is forked if the signal arrived first, and the command is still
+      // this run's child), so what was left was the budget for four runs on a
+      // two-core runner. The loop runs four signals, so the whole test has its own
+      // budget below as well.
+      await waitForFile(path.join(dir, 'got'), 30000);
       gate.child.kill(second);
       const r = await gate.done;
       expect(r.status, second).toBe(143);
@@ -670,6 +682,44 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     expect(names(pool)).toEqual(['.format']);
     expect(gone(beatPids(r.stdout)[0])).toBe(true);
   });
+
+  it('T36 a refresh held longer than the teardown bound is waited for, not cut off', async () => {
+    const pool = freshPool();
+    const hook = beatHook(pool);
+    const parked = blocker(pool, 'parked');
+    const gate = startRun(pool, 'lane', parked.cmd, {
+      env: {
+        GATE_LOCK_TEST_MODE: '1',
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '2',
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+      },
+    });
+    // The refresh is parked at the rename, which is where a teardown finds it if the
+    // run is signalled now. The teardown's own bound is eight seconds, and this holds
+    // the refresh for longer than that on purpose: the loop is not wedged, it is busy,
+    // and a refresh in flight is never cut short (C41, R7). KILLing it there is what
+    // made macOS CI report a lost lock for a run that held its lock throughout - the
+    // loop died, the supervisor called it a lock this run could not account for, and
+    // the run said so with the slot still its own. Holding the refresh is what makes
+    // that race deterministic, so no CPU stress is needed to see it.
+    await waitForFile(hook.seam);
+    gate.child.kill('SIGTERM');
+    const held = Date.now();
+    // Ten seconds: past the teardown's own eight-second bound and past the three
+    // asks the supervisor gives a loop that will not stop, with room to spare for a
+    // loaded runner afterwards.
+    await new Promise((r) => setTimeout(r, 10000));
+    expect(gate.child.exitCode, 'the run gave up on a refresh that was in flight').toBe(null);
+    hook.release();
+    const r = await gate.done;
+    expect(Date.now() - held).toBeLessThan(30000);
+    expect(r.status).toBe(143);
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
+    expect(r.stdout).toContain('released by lane');
+    expect(names(pool)).toEqual(['.format']);
+    expect(gone(beatPids(r.stdout)[0])).toBe(true);
+  }, 90_000);
 
   it('T36 a second TERM while the release is waiting leaves run alive and still holding, then released: 143, empty stderr', async () => {
     const pool = freshPool();

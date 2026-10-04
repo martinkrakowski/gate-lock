@@ -845,7 +845,7 @@ describe('D10 a loop that keeps dying', () => {
     await waitForDead(victim);
     expect(fs.existsSync(block.done)).toBe(false);
   });
-  it('D10 a wedged loop is KILLed on request, is not restarted for it, and the run answers 2 with "lock lost"', async () => {
+  it('D10 a wedged loop is KILLed on request, is not restarted for it, and the slot decides: the command status stands', async () => {
     const pool = freshPool();
     const wedge = path.join(scratchOf(pool), 'loop-wedge');
     fs.writeFileSync(wedge, 'wedged\n');
@@ -859,15 +859,21 @@ describe('D10 a loop that keeps dying', () => {
       },
     });
     await up(block);
-    // The loop is parked where it reads no stop file, so the cleanup's three
-    // asks are not enough and the supervisor has to KILL it. Restart-once (D10)
-    // is for an unrequested death: a KILL during the cleanup must not start a
-    // second loop that would be KILLed again, and a run that cannot show the lock
-    // was its own says so instead of answering 0.
+    // The loop is parked where it reads no stop file - and no in-flight marker, since
+    // it is not inside a refresh - so the cleanup's three asks are not enough and the
+    // supervisor has to KILL it. Two things follow. Restart-once (D10) is for an
+    // unrequested death: a KILL during the cleanup must not start a second loop that
+    // would be KILLed again. And the KILL is not evidence about the lock - the loop was
+    // wedged, not the lock lost - so the run reads the slot before the release, finds
+    // it still its own, and answers the command's own status with a line saying the
+    // supervisor was hard stopped. This used to be answered 2 with "lock lost": that
+    // was the teardown's own KILL being read as proof, which is what made a run whose
+    // command finished perfectly claim it had lost a lock it held and released.
     block.release();
     const r = await gate.done;
-    expect(r.status).toBe(2);
-    expect(r.stderr).toContain('lock lost');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('stopped the hard way');
+    expect(r.stderr).not.toContain('lock lost');
     expect(beatPids(r.stdout), 'one loop, not a restart and a second loop').toHaveLength(1);
     expect(names(pool)).toEqual(['.format']);
   });

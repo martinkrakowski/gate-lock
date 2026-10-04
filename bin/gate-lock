@@ -2077,6 +2077,15 @@ run_finished=0
 # The seconds between the supervisor's TERM and its KILL (D10). A test seam may
 # shorten it; nothing else may.
 run_kill_grace=10
+# How long a teardown waits for a helper that will not stop, and how many of those
+# seconds may be spent with one of its own refreshes in flight. The first is the
+# bound that keeps a wedged helper from holding the run; the second is the same wait
+# again, counted apart, because a helper with a refresh in flight is busy rather than
+# wedged and a refresh is never cut short (C41, R7). The supervisor waits the same
+# thing for the loop it owns - the grace plus ten - and these are larger, so `run` is
+# never the side that gives up while the supervisor is still being careful.
+run_stop_bound=8
+run_stop_cap=25
 
 # run_signal NAME CODE (D15, C38-C40): HUP, QUIT and TERM all forward TERM to
 # the command, and INT does too, because an asynchronous command starts with INT
@@ -2112,15 +2121,27 @@ run_stop_helper() {
     kill -0 "$3" 2>/dev/null || return 0
     : >"$1" 2>/dev/null
     run_stop_waited=0
+    run_stop_busy=0
     run_stop_spin=0
     while [ -e "$1" ] && [ ! -e "$2" ]; do
       run_stop_spin=$((run_stop_spin + 1))
       if [ "$run_stop_spin" -lt 200 ]; then
         continue
       fi
-      run_stop_waited=$((run_stop_waited + 1))
-      [ "$run_stop_waited" -lt 8 ] || break
       run_stop_spin=0
+      # A refresh of the helper's own is in flight: it is busy, not wedged, and
+      # C41 says that refresh is never cut short. Those seconds are counted apart
+      # from the bound below, and the busy count has a cap of its own so that a
+      # marker nobody takes away - a helper wedged with a refresh published for
+      # ever - still ends. $4 is that marker's path, or empty where there is none.
+      if [ -n "$4" ] && [ -e "$4" ]; then
+        run_stop_busy=$((run_stop_busy + 1))
+        [ "$run_stop_busy" -lt "$run_stop_cap" ] || break
+        sleep 1
+        continue
+      fi
+      run_stop_waited=$((run_stop_waited + 1))
+      [ "$run_stop_waited" -lt "$run_stop_bound" ] || break
       sleep 1
     done
     # Last resort: the subshell has neither taken the file away nor said it went.
@@ -2255,7 +2276,7 @@ run_escalator() {
 # skipped rather than spent on a marker no live process is going to remove.
 run_cancel_escalator() {
   [ -n "$run_escalator_pid" ] || return 0
-  run_stop_helper "$run_dir/escalator.stop" "$run_dir/escalator.gone" "$run_escalator_pid"
+  run_stop_helper "$run_dir/escalator.stop" "$run_dir/escalator.gone" "$run_escalator_pid" "$run_dir/beat-inflight"
   wait "$run_escalator_pid" 2>/dev/null
   run_escalator_pid=
   rm -f "$run_dir/escalator.pid" "$run_dir/escalator.stop" "$run_dir/escalator.gone" 2>/dev/null
@@ -2369,7 +2390,7 @@ run_stop_supervisor() {
   # exited already - a lost lock ends the run before the cleanup does - so the files
   # are removed once the pids are reaped.
   : >"$run_dir/loop.stop" 2>/dev/null
-  run_stop_helper "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" "$run_sup"
+  run_stop_helper "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" "$run_sup" "$run_dir/beat-inflight"
   run_wait_supervisor "$run_sup"
   rm -f "$run_dir/loop.stop" "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" 2>/dev/null
 }
@@ -2610,6 +2631,7 @@ run_beat_loop() {
   rb_status=$4
   rb_stop=$5
   rb_run=$6
+  rb_inflight=$7
   rb_tick=0
   # Nothing to catch: these four signals are ignored for this subshell's whole
   # life, so one from a terminal's process group is never pending against a trap
@@ -2619,7 +2641,7 @@ run_beat_loop() {
   # The status is written first, because what the supervisor is told must be how
   # this loop ended and not how it tidied up: `$?` is the status the trap was
   # entered with, and it is the only reading of it there is.
-  trap 'printf "%s\n" "$?" >"$rb_status" 2>/dev/null; rm -f "$rb_stop" 2>/dev/null' EXIT
+  trap 'printf "%s\n" "$?" >"$rb_status" 2>/dev/null; rm -f "$rb_stop" "$rb_inflight" 2>/dev/null' EXIT
   while [ ! -e "$rb_stop" ]; do
     kill -0 "$rb_run" 2>/dev/null || exit 3
     rb_tick=$((rb_tick + 1))
@@ -2652,9 +2674,15 @@ run_beat_loop() {
     # The refresh is a foreground child on purpose: the loop only ends when no
     # refresh of its own is running (C41), so a stop that arrives mid-refresh
     # waits for it rather than cutting it short.
+    # Published for as long as the refresh runs, so that a stop asking this loop to
+    # end can tell "wedged" from "busy" and never cuts a refresh short (C41, R7).
+    # It is the loop's own file, and it is removed on every way out of the refresh.
+    : >"$rb_inflight" 2>/dev/null
     if ! GATE_LOCK_CALLER_PID="$$" GATE_LOCK_SLOT_PATH="$rb_slot" "$self" heartbeat; then
+      rm -f "$rb_inflight" 2>/dev/null
       exit 1
     fi
+    rm -f "$rb_inflight" 2>/dev/null
     rb_left=$rb_period
     while [ "$rb_left" -gt 0 ]; do
       rb_tick=$((rb_tick + 1))
@@ -2700,6 +2728,7 @@ run_supervise() {
   sv_beat=$sv_dir/beat.pid
   sv_stop=$sv_dir/supervisor.stop
   sv_ready=$sv_dir/loop.stop
+  sv_inflight=$sv_dir/beat-inflight
   sv_restart=0
   # The grace between the TERM and the KILL that stops the command (D10), read once
   # because both places that stop it need it: the lost-lock tail below, and the tail
@@ -2710,6 +2739,10 @@ run_supervise() {
   '' | *[!0-9]*) ;;
   *) sv_grace=$seam_value ;;
   esac
+  # How long this supervisor waits for a loop that will not stop while one of its own
+  # refreshes is in flight: the grace it would spend stopping the command anyway, plus
+  # ten seconds of slack, so the two waits are not in each other way.
+  sv_wait_cap=$((sv_grace + 10))
   # sv_orphaned: the run is gone. Its lock is about to be lost - the beat stops with
   # the loop, and nothing is refreshing it - which is D10's case, so the command is
   # stopped the way D10 stops one: TERM, the grace, then KILL. Nothing else will:
@@ -2757,7 +2790,7 @@ run_supervise() {
     # file has to be one `run` can write once. A file left by an earlier loop is
     # removed before the next one starts.
     rm -f "$sv_ready" 2>/dev/null
-    run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" "$sv_ready" "$sv_run" &
+    run_beat_loop "$sv_slot" "$sv_period" "$sv_alive" "$sv_status" "$sv_ready" "$sv_run" "$sv_inflight" &
     sv_loop=$!
     # C31: the heartbeat's pid is announced on stdout, and published to this run's
     # private directory straight after, so `run` cannot tear the supervisor down
@@ -2767,6 +2800,7 @@ run_supervise() {
     sv_mark=
     sv_stale=0
     sv_asked=0
+    sv_waited=0
     while :; do
       if [ -e "$sv_status" ]; then
         break
@@ -2799,10 +2833,24 @@ run_supervise() {
       if [ -e "$sv_stop" ]; then
         : >"$sv_ready" 2>/dev/null
         sv_asked=$((sv_asked + 1))
+        # Three asks is enough for a refresh to land - unless one is in flight, in
+        # which case this loop is busy and not wedged, and a refresh is never cut
+        # short (C41, R7). So the KILL waits for the refresh, and the wait is
+        # capped: a marker that is never taken away must not hold the cleanup for
+        # ever, and the cap is the same budget the command's own escalation gets.
         if [ "$sv_asked" -ge 3 ]; then
-          rm -f "$sv_ready" 2>/dev/null
-          kill -KILL "$sv_loop" 2>/dev/null
-          break
+          if [ -e "$sv_inflight" ]; then
+            sv_waited=$((sv_waited + 1))
+            if [ "$sv_waited" -ge "$sv_wait_cap" ]; then
+              rm -f "$sv_ready" 2>/dev/null
+              kill -KILL "$sv_loop" 2>/dev/null
+              break
+            fi
+          else
+            rm -f "$sv_ready" 2>/dev/null
+            kill -KILL "$sv_loop" 2>/dev/null
+            break
+          fi
         fi
         # A loop that was in its pause answers in milliseconds, so its status is
         # looked for before a second is spent waiting for it.
@@ -2832,27 +2880,43 @@ run_supervise() {
       esac
     fi
     rm -f "$sv_alive" "$sv_status" 2>/dev/null
-    # The verdict is the loop's own status, never the stop request: 1 means a
-    # refresh failed and the lock is gone; 3 means this loop found its run gone;
-    # anything else that is not a clean stop means the loop itself died, which is
-    # restarted exactly once (D10) - but only when nobody asked it to stop, since a
-    # KILL because a cleanup's request was not honoured is not a reason to start
-    # another loop that will be KILLed again. A stop request must never turn one of
-    # those into a quiet exit, or a run cleaning up would answer 0 for a lost lock.
+    # The verdict is the loop's own status, never the stop request: 1 means a refresh
+    # failed and the lock is gone; 3 means this loop found its run gone; anything else
+    # that is not a clean stop means the loop itself died, which is restarted exactly
+    # once (D10) - but only when nobody asked it to stop, since a KILL because a
+    # cleanup's request was not honoured is not a reason to start another loop that
+    # would be KILLed again. A stop request must never turn one of those into a quiet
+    # exit, or a run cleaning up would answer 0 for a lost lock.
     if [ "$sv_st" -ne 0 ]; then
-      # A stop was asked for, so `run` is already tearing this supervisor down, and
-      # the command it may still be reaping is not ours to signal: its pid is free
-      # the moment `run` reaps it and can belong to a stranger by the time a KILL
-      # here arrives. Nothing is lost by leaving it alone - the run that asked has
-      # forwarded TERM itself and its watchdog escalates (C38, C40) - and the status
-      # is still 1, so the verdict table reads it as a lock this run cannot account
-      # for, which is exactly what a loop that would not stop leaves behind.
+      # A refresh that failed is proof: the lock is gone, and the tail below stops the
+      # command for it (D10).
+      if [ "$sv_st" -eq 1 ]; then
+        break
+      fi
+      # This loop found its run gone. The check above has already dealt with that, so
+      # the tail is reached only to keep the status from reading as a clean stop.
+      if [ "$sv_st" -eq 3 ]; then
+        break
+      fi
+      # Anything else is the loop itself dying, or being KILLed because a cleanup's
+      # request was not honoured. Two things follow from that. Restart-once is for an
+      # unrequested death, so a KILL during the cleanup starts no second loop that
+      # would be KILLed again. And a stop means `run` is already tearing this
+      # supervisor down, so the command it may still be reaping is not ours to signal
+      # - that pid is free the moment `run` reaps it and can belong to a stranger by
+      # the time a KILL from here arrives; nothing is lost by leaving it alone, since
+      # the run that asked has forwarded the TERM itself and its watchdog escalates
+      # (C38, C40).
+      #
+      # The status is 3, not 1, and that is the correction: a hard stop is not
+      # evidence about the lock in either direction - the loop may have been busy with
+      # a refresh rather than wedged - so this leaves unproven and `run` decides from
+      # the slot (C35). It used to leave with 1, which is proof of a lost lock, and
+      # that is how a run whose command finished perfectly was told it had lost a
+      # lock it held and released: the teardown's own KILL became the evidence.
       if [ -e "$sv_stop" ]; then
         rm -f "$sv_stop" 2>/dev/null
-        exit 1
-      fi
-      if [ "$sv_st" -eq 1 ] || [ "$sv_st" -eq 3 ]; then
-        break
+        exit 3
       fi
       if [ "$sv_restart" -eq 0 ]; then
         sv_restart=1
@@ -2983,7 +3047,11 @@ run_finish() {
       # The evidence settled it: the slot is not this run's, so this is a lost lock
       # after all, and the table's own rows take over from here.
       run_sup_lost=1
-    else
+    elif [ -z "$run_sig" ]; then
+      # Nothing was lost and nobody asked this run to stop, so the hard stop is worth
+      # saying out loud. A signalled run says nothing: the caller's own signal is the
+      # news, D15 promises that stderr is empty, and the caller is already on its way
+      # out of the gate.
       run_sup_warning 1
     fi
   fi
