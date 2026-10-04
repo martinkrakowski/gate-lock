@@ -185,6 +185,31 @@ describe('C40 a command that will not stop', () => {
     expect(names(pool)).toEqual(['.format']);
   }, 60_000);
 
+  it('D15 a signal into a run that is waiting still leaves the tool own lines on the caller stderr', async () => {
+    const pool = freshPool();
+    const slot = path.join(pool, 'gate.lock');
+    // The command deafens itself to TERM and takes its own slot away, so the loop's
+    // next refresh fails *while* the run sits in the wait for that command: the
+    // refusal is a line of the tool's own, written by the heartbeat through the
+    // stderr it inherited. The signal then ends the run through the very same wait,
+    // whose stderr is turned away so the shell cannot put a job notice there. Both
+    // halves are the property: what the tool says still arrives, what the shell says
+    // about itself does not.
+    const block = blocker(pool, 'deaf', { ignoreTerm: true, pre: 'rm -rf "$2"', args: [slot] });
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '1', GATE_LOCK_TEST_KILL_GRACE: '2' },
+    });
+    await up(block);
+    const victim = track(block.pid());
+    await until(() => !fs.existsSync(slot));
+    gate.child.kill('SIGTERM');
+    const r = await gate.done;
+    expect(r.status).toBe(143);
+    expect(r.stderr, JSON.stringify(r.stderr)).toContain('heartbeat: no lock');
+    expect(r.stderr).not.toContain('Killed');
+    await waitForDead(victim, 10000);
+  }, 60_000);
+
   it('D15 a second signal of any kind after the first is ignored: 143, the lock released, nothing killed', async () => {
     // The watchdog this run arms when it forwards the TERM must not take the
     // run's own signal handling with it: a run whose traps were replaced would

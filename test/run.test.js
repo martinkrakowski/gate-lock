@@ -834,7 +834,7 @@ describe('D10 a loop that keeps dying', () => {
     expect(names(pool)).toEqual(['.format']);
   });
 
-  it('D10 a supervisor that will not be stopped at all is KILLed, and the run answers 2 rather than 0', async () => {
+  it('D10 a supervisor that will not be stopped at all is KILLed, and the slot decides: the command status stands', async () => {
     const pool = freshPool();
     const wedge = path.join(scratchOf(pool), 'sup-wedge');
     fs.writeFileSync(wedge, 'wedged\n');
@@ -844,18 +844,44 @@ describe('D10 a loop that keeps dying', () => {
     });
     await up(block);
     block.release();
-    // The supervisor is parked where it hears nothing, so the only way to stop it
-    // is the KILL the stop-file protocol falls back to. Its status is then 137 and
-    // not 1, and the verdict table says that is a lost lock like any other: the
-    // last thing such a supervisor established about the lock is nothing.
+    // The supervisor is parked where it hears nothing, so the only way to stop it is
+    // the KILL the stop-file protocol falls back to, and its status is 137. A helper
+    // stopped the hard way is proof of nothing: the slot is read before the release,
+    // and this one is still this run's - owner, pid, worktree - so the run answers
+    // the command's own status. It says on stderr that the supervisor was hard
+    // stopped, because that is worth an operator knowing.
     const r = await gate.done;
-    expect(r.status).toBe(2);
-    expect(r.stderr).toContain('lock lost');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('stopped the hard way');
+    expect(r.stderr).not.toContain('lock lost');
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
     // Nothing of the run's outlives it, and the KILLed supervisor's loop is gone
     // too: a loop that outlived the run would keep refreshing the beat.
     await waitForDead(block.pid(), 5000);
+  }, 60_000);
+
+  it('D10 a supervisor KILLed at cleanup whose slot is gone is a lost lock, not a 0', async () => {
+    const pool = freshPool();
+    const wedge = path.join(scratchOf(pool), 'sup-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const slot = path.join(pool, 'gate.lock');
+    // The same hard stop, with the other evidence: the command takes its own slot
+    // away, so nothing is left to verify. The table's unproven row is settled by the
+    // slot rather than by the status, and here the slot is not this run's - so the run
+    // is lost, answers 2, and says which of the two it is.
+    const block = blocker(pool, 'thief', { pre: 'rm -rf "$2"', args: [slot] });
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: { ...TM, GATE_LOCK_TEST_SUP_WEDGE: wedge, GATE_LOCK_HEARTBEAT_SECONDS: '1' },
+    });
+    await up(block);
+    block.release();
+    const r = await gate.done;
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('lock lost');
+    expect(r.stderr).toContain('no longer this run');
+    expect(r.stderr).not.toContain('the lock was lost while the command ran');
+    expect(names(pool)).toEqual(['.format']);
   }, 60_000);
 });
 

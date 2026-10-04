@@ -10,6 +10,12 @@ export LC_ALL
 # Everything this tool creates is owner-only unless a mode is set explicitly.
 umask 077
 
+# Where this tool's own messages go: `>&"$run_err_fd"`, everywhere, and 2 until
+# `run` moves it (see errmsg by do_run). It is set here because the first message
+# this tool can print is the one below, and a redirection to an unset descriptor is
+# an error the shell reports instead of the message.
+run_err_fd=2
+
 # Resolve $0 to an absolute, physical path once (no realpath): follow symlinks
 # (npm's .bin links to this file), then canonicalise the directory with
 # `cd ... && pwd -P`. readlink and dirname exist on GNU, BSD/macOS and busybox.
@@ -22,7 +28,7 @@ hops=0
 while [ -h "$self" ]; do
   hops=$((hops + 1))
   if [ "$hops" -gt 40 ]; then
-    echo "gate-lock: too many levels of symbolic links" >&2
+    echo "gate-lock: too many levels of symbolic links" >&"$run_err_fd"
     exit 2
   fi
   target=$(readlink -- "$self") || break
@@ -32,7 +38,7 @@ while [ -h "$self" ]; do
   esac
 done
 self_dir=$(CDPATH='' cd -- "$(dirname -- "$self")" && pwd -P) || {
-  echo "gate-lock: cannot resolve the script directory" >&2
+  echo "gate-lock: cannot resolve the script directory" >&"$run_err_fd"
   exit 2
 }
 
@@ -45,7 +51,7 @@ if [ "$#" -eq 1 ]; then
   --version)
     version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*$/\1/p' "$self_dir/../package.json" | head -n 1) || version=
     if [ -z "$version" ]; then
-      echo "gate-lock: cannot read the package version" >&2
+      echo "gate-lock: cannot read the package version" >&"$run_err_fd"
       exit 2
     fi
     echo "$version"
@@ -60,7 +66,7 @@ fi
 # ---------------------------------------------------------------------------
 
 die() {
-  printf 'gate-lock: %s\n' "$*" >&2
+  printf 'gate-lock: %s\n' "$*" >&"$run_err_fd"
   exit 2
 }
 
@@ -163,7 +169,7 @@ else
   ignored=$(env | sed -n 's/^\(GATE_LOCK_TEST_[A-Za-z0-9_]*\)=..*$/\1/p' | tr '\n' ' ')
   ignored=${ignored% }
   if [ -n "$ignored" ]; then
-    printf 'gate-lock: warning: ignoring %s (test seams need GATE_LOCK_TEST_MODE=1)\n' "$ignored" >&2
+    printf 'gate-lock: warning: ignoring %s (test seams need GATE_LOCK_TEST_MODE=1)\n' "$ignored" >&"$run_err_fd"
   fi
 fi
 
@@ -304,7 +310,7 @@ get_procs() {
 
 if [ "${1:-}" = workers ]; then
   [ "$#" -eq 1 ] || {
-    echo "gate-lock: usage: gate-lock workers" >&2
+    echo "gate-lock: usage: gate-lock workers" >&"$run_err_fd"
     exit 2
   }
   if [ "${GATE_LOCK_WORKERS+set}" = set ]; then
@@ -592,12 +598,12 @@ seam GATE_LOCK_TEST_SLOT_UID
 is_digits "$slot_uid" || die "GATE_LOCK_TEST_SLOT_UID must be a numeric user id"
 
 fail1() {
-  printf 'gate-lock: %s\n' "$*" >&2
+  printf 'gate-lock: %s\n' "$*" >&"$run_err_fd"
   exit 1
 }
 
 usage_error() {
-  printf 'gate-lock: %s\nusage: gate-lock acquire <lane> | release <lane> | verify <lane> | heartbeat | status [--json] | clean | run [options] <lane> -- <command...> | workers\n' "$1" >&2
+  printf 'gate-lock: %s\nusage: gate-lock acquire <lane> | release <lane> | verify <lane> | heartbeat | status [--json] | clean | run [options] <lane> -- <command...> | workers\n' "$1" >&"$run_err_fd"
   exit 2
 }
 
@@ -853,7 +859,7 @@ take_aside() {
   ta_slot=$1
   ta_base=${ta_slot##*/}
   if [ -d "$ta_slot/$ta_base" ]; then
-    printf 'gate-lock: %s contains an entry named %s, so it is not a standard slot and is not touched\n' "$ta_slot" "$ta_base" >&2
+    printf 'gate-lock: %s contains an entry named %s, so it is not a standard slot and is not touched\n' "$ta_slot" "$ta_base" >&"$run_err_fd"
     return 3
   fi
   ta_k=0
@@ -874,9 +880,9 @@ take_aside() {
   # mv onto an existing directory moves the source inside it and exits 0 (D11).
   if [ -d "$aside/$ta_base" ]; then
     if restore_to "$aside/$ta_base" "$ta_slot"; then
-      printf 'gate-lock: reclaim aborted: %s was moved inside %s, which already existed; the slot was restored\n' "$ta_slot" "$aside" >&2
+      printf 'gate-lock: reclaim aborted: %s was moved inside %s, which already existed; the slot was restored\n' "$ta_slot" "$aside" >&"$run_err_fd"
     else
-      printf 'gate-lock: reclaim aborted: %s was moved inside %s, which already existed; the moved copy is at %s/%s and is never deleted\n' "$ta_slot" "$aside" "$aside" "$ta_base" >&2
+      printf 'gate-lock: reclaim aborted: %s was moved inside %s, which already existed; the moved copy is at %s/%s and is never deleted\n' "$ta_slot" "$aside" "$aside" "$ta_base" >&"$run_err_fd"
     fi
     return 2
   fi
@@ -894,16 +900,16 @@ put_back() {
   [ "$3" != reclaim ] || pb_what=judged
   if restore_to "$1" "$2"; then
     if [ "$4" = failed ]; then
-      printf 'gate-lock: %s aborted: %s could not be removed; the slot was put back\n' "$3" "$2" >&2
+      printf 'gate-lock: %s aborted: %s could not be removed; the slot was put back\n' "$3" "$2" >&"$run_err_fd"
     else
-      printf 'gate-lock: %s aborted: %s held a different slot than the one %s; it was restored\n' "$3" "$2" "$pb_what" >&2
+      printf 'gate-lock: %s aborted: %s held a different slot than the one %s; it was restored\n' "$3" "$2" "$pb_what" >&"$run_err_fd"
     fi
     return 0
   fi
   if [ "$4" = failed ]; then
-    printf 'gate-lock: %s aborted: %s could not be removed; the slot was left at %s and is never deleted\n' "$3" "$2" "$1" >&2
+    printf 'gate-lock: %s aborted: %s could not be removed; the slot was left at %s and is never deleted\n' "$3" "$2" "$1" >&"$run_err_fd"
   else
-    printf 'gate-lock: %s aborted: %s held a different slot than the one %s; the moved copy was left at %s and is never deleted\n' "$3" "$2" "$pb_what" "$1" >&2
+    printf 'gate-lock: %s aborted: %s held a different slot than the one %s; the moved copy was left at %s and is never deleted\n' "$3" "$2" "$pb_what" "$1" >&"$run_err_fd"
   fi
   return 1
 }
@@ -1117,11 +1123,11 @@ janitor_put_back() {
     return 0
   fi
   if ! aside_ok "$jp_priv"; then
-    printf 'gate-lock: janitor: left %s alone: it is not the directory this pass moved\n' "$jp_priv" >&2
+    printf 'gate-lock: janitor: left %s alone: it is not the directory this pass moved\n' "$jp_priv" >&"$run_err_fd"
     return 0
   fi
   if [ -e "$1" ] || [ -h "$1" ]; then
-    printf 'gate-lock: janitor: left %s: %s was taken again while it was judged\n' "$jp_priv" "$1" >&2
+    printf 'gate-lock: janitor: left %s: %s was taken again while it was judged\n' "$jp_priv" "$1" >&"$run_err_fd"
     return 0
   fi
   mv "$jp_priv" "$1" 2>/dev/null || :
@@ -1515,7 +1521,7 @@ create_slot() {
     if [ -h "$cs_slot" ]; then
       # The name became a symlink in the window: the candidate went through it.
       # Deleting through a changed path is never done; leave it and say so.
-      printf 'gate-lock: candidate %s was moved through a symlink at %s and is left in place, not deleted\n' "${cs_cand##*/}" "$cs_slot" >&2
+      printf 'gate-lock: candidate %s was moved through a symlink at %s and is left in place, not deleted\n' "${cs_cand##*/}" "$cs_slot" >&"$run_err_fd"
     else
       rm -rf "${cs_slot:?}/${cs_cand##*/}" 2>/dev/null
     fi
@@ -1693,10 +1699,10 @@ give_back() {
   case $? in
   0 | 4) return 0 ;;
   1)
-    printf 'gate-lock: %s changed hands before it could be given back and was left alone\n' "$1" >&2
+    printf 'gate-lock: %s changed hands before it could be given back and was left alone\n' "$1" >&"$run_err_fd"
     ;;
   *)
-    printf 'gate-lock: %s could not be given back and still holds this lock (pid %s); release it with GATE_LOCK_CALLER_PID=%s\n' "$1" "$caller" "$caller" >&2
+    printf 'gate-lock: %s could not be given back and still holds this lock (pid %s); release it with GATE_LOCK_CALLER_PID=%s\n' "$1" "$caller" "$caller" >&"$run_err_fd"
     ;;
   esac
   return 0
@@ -1728,7 +1734,7 @@ do_acquire() {
       if [ "$sw_found" = 1 ]; then
         # F56b: no `acquired` line and no slot-path file on this answer.
         give_back "$won"
-        printf 'gate-lock: busy: %s is held by %s (pid %s, beat %s) in the same worktree %s; sleep and retry, and never remove the lock by hand\n' "$sw_slot" "${sw_owner:-unknown}" "$sw_pid" "$sw_beat" "$wt" >&2
+        printf 'gate-lock: busy: %s is held by %s (pid %s, beat %s) in the same worktree %s; sleep and retry, and never remove the lock by hand\n' "$sw_slot" "${sw_owner:-unknown}" "$sw_pid" "$sw_beat" "$wt" >&"$run_err_fd"
         exit 75
       fi
       printf 'gate-lock: acquired by %s pid %s at %s\n' "$lane" "$caller" "$won"
@@ -1745,7 +1751,7 @@ do_acquire() {
     n=$((n + 1))
   done
   # F54: every slot is busy.
-  printf 'gate-lock: busy: %s is held by %s (pid %s, beat %s); sleep and retry, and never remove the lock by hand\n' "$h_slot" "$h_owner" "$h_pid" "$h_beat" >&2
+  printf 'gate-lock: busy: %s is held by %s (pid %s, beat %s); sleep and retry, and never remove the lock by hand\n' "$h_slot" "$h_owner" "$h_pid" "$h_beat" >&"$run_err_fd"
   exit 75
 }
 
@@ -1801,6 +1807,17 @@ do_heartbeat() {
       fail1 "heartbeat: no lock: $target is now held by another holder (pid ${rd:-none}); nothing of this caller's was refreshed"
     fi
   fi
+  # The residual window, and why it is narrow: the check above and this rename are
+  # two syscalls, so a holder can take the name in between, and this rename would
+  # write that holder's beat. That takes a reclaim, and a reclaim takes a stale
+  # beat - while this refresh is in flight the slot's beat is as current as it ever
+  # is, because it was read moments ago and the next holder's own refresh follows
+  # it at once. So the slot this rename could overwrite is one whose beat is at
+  # most a period old, and the janitor's own age rule (D16) is what decides whether
+  # that is stale at all; a caller that wants this window closed for certain rather
+  # than for nearly always has to hold the slot itself. The window is left open
+  # deliberately: closing it needs a lock around the check and the rename, and a
+  # stale beat on a slot nobody is beating any more is the janitor's job (D16).
   if [ -d "$target/beat" ] || ! mv -f "$hb_stage" "$target/beat" 2>/dev/null; then
     rm -f "$hb_stage" 2>/dev/null
     fail1 "heartbeat: cannot replace the beat in $target (the lock may be gone)"
@@ -2175,6 +2192,13 @@ run_escalator() {
   (
     exec >/dev/null 2>&1
     trap '' TERM INT HUP QUIT
+    # The saved descriptor (errmsg by do_run) is this process's own: a helper
+    # that inherited a second copy of the caller's stderr would keep the caller's
+    # pipe open for as long as the helper lives, and a helper that outlives this
+    # run - the one case D25 is about - would then hold a pipe nobody is reading.
+    # This watchdog writes nothing anyway (its own stderr is /dev/null).
+    run_err_fd=2
+    exec 3>&-
     esc_grace=$1
     esc_cmd=$2
     esc_dir=$3
@@ -2245,17 +2269,13 @@ run_cancel_escalator() {
 # for an already reaped child answers with the status it reaped - 143 for a
 # command we stopped - which is above 128 but is not an interruption (D10).
 #
-# This shell's own stderr is out of the way for the length of this function, and
-# that is deliberate. A shell reports the death of a job of its own on its own
-# stderr - bash writes `$0: line N: <pid> Killed <the job's command line>` - and a
-# command stopped by a KILL, which is the whole point of a watchdog, is such a job.
-# The line is the shell talking about its own bookkeeping rather than about
-# anything the tool or the command said, and D15 wants a signalled run's stderr
-# empty. It is also reported late: bash flushes it at a command boundary after the
-# wait, so redirecting the wait alone is not enough, which is why the redirection
-# is on the function. Nothing is lost by it - the command opened this shell's
-# stderr when it was forked and writes through its own copy of it, and this
-# function prints nothing.
+# This shell's own stderr is out of the way for the length of this function, for
+# the reason errmsg gives by do_run: a command stopped by a KILL - which is what a
+# watchdog exists to do - is a job of this shell's, and the line bash writes about
+# it belongs to the shell rather than to this tool. The redirection is on the
+# function rather than on the `wait`, because that is where the shell flushes such a
+# line: late, at a command boundary after the wait. Nothing is lost by it - this
+# function prints nothing, and everything the tool says goes through run_err_fd.
 run_wait_pid() {
   {
     wp_pid=$1
@@ -2273,24 +2293,26 @@ run_wait_pid() {
 # run_wait_supervisor PID: as run_wait_pid, keeping the supervisor's status in
 # $run_sup_status.
 #
-# This wait has the shell's stderr out of the way. A shell reports the death of a
-# job of its own on its own stderr - bash says `$0: line N: pid Killed ...` - and a
-# helper that had to be KILLed is such a job; the line is the shell talking about
-# itself, not this tool, and D15 wants a signalled run's stderr empty. Nothing of
-# ours is lost by that: the supervisor writes only to stdout (C31), and the
-# heartbeat's own complaints are written by a process that opened this shell's
-# stderr before this redirection and still has it.
+# This wait has the shell's own stderr out of the way for the whole function, and
+# for the reason errmsg gives by do_run: a supervisor that had to be KILLed is a
+# job of this shell's, and the line bash writes about it is not the tool's. The
+# redirection is on the function rather than on the `wait` because that is where
+# the shell flushes such a line - late, at a command boundary after the wait.
+# Nothing is lost: the supervisor writes only to stdout (C31), this function prints
+# nothing, and everything this tool says goes through run_err_fd.
 run_wait_supervisor() {
-  run_sup_status=0
-  while :; do
-    ws_before=$run_sig_seen
-    wait "$1" 2>/dev/null
-    ws_status=$?
-    if [ "$run_sig_seen" = "$ws_before" ]; then
-      break
-    fi
-  done
-  run_sup_status=$ws_status
+  {
+    run_sup_status=0
+    while :; do
+      ws_before=$run_sig_seen
+      wait "$1" 2>/dev/null
+      ws_status=$?
+      if [ "$run_sig_seen" = "$ws_before" ]; then
+        break
+      fi
+    done
+    run_sup_status=$ws_status
+  } 2>/dev/null
 }
 
 # run_reap_command: wait for the command and remember its own status.
@@ -2310,11 +2332,22 @@ run_child() {
 # cleared only after the wait, because a signal that arrives while we are waiting
 # is answered by forwarding TERM to the command - which is still ours to stop
 # until it has really gone (C38).
+#
+# A supervisor that ended without being asked to stop this command - stopped the
+# hard way, or gone with its run - leaves this wait with nothing that would end it,
+# and that is this process's own business: the command is still this run's child, so
+# its pid is ours to signal, which is what a signal path does and what the watchdog
+# it arms then escalates. Without this, the fix that keeps a stop request from
+# signalling a pid `run` may already have reaped would leave a deaf command with
+# nobody to stop it.
 run_reap_command() {
   if [ -z "$run_cmd_pid" ]; then
     return 0
   fi
   run_last_cmd_pid=$run_cmd_pid
+  if [ "$run_sup_status" -ne 0 ] && [ "$run_sup_status" -ne 3 ]; then
+    run_forward_term
+  fi
   run_wait_pid "$run_last_cmd_pid"
   run_cmd_status=$wp_status
   run_cmd_pid=
@@ -2343,36 +2376,72 @@ run_stop_supervisor() {
 # run_sup_verdict: what the supervisor's own status means for this run's answer
 # (C37, D6, D10). The supervisor ends with 0 or 1, or with a status that says how
 # it was stopped, and the table is followed exactly - nothing here may answer 0
-# for a lock this run cannot show it still held.
+# for a lock this run cannot show it still held, and nothing here may answer 2 for
+# a lock it can.
 #
-#   supervisor  loop      what happened                         the run answers
+#   supervisor  loop      what happened                        the run answers
 #   0           0         stopped as asked, nothing wrong      the command's status
 #   1           1         a refresh failed: the lock is gone    2, lock lost
-#   1           2 or more the loop died twice, or was KILLed     2, lock lost
+#   1           2 or more the loop died twice, or was KILLed    unproven, below
 #                        on request (D10's second death)
-#   3           any       this supervisor found its run gone;    nothing is reading
+#   3           any       this supervisor found its run gone;   unproven, below
 #                        it never touched the command
-#   137, 143, any other   the supervisor was KILLed or signalled 2, lock lost
-#                        while stopping, so the last thing it
-#                        established about the lock is nothing
+#   137, 143, any other   the supervisor was KILLed or         unproven, below
+#                        signalled while stopping
 #
-# The last row is the one round 9 got wrong: `run_stop_helper`'s KILL, a signal
-# from a terminal's process group, or a wedged supervisor that had to be stopped
-# the hard way all end up here, and a run that treats "not 1" as "not lost"
-# answers 0 for a lock nobody can account for.
+# The last two rows are unproven rather than lost, and that is the correction:
+# a helper stopped the hard way says nothing about the lock in either direction. It
+# is proof neither that the lock was lost - a wedged supervisor that is KILLed
+# while the command finished perfectly leaves a slot that is still this run's - nor
+# that it was kept, so the answer is whatever the evidence says. `run_verify_lock`
+# reads the slot before the release, and the pin it verifies is this run's own: if
+# the slot is still this run's (owner and pid), the command's status stands and the
+# hard stop is reported on stderr as the warning it is; if it is not, the lock is
+# lost and the run answers 2.
+#
+# The row that used to be here - "any status that is not 1 is a lost lock" - is the
+# one round 9 got wrong in the other direction, and it was wrong in this one too: a
+# supervisor that has to be KILLed at cleanup is not evidence of a lost lock.
 run_sup_lost=0
+run_sup_unproven=0
 run_sup_verdict() {
   run_sup_lost=0
-  [ "$run_sup_status" -eq 0 ] && return 0
-  run_sup_lost=1
+  run_sup_unproven=0
+  case ${run_sup_status:-0} in
+  0) ;;
+  1) run_sup_lost=1 ;;
+  *) run_sup_unproven=1 ;;
+  esac
   return 0
 }
 
-# run_lost_lock: what the table above says (C37, D6, D10).
+# run_sup_warning VERIFIED: the unproven row, said out loud. VERIFIED is 1 when the
+# slot was read afterwards and was still this run's - the row's good outcome, where
+# the command's own status stands - and 0 on a path with no verify to read it with,
+# which is the run's cleanup: there the hard stop is all this run knows and the
+# answer it already gave cannot be taken back.
+run_sup_warning() {
+  [ "$run_sup_unproven" = 1 ] || return 0
+  if [ "${1:-0}" = 1 ]; then
+    printf "gate-lock: the heartbeat supervisor was stopped the hard way (status %s) while the command ran; the slot verified as this run to release, so the command's status stands\n" "$run_sup_status" >&"$run_err_fd"
+  else
+    printf 'gate-lock: the heartbeat supervisor was stopped the hard way (status %s) while the command ran, and the slot was not verified afterwards\n' "$run_sup_status" >&"$run_err_fd"
+  fi
+  return 0
+}
+
+# run_lost_lock: what the table above says (C37, D6, D10). The first line says how
+# this run knows, because the two ways of knowing are not the same: a failed refresh
+# is the supervisor telling us it stopped the command, while a slot that is no
+# longer ours after a hard stop is the slot telling us, and nobody stopped anything.
 run_lost_lock() {
   [ "$run_sup_lost" = 1 ] || return 0
-  printf 'gate-lock: the lock was lost while the command ran; the command was stopped (pid %s)\n' "${run_last_cmd_pid:-none}" >&2
-  printf 'gate-lock: lock lost: exiting 2; %s is not this run to release, and whatever is there is left as it is\n' "${run_slot:-the slot}" >&2
+  if [ "$run_sup_unproven" = 1 ]; then
+    printf "gate-lock: the lock is no longer this run's: the heartbeat supervisor was stopped the hard way (status %s) and the slot says so\n" "$run_sup_status" >&"$run_err_fd"
+  else
+    printf 'gate-lock: the lock was lost while the command ran; the command was stopped (pid %s)\n' "${run_last_cmd_pid:-none}" >&"$run_err_fd"
+  fi
+  printf 'gate-lock: lock lost: exiting 2; %s is not this run to release, and whatever is there is left as it is\n' "${run_slot:-the slot}" >&"$run_err_fd"
 }
 
 # run_verify_lock (C35): after the command ends the lock must still be this run's.
@@ -2417,19 +2486,19 @@ run_release_lock() {
     if [ "$run_acq_child" -lt 128 ]; then
       return 0
     fi
-    printf 'gate-lock: the acquire was stopped before it recorded the slot; releasing by lane %s and pid %s\n' "$run_lane" "$$" >&2
+    printf 'gate-lock: the acquire was stopped before it recorded the slot; releasing by lane %s and pid %s\n' "$run_lane" "$$" >&"$run_err_fd"
     run_child env "GATE_LOCK_CALLER_PID=$$" "$self" release "$run_lane" >"$run_dir/rel.out" 2>"$run_dir/rel.err"
-    cat "$run_dir/rel.err" >&2
+    cat "$run_dir/rel.err" >&"$run_err_fd"
     cat "$run_dir/rel.out"
     if grep -qE '^gate-lock: (released by|nothing to release)' "$run_dir/rel.out" 2>/dev/null; then
       run_removed=1
       return 0
     fi
-    printf 'gate-lock: FAILED to release the lock for lane %s: %s\n' "$run_lane" "$run_lane was not released" >&2
+    printf 'gate-lock: FAILED to release the lock for lane %s: %s\n' "$run_lane" "$run_lane was not released" >&"$run_err_fd"
     return 0
   fi
   run_child env "GATE_LOCK_CALLER_PID=$$" "GATE_LOCK_SLOT_PATH=$run_slot" "$self" release "$run_lane" >"$run_dir/rel.out" 2>"$run_dir/rel.err"
-  cat "$run_dir/rel.err" >&2
+  cat "$run_dir/rel.err" >&"$run_err_fd"
   cat "$run_dir/rel.out"
   if grep -q '^gate-lock: released by' "$run_dir/rel.out" 2>/dev/null; then
     run_removed=1
@@ -2440,7 +2509,7 @@ run_release_lock() {
   else
     run_rel_why="the release did not remove it"
   fi
-  printf 'gate-lock: FAILED to release the lock %s: %s\n' "$run_slot" "$run_rel_why" >&2
+  printf 'gate-lock: FAILED to release the lock %s: %s\n' "$run_slot" "$run_rel_why" >&"$run_err_fd"
 }
 
 # run_record_status (D18): one of tool:<code>, cmd:<code>, busy:host or
@@ -2465,7 +2534,7 @@ run_record_status() {
     run_status=cmd:$run_exit_code
   fi
   if ! out_write "$run_status_file" "--status-file" "$run_status"; then
-    printf 'gate-lock: cannot record the run status %s in --status-file %s: %s\n' "$run_status" "$run_status_file" "$out_why" >&2
+    printf 'gate-lock: cannot record the run status %s in --status-file %s: %s\n' "$run_status" "$run_status_file" "$out_why" >&"$run_err_fd"
   fi
 }
 
@@ -2474,7 +2543,7 @@ run_record_status() {
 run_scratch_rm() {
   [ -n "$run_dir" ] || return 0
   if [ -h "$run_dir" ]; then
-    printf 'gate-lock: left %s alone: it is not the private directory this run created\n' "$run_dir" >&2
+    printf 'gate-lock: left %s alone: it is not the private directory this run created\n' "$run_dir" >&"$run_err_fd"
     run_dir=
     return 0
   fi
@@ -2546,9 +2615,18 @@ run_beat_loop() {
   # list here - the state bash 3.2 mishandles. The loop is stopped by being asked,
   # through the file it checks once a second, and by finding that its run has gone.
   trap '' TERM INT HUP QUIT
-  # The status is taken first: everything else in this trap is a command, and
-  # what the supervisor is told must be how this loop ended, not how it tidied up.
-  trap 'rb_exit=$?; rm -f "$rb_stop" 2>/dev/null; printf "%s\n" "$rb_exit" >"$rb_status"' 2>/dev/null EXIT
+  # The saved descriptor (errmsg by do_run) is this process's own: a helper
+  # that inherited a second copy of the caller's stderr would keep the
+  # caller's pipe open for as long as the helper lives, and a helper that
+  # outlives this run - the one case D25 is about - would then hold a pipe
+  # nobody is reading. Anything a helper has to say goes to the stderr it
+  # inherited, which is the caller's.
+  run_err_fd=2
+  exec 3>&-
+  # The status is written first, because what the supervisor is told must be how
+  # this loop ended and not how it tidied up: `$?` is the status the trap was
+  # entered with, and it is the only reading of it there is.
+  trap 'printf "%s\n" "$?" >"$rb_status" 2>/dev/null; rm -f "$rb_stop" 2>/dev/null' EXIT
   while [ ! -e "$rb_stop" ]; do
     kill -0 "$rb_run" 2>/dev/null || exit 3
     rb_tick=$((rb_tick + 1))
@@ -2634,6 +2712,14 @@ run_supervise() {
   # life, so one from a terminal's process group is never pending against a trap
   # list here. `run` stops this supervisor and the loop by writing the two files.
   trap '' TERM INT HUP QUIT
+  # The saved descriptor (errmsg by do_run) is this process's own: a helper
+  # that inherited a second copy of the caller's stderr would keep the
+  # caller's pipe open for as long as the helper lives, and a helper that
+  # outlives this run - the one case D25 is about - would then hold a pipe
+  # nobody is reading. Anything a helper has to say goes to the stderr it
+  # inherited, which is the caller's.
+  run_err_fd=2
+  exec 3>&-
   trap 'rm -f "$sv_stop" 2>/dev/null; : >"$sv_dir/supervisor.gone" 2>/dev/null' EXIT
   while :; do
     rm -f "$sv_status" 2>/dev/null
@@ -2721,11 +2807,21 @@ run_supervise() {
     # anything else that is not a clean stop means the loop itself died, which is
     # restarted exactly once (D10) - but only when nobody asked it to stop, since a
     # KILL because a cleanup's request was not honoured is not a reason to start
-    # another loop that will be KILLed again. A stop request only makes this
-    # supervisor prompt below; it must never turn one of those into a quiet exit, or
-    # a run cleaning up would answer 0 for a lost lock.
+    # another loop that will be KILLed again. A stop request must never turn one of
+    # those into a quiet exit, or a run cleaning up would answer 0 for a lost lock.
     if [ "$sv_st" -ne 0 ]; then
-      if [ "$sv_st" -eq 1 ] || [ "$sv_st" -eq 3 ] || [ -e "$sv_stop" ]; then
+      # A stop was asked for, so `run` is already tearing this supervisor down, and
+      # the command it may still be reaping is not ours to signal: its pid is free
+      # the moment `run` reaps it and can belong to a stranger by the time a KILL
+      # here arrives. Nothing is lost by leaving it alone - the run that asked has
+      # forwarded TERM itself and its watchdog escalates (C38, C40) - and the status
+      # is still 1, so the verdict table reads it as a lock this run cannot account
+      # for, which is exactly what a loop that would not stop leaves behind.
+      if [ -e "$sv_stop" ]; then
+        rm -f "$sv_stop" 2>/dev/null
+        exit 1
+      fi
+      if [ "$sv_st" -eq 1 ] || [ "$sv_st" -eq 3 ]; then
         break
       fi
       if [ "$sv_restart" -eq 0 ]; then
@@ -2807,7 +2903,7 @@ run_acquire() {
     # own status says whether an acquire was stopped rather than answered (D6).
     run_acq_child=$run_acq_status
     run_attempts=$((run_attempts + 1))
-    cat "$run_dir/acq.err" >&2
+    cat "$run_dir/acq.err" >&"$run_err_fd"
     if [ "$run_acq_status" != 75 ]; then
       return 0
     fi
@@ -2851,8 +2947,20 @@ run_finish() {
   run_stop_supervisor
   run_reap_command
   run_sup_verdict
-  run_lost_lock
+  # The verify comes before the verdict is read, because it is what decides the
+  # unproven row of the table: a supervisor that had to be KILLed says nothing
+  # about the lock in either direction, and the slot does (C35).
   run_verify_lock
+  if [ "$run_sup_unproven" = 1 ]; then
+    if [ "$run_verify_ok" = 0 ]; then
+      # The evidence settled it: the slot is not this run's, so this is a lost lock
+      # after all, and the table's own rows take over from here.
+      run_sup_lost=1
+    else
+      run_sup_warning 1
+    fi
+  fi
+  run_lost_lock
   run_release_lock
   run_finished=1
   # A signal outranks everything (C38). Then a lost lock (D10). Then a verify that
@@ -2885,14 +2993,24 @@ run_cleanup() {
     run_stop_supervisor
     run_reap_command
     run_sup_verdict
-    # The same table as run_finish, and for the same reason: a helper that ended
-    # in any way but a clean stop means this run cannot show the lock was its own.
-    # A signal still outranks that (C38).
-    if [ -z "$run_sig" ] && [ "$run_sup_lost" = 1 ]; then
-      run_lost_lock
-      run_exit_code=2
-    fi
+    # The same table as run_finish, with one thing missing: this path has no time
+    # for the verify that decides the unproven row, and a signal still outranks
+    # everything (C38). So a refresh that failed is a lost lock here and now, and a
+    # helper that was hard stopped is only reported - the answer this run has already
+    # given cannot be taken back by a verdict read this late.
     run_verify_lock
+    if [ -z "$run_sig" ] && [ "$run_sup_unproven" = 1 ] && [ "$run_verify_ok" = 0 ]; then
+      run_sup_lost=1
+    fi
+    if [ -z "$run_sig" ]; then
+      run_lost_lock
+      if [ "$run_sup_unproven" = 1 ] && [ "$run_sup_lost" = 0 ]; then
+        run_sup_warning
+      fi
+      if [ "$run_sup_lost" = 1 ]; then
+        run_exit_code=2
+      fi
+    fi
     run_release_lock
     if [ "$run_exit_code" -eq 0 ] && [ "$run_removed" = 0 ]; then
       run_exit_code=1
@@ -2904,7 +3022,27 @@ run_cleanup() {
 }
 
 # do_run ARGS (C29, D18, D21, C31): `run [options] <lane> -- <command...>`.
+#
+# errmsg, the writer every message in this file uses (`>&"$run_err_fd"`): a shell
+# writes lines of its own about its own jobs to its own stderr - bash says
+# `$0: line N: <pid> Killed <the job's command line>`, flushed at whatever command
+# boundary comes after the wait - and a command stopped by a watchdog's KILL is
+# such a job. Those lines are the shell talking about its bookkeeping, not this
+# tool and not the command, and D15 wants a signalled run's stderr to hold nothing
+# else. They cannot be stopped where they are written, because the shell writes
+# them itself; what can be stopped is this shell's stderr for the length of the
+# waits that follow such a death (run_wait_pid, run_stop_helper).
+#
+# So the real stderr is kept on a descriptor of its own, first, and every line this
+# tool prints goes there instead. Turning this shell's stderr away around those
+# waits then swallows the shell's notices and nothing else: a handler that runs
+# during a wait - run_signal forwarding a TERM, arming the watchdog - writes
+# through this descriptor and is heard, and a message a handler's children write
+# reaches the caller's stderr through the copy of it they opened when they were
+# forked, which no redirection here can touch.
 do_run() {
+  exec 3>&2
+  run_err_fd=3
   # The options, then the lane, then the separator and the command. Anything else
   # is a usage error, which takes no lock. Only the first `--` separates: a later
   # one is an ordinary argument of the command (C29).
@@ -2959,7 +3097,7 @@ do_run() {
   # The plan's worker-cap warning: one line on stderr, and the exit status of the
   # run is whatever the command and the lock say it is.
   if [ "$slot_count" -gt 1 ] && [ -z "$host_workers_raw" ] && [ -z "${GATE_LOCK_WORKERS:-}" ]; then
-    printf 'gate-lock: this pool has %s slots and neither GATE_HOST_WORKERS nor GATE_LOCK_WORKERS is set; cap the workers of each gate with resolveMaxWorkers()\n' "$slot_count" >&2
+    printf 'gate-lock: this pool has %s slots and neither GATE_HOST_WORKERS nor GATE_LOCK_WORKERS is set; cap the workers of each gate with resolveMaxWorkers()\n' "$slot_count" >&"$run_err_fd"
   fi
   # C31: signal handling and cleanup first, then the acquire.
   trap 'run_signal TERM 143' TERM
