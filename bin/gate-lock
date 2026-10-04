@@ -10,10 +10,12 @@ export LC_ALL
 # Everything this tool creates is owner-only unless a mode is set explicitly.
 umask 077
 
-# Where this tool's own messages go: `>&"$run_err_fd"`, everywhere, and 2 until
-# `run` moves it (see errmsg by do_run). It is set here because the first message
-# this tool can print is the one below, and a redirection to an unset descriptor is
-# an error the shell reports instead of the message.
+# Where this tool's own messages go: `>&"$run_err_fd"`, everywhere. Descriptor 9,
+# which `run` opens on its own stderr before it starts (errmsg by do_run). The
+# messages that can be printed before that open - a usage error, the path
+# resolution above - are answers with nothing to clean up and no helper to leave
+# behind, so they go to stderr itself; every message printed once a slot is held
+# goes to the descriptor.
 run_err_fd=2
 
 # Resolve $0 to an absolute, physical path once (no realpath): follow symlinks
@@ -2161,7 +2163,7 @@ run_forward_term() {
   '' | *[!0-9]*) ;;
   *) run_escalator_grace=$seam_value ;;
   esac
-  run_escalator "$run_escalator_grace" "$run_cmd_pid" "$run_dir" "$$"
+  run_escalator "$run_escalator_grace" "$run_cmd_pid" "$run_dir" "$$" 9>&-
 }
 
 # run_escalator GRACE COMMAND DIR RUNPID (D10, C40): the watchdog that makes a
@@ -2192,13 +2194,6 @@ run_escalator() {
   (
     exec >/dev/null 2>&1
     trap '' TERM INT HUP QUIT
-    # The saved descriptor (errmsg by do_run) is this process's own: a helper
-    # that inherited a second copy of the caller's stderr would keep the caller's
-    # pipe open for as long as the helper lives, and a helper that outlives this
-    # run - the one case D25 is about - would then hold a pipe nobody is reading.
-    # This watchdog writes nothing anyway (its own stderr is /dev/null).
-    run_err_fd=2
-    exec 3>&-
     esc_grace=$1
     esc_cmd=$2
     esc_dir=$3
@@ -2325,7 +2320,7 @@ run_wait_supervisor() {
 # runs is the tool itself with those two signals ignored; a KILL still reaches it,
 # which is the escape hatch C40 names.
 run_child() {
-  sh -c 'trap "" INT TERM; exec "$@"' sh "$@"
+  sh -c 'trap "" INT TERM; exec "$@"' sh "$@" 9>&-
 }
 
 # run_reap_command: wait for the command and remember its own status. The pid is
@@ -2615,14 +2610,6 @@ run_beat_loop() {
   # list here - the state bash 3.2 mishandles. The loop is stopped by being asked,
   # through the file it checks once a second, and by finding that its run has gone.
   trap '' TERM INT HUP QUIT
-  # The saved descriptor (errmsg by do_run) is this process's own: a helper
-  # that inherited a second copy of the caller's stderr would keep the
-  # caller's pipe open for as long as the helper lives, and a helper that
-  # outlives this run - the one case D25 is about - would then hold a pipe
-  # nobody is reading. Anything a helper has to say goes to the stderr it
-  # inherited, which is the caller's.
-  run_err_fd=2
-  exec 3>&-
   # The status is written first, because what the supervisor is told must be how
   # this loop ended and not how it tidied up: `$?` is the status the trap was
   # entered with, and it is the only reading of it there is.
@@ -2708,18 +2695,43 @@ run_supervise() {
   sv_stop=$sv_dir/supervisor.stop
   sv_ready=$sv_dir/loop.stop
   sv_restart=0
+  # The grace between the TERM and the KILL that stops the command (D10), read once
+  # because both places that stop it need it: the lost-lock tail below, and the tail
+  # that runs when this run is gone.
+  sv_grace=$run_kill_grace
+  seam GATE_LOCK_TEST_KILL_GRACE
+  case ${seam_value:-} in
+  '' | *[!0-9]*) ;;
+  *) sv_grace=$seam_value ;;
+  esac
+  # sv_orphaned: the run is gone. Its lock is about to be lost - the beat stops with
+  # the loop, and nothing is refreshing it - which is D10's case, so the command is
+  # stopped the way D10 stops one: TERM, the grace, then KILL. Nothing else will:
+  # the run that would have reaped it is dead, `run_reap_command` will never run,
+  # and a command left running on a slot nobody holds is the one failure a lock
+  # cannot come back from.
+  #
+  # The command was the run's child and has been reparented, so there is no status
+  # to collect and no reaping race - only the residual pid-reuse risk, stated here:
+  # this process has not been that command's parent since the run died, so a pid the
+  # kernel recycles inside the grace could in principle be a stranger's. The window
+  # is one grace period, on a command of a run that is already gone, and the
+  # alternative is a command that outlives its lock for as long as it likes.
+  sv_orphaned() {
+    kill -TERM "$sv_cmd" 2>/dev/null
+    sv_o=0
+    while [ "$sv_o" -lt "$sv_grace" ]; do
+      kill -0 "$sv_cmd" 2>/dev/null || exit 3
+      sleep 1
+      sv_o=$((sv_o + 1))
+    done
+    kill -KILL "$sv_cmd" 2>/dev/null
+    exit 3
+  }
   # Nothing to catch: these four signals are ignored for this subshell's whole
   # life, so one from a terminal's process group is never pending against a trap
   # list here. `run` stops this supervisor and the loop by writing the two files.
   trap '' TERM INT HUP QUIT
-  # The saved descriptor (errmsg by do_run) is this process's own: a helper
-  # that inherited a second copy of the caller's stderr would keep the
-  # caller's pipe open for as long as the helper lives, and a helper that
-  # outlives this run - the one case D25 is about - would then hold a pipe
-  # nobody is reading. Anything a helper has to say goes to the stderr it
-  # inherited, which is the caller's.
-  run_err_fd=2
-  exec 3>&-
   trap 'rm -f "$sv_stop" 2>/dev/null; : >"$sv_dir/supervisor.gone" 2>/dev/null' EXIT
   while :; do
     rm -f "$sv_status" 2>/dev/null
@@ -2792,7 +2804,8 @@ run_supervise() {
       fi
       sleep 1
     done
-    kill -0 "$sv_run" 2>/dev/null || exit 3
+    # The run is gone, so the tail below is the one that stops the command.
+    kill -0 "$sv_run" 2>/dev/null || sv_orphaned
     wait "$sv_loop" 2>/dev/null
     sv_st=$?
     if [ -e "$sv_status" ]; then
@@ -2836,12 +2849,6 @@ run_supervise() {
     rm -f "$sv_stop" 2>/dev/null
     exit 0
   done
-  sv_grace=$run_kill_grace
-  seam GATE_LOCK_TEST_KILL_GRACE
-  case ${seam_value:-} in
-  '' | *[!0-9]*) ;;
-  *) sv_grace=$seam_value ;;
-  esac
   # The lock is gone and the command is still running: TERM it, then KILL it after
   # the grace period, so nothing outlives the run without a lock (D10). `run`'s
   # cleanup may ask this supervisor to stop while it waits out that grace - the
@@ -2854,7 +2861,10 @@ run_supervise() {
       rm -f "$sv_stop" 2>/dev/null
       exit 1
     fi
-    kill -0 "$sv_run" 2>/dev/null || exit 3
+    # The run's own death is not checked here: this tail has already sent the TERM,
+    # and a run that died leaves this command with nobody else to stop it, so the
+    # escalation is finished rather than abandoned. The status stays 1: the lock was
+    # lost either way, and a run that is still here is waiting for exactly that.
     sleep 1
     sv_n=$((sv_n + 1))
   done
@@ -3040,9 +3050,16 @@ run_cleanup() {
 # through this descriptor and is heard, and a message a handler's children write
 # reaches the caller's stderr through the copy of it they opened when they were
 # forked, which no redirection here can touch.
+#
+# The descriptor is 9, and `run` reserves it: it is opened here and closed again
+# (`9>&-`) on the launch of every child, so no child - the command, the
+# supervisor, the watchdog, a tool child of run_child - can write to it or hold the
+# caller's pipe open through a second reference to it. Nine is where a caller's own
+# low descriptors (0-8) end, so a command sees the descriptors the caller gave it;
+# a caller's own fd 9 is the one thing `run` does not pass through, and the README
+# says so.
 do_run() {
-  exec 3>&2
-  run_err_fd=3
+  exec 9>&2
   # The options, then the lane, then the separator and the command. Anything else
   # is a usage error, which takes no lock. Only the first `--` separates: a later
   # one is an ordinary argument of the command (C29).
@@ -3123,7 +3140,7 @@ do_run() {
   fi
   # C31/C32: the command in the background, with the tool's own stdout and stderr
   # unchanged (no capture, no buffering) and its stdin null.
-  "$@" </dev/null &
+  "$@" </dev/null 9>&- &
   run_cmd_pid=$!
   # A shell runs a pending signal between two commands, so a signal can arrive
   # between the fork above and the assignment, when the handler had no pid to
@@ -3134,7 +3151,7 @@ do_run() {
   if [ -n "$run_sig" ]; then
     run_forward_term
   fi
-  run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" "$$" &
+  run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" "$$" 9>&- &
   run_sup_pid=$!
   # C31: the heartbeat is started before the command is waited for, and the
   # supervisor's announcement is waited for here - before anything can tear it

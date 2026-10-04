@@ -10,6 +10,7 @@
 // Nothing here synchronises with a sleep in the tool: the run is started, the loop
 // is named from the line it printed, and the waits are polls of a condition.
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { scratchOf } from './harness.js';
 import { TM, names, readSlot, until } from './slots.js';
@@ -54,6 +55,7 @@ describe('D25 a helper does not outlive the run', () => {
     // on a run that will not answer. The slot is left behind, holding a pid that is
     // gone - and it must be left *stale*, not beating.
     gate.child.kill('SIGKILL');
+    const killed = Date.now();
     await untilGone(loop, 5000);
     await untilGone(supervisor, 5000);
     expect(stopped(loop), 'the heartbeat loop').toBe(true);
@@ -64,13 +66,51 @@ describe('D25 a helper does not outlive the run', () => {
     const beat = readSlot(pool, 'gate.lock').beat;
     await new Promise((r) => setTimeout(r, 3000));
     expect(readSlot(pool, 'gate.lock').beat, 'the beat kept moving').toBe(beat);
-    // The command is not ours to stop - a KILL of the run is the caller's doing, and
-    // the test kills it here rather than leaving it behind.
+    // The command goes with the lock. This one stops at a plain TERM, which is what
+    // the supervisor sends when it finds its run gone; the deaf command below is the
+    // same shape with the grace in between.
     expect(command).toBeGreaterThan(0);
+    await untilGone(command, 10000);
+    expect(stopped(command), 'a command that answers TERM ends at once').toBe(true);
+    // Inside a margin, and well inside the ten second grace a KILL would have needed:
+    // this command was stopped by the TERM the supervisor sends as soon as it finds
+    // its run gone.
+    expect(Date.now() - killed, 'the command waited for the KILL').toBeLessThan(8000);
     // Nothing of the run's is left in the pool either: the slot is there, reclaimable,
     // and nothing of the private directory is published.
     expect(names(pool)).toEqual(['.format', 'gate.lock']);
     expect(names(pool).filter((n) => n.endsWith('.gone') || n.endsWith('.stop'))).toEqual([]);
     expect(names(scratchOf(pool)).filter((n) => n.startsWith('gate-lock'))).toEqual([]);
+  }, 60_000);
+
+  it('a KILLed run stops a command that ignores TERM, after the grace and not after', async () => {
+    const pool = freshPool();
+    // Deaf to TERM, so only the KILL the grace ends in can stop it. A run that is
+    // KILLed cannot reap its command and cannot stop it either, so the supervisor is
+    // what does: TERM, the grace, KILL - D10's own escalation, for a run whose lock
+    // is about to be lost because the beat stops with the loop.
+    const block = blocker(pool, 'deaf', { ignoreTerm: true });
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '1', GATE_LOCK_TEST_KILL_GRACE: '2' },
+    });
+    // A live view of the run's stdout, from before the command is up: the loop's
+    // announcement is the proof that the heartbeat is running and will be the one to
+    // notice that this run is gone.
+    let out = '';
+    gate.child.stdout.setEncoding('utf8').on('data', (d) => {
+      out += d;
+    });
+    const command = await up(block);
+    const started = readSlot(pool, 'gate.lock').started;
+    await until(() => readSlot(pool, 'gate.lock').beat !== started);
+    expect(beatPids(out).length).toBeGreaterThan(0);
+    gate.child.kill('SIGKILL');
+    const killed = Date.now();
+    await untilGone(command, 20000);
+    // Inside the grace plus a margin: the grace is two seconds, and a supervisor
+    // that forgot to stop the command at all would never end this wait.
+    expect(Date.now() - killed, 'the deaf command outlived the grace').toBeLessThan(15000);
+    expect(stopped(command), 'the command is gone, one way or another').toBe(true);
+    expect(fs.existsSync(block.done), 'it was stopped, not allowed to finish').toBe(false);
   }, 60_000);
 });

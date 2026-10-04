@@ -706,6 +706,36 @@ describe('D10 a helper that has already ended is not waited for', () => {
   }, 60_000);
 });
 
+describe('D26 the descriptors a wrapped command sees', () => {
+  it("a caller's own descriptor 3 reaches the command, and fd 9 is run's alone", async () => {
+    const pool = freshPool();
+    const seen = out(pool, 'caller-fd3');
+    const fd = fs.openSync(seen, 'w', 0o600);
+    // `run` keeps its own stderr on a descriptor of its own, so that the shell's job
+    // notices cannot land on the caller's, and it used descriptor 3 - which is a
+    // descriptor a caller may well be using. This hands the tool a descriptor 3 of
+    // the caller's own, opened on a file, and the command writes to it: what lands in
+    // the file is the command's own writing, not the tool's.
+    const cmd = [
+      'sh',
+      '-c',
+      'printf "%s\\n" "through three" >&3; printf "%s\\n" "through nine" >&9 || printf "%s\\n" "nine closed" >&3',
+    ];
+    const gate = startBin(['run', 'lane', '--', ...cmd], {
+      env: { ...TM, GATE_LOCK_DIR: pool },
+      cwd: wtDir(pool, 'wt0'),
+      fd3: fd,
+    });
+    const r = await gate.done;
+    fs.closeSync(fd);
+    expect(r.status, JSON.stringify(r.stderr)).toBe(0);
+    // The caller's fd 3 is the command's fd 3, and the one descriptor `run` does not
+    // pass through is its own (the README says which).
+    expect(fs.readFileSync(seen, 'utf8')).toBe('through three\nnine closed\n');
+    expect(names(pool)).toEqual(['.format']);
+  }, 60_000);
+});
+
 describe('a probe like the one that hung for 77 minutes', () => {
   it('D10 around a command that ignores TERM, a run ends by itself: it exits inside the grace, and no lock outlives it', async () => {
     const pool = freshPool();

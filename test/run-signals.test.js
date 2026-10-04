@@ -11,7 +11,6 @@ import { listing, scratchOf, waitForFile } from './harness.js';
 import { TM, livePid, names, readSlot, until } from './slots.js';
 import {
   HAS_PGREP,
-  alive,
   beatPids,
   blocker,
   childrenMatching,
@@ -318,7 +317,7 @@ done`,
     }
   }, 90_000);
 
-  it('D10 a watchdog whose run is gone does not kill the command: it only escalates while run wants it', async () => {
+  it('D10 a watchdog whose run is gone leaves the command alone and is gone itself', async () => {
     const pool = freshPool();
     const tmpRoot = path.join(scratchOf(pool), 'tmp-root');
     fs.mkdirSync(tmpRoot, { mode: 0o700 });
@@ -336,12 +335,22 @@ done`,
     const dir = path.join(tmpRoot, `gate-lock-run.${gate.child.pid}`);
     gate.child.kill('SIGTERM');
     await waitForFile(path.join(dir, 'escalator.pid'), 15000);
-    // KILL the run itself: the lock is now nobody's, and the command's pid may
-    // be reused at any moment. The watchdog must notice that its parent is gone
-    // and leave the command alone rather than aim a KILL at a stranger.
+    const watchPid = Number(fs.readFileSync(path.join(dir, 'escalator.pid'), 'utf8'));
+    // KILL the run itself: the lock is now nobody's, and the command's pid may be
+    // reused at any moment. The watchdog must notice that its run is gone and leave
+    // the command alone rather than aim a KILL at a stranger - and it must go, rather
+    // than sit on an armed KILL for a run that is not coming back.
     gate.child.kill('SIGKILL');
-    await new Promise((r) => setTimeout(r, 5000));
-    expect(alive(victim), 'the watchdog killed the command after run was gone').toBe(true);
+    await until(() => stopped(watchPid), 20000);
+    expect(stopped(watchPid), 'the watchdog outlived its run').toBe(true);
+    // The command is stopped all the same, and by the supervisor: a run that is gone
+    // is a run whose lock is about to be lost, which is D10's case, and nothing else
+    // would stop the command or escalate to a KILL. Before round 13 the watchdog was
+    // the only thing that could, and this test used the command's survival to watch
+    // it not fire; the supervisor is what fires now, and the watchdog's own rule is
+    // what the two assertions above say.
+    await waitForDead(victim, 20000);
+    expect(stopped(victim), 'the command outlived the run and its lock').toBe(true);
   }, 90_000);
   it('D15 a run signalled while its helpers are still starting still answers with the signal code', async () => {
     // The macOS regression: a run that was signalled came to answer 0, because a

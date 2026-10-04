@@ -81,7 +81,12 @@ gate-lock run --status-file /tmp/gate.status docs -- make docs
   argument of the command, and the command's arguments are passed through exactly
   as given - no re-parsing, no word splitting, no globbing.
 - The command inherits the tool's stdout and stderr unchanged, so a failing test
-  run is reported live, and its stdin is `/dev/null`.
+  run is reported live, and its stdin is `/dev/null`. `run` reserves file
+  descriptor **9** for itself: it keeps a copy of its own stderr there, so that a
+  shell's own notices about its own jobs cannot land on yours, and it closes 9 again
+  on the launch of every child. Your command therefore sees the descriptors you gave
+  it - 0 to 8, and anything above 9 - with that single exception: **fd 9 is not
+  passed through**, so a command that wants it must open its own.
 - The holder recorded in the slot is `run`'s own pid, whatever caller pid was
   inherited from the environment; an inherited pin (`GATE_LOCK_SLOT_PATH`) and
   slot-output file (`GATE_LOCK_SLOT_OUT`) are cleared first and are **not** passed

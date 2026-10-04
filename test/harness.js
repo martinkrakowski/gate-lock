@@ -114,13 +114,16 @@ export function runBin(args = [], { env = {}, cwd, timeout, ...rest } = {}) {
  * Start bin/gate-lock without waiting, with the same environment and shell
  * handling as runBin. Returns { child, done }: `done` resolves with
  * { status, signal, stdout, stderr } when the process exits. Stdin is closed.
+ * `fd3` is a number the caller has opened: it becomes the child's descriptor 3,
+ * which is how a test can hand the tool - and through it the wrapped command - a
+ * descriptor of the caller's own.
  */
-export function startBin(args = [], { env = {}, cwd, ...rest } = {}) {
+export function startBin(args = [], { env = {}, cwd, fd3, ...rest } = {}) {
   const [cmd, argv] = command(args, rest);
   const child = spawn(cmd, argv, {
     env: buildEnv(env),
     cwd,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: fd3 === undefined ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe', fd3],
   });
   let stdout = '';
   let stderr = '';
