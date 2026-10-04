@@ -73,4 +73,8 @@ format 1, and a wrapper that holds a slot around one command.
   refused to reclaim the other's live holder and reclaimed its dead one, the
   same worktree blocked with byte-equal identity, each side's `status` listed
   the other's slot with the project, and a 4-client storm into 2 slots never
-  held more than two complete slots - every scenario passed.
+  held more than two complete slots - every scenario passed. The same run
+  found a §2.4 defect on the other client's side: it removes a slot in place
+  rather than renaming it aside first, so a watcher can briefly see an
+  incomplete slot at a canonical name. This client behaved correctly
+  throughout, and the defect was reported to that client's maintainers.
