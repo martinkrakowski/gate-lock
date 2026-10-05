@@ -14,13 +14,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { scratchOf, waitForFile } from './harness.js';
-import { TM, names, readSlot, until } from './slots.js';
+import { TM, names, readSlot, until, deadPid } from './slots.js';
 import {
   beatPids,
   blocker,
   freshPool,
   parentOf,
-  runDirNames,
   runDirOf,
   startRun,
   stopHelpers,
@@ -208,7 +207,7 @@ describe('stopRun removes only the directory a run created', () => {
   it('a leftover gate-lock-run.<pid> base is left alone when the run took gate-lock-run.<pid>.<k>', () => {
     const pool = freshPool();
     const tmpRoot = scratchOf(pool);
-    const pid = 99999;
+    const pid = deadPid();
     // Pre-create the base directory with a marker that must survive cleanup.
     const base = path.join(tmpRoot, `gate-lock-run.${pid}`);
     fs.mkdirSync(base);
