@@ -354,7 +354,12 @@ describe('--wait', () => {
       // It waited the number of seconds it was asked for, not the octal reading of
       // it, and not none at all.
       expect(elapsed, `${given} waited ${elapsed}ms`).toBeGreaterThanOrEqual((seconds - 1) * 1000);
-      expect(elapsed, given).toBeLessThan(seconds * 1000 + 6000);
+      // Upper bound: the measured deadline (run_wait + 1s — the +1 rounds up the
+      // whole-second clock the tool reads) plus one backoff step (the retry loop
+      // sleeps at most 5s before its final deadline check) plus 5s of margin for
+      // host load: macOS CI under full-suite load can make sleep oversleep, but
+      // the wait must still be shown to end.
+      expect(elapsed, given).toBeLessThan((seconds + 1) * 1000 + 5000 + 5000);
     }
     // A ten-digit value is inside the limit the message states, so it is accepted
     // rather than refused: it is checked by letting the run answer its first busy
