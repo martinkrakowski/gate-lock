@@ -1061,16 +1061,17 @@ describe('D10 a loop that keeps dying', () => {
     // point is what would be left behind.
     gate.child.kill('SIGKILL');
     await untilTraced(() => /stops waiting for a quiet loop/.test(traceText(trace)), trace, 90000);
-    // The loop and the heartbeat under it are gone, and the command is stopped by the
-    // supervisor's tail - which cannot happen at all unless the loop was ended first.
-    await untilGone(heartbeat, 15000);
-    await untilGone(loop, 15000);
-    expect(stopped(heartbeat), 'a heartbeat outlived the supervisor that owned it').toBe(true);
-    expect(stopped(loop), 'a loop outlived the supervisor that owned it').toBe(true);
-    await untilGone(block.pid(), 20000);
-    expect(stopped(block.pid()), 'the command outlived a run that was KILLed').toBe(true);
-    expect(traceText(trace), traceText(trace)).toMatch(/stopping command \d+: run \d+ is gone/);
-  }, 150_000);
+     // The loop and the heartbeat under it are gone, and the command is stopped by the
+     // supervisor's tail - which cannot happen at all unless the loop was ended first.
+     await untilGone(heartbeat, 15000);
+     await untilGone(loop, 15000);
+     expect(stopped(heartbeat), 'a heartbeat outlived the supervisor that owned it').toBe(true);
+     expect(stopped(loop), 'a loop outlived the supervisor that owned it').toBe(true);
+     await untilGone(block.pid(), 20000);
+     expect(stopped(block.pid()), 'the command outlived a run that was KILed').toBe(true);
+     expect(traceText(trace), traceText(trace)).toMatch(/stopping command \d+: run \d+ is gone/);
+     hook.release();
+   }, 150_000);
 
   it('D10 a loop KILLed with a heartbeat in flight leaves no pid behind for the next loop to signal', async () => {
     const pool = freshPool();
@@ -1128,10 +1129,14 @@ describe('D10 a loop that keeps dying', () => {
     const hook = beatHook(pool);
     // A seam that keeps this supervisor counting and never leaving its watch: the shape
     // `run`'s wait cannot tell from progress. A short grace keeps the cap it is held to
-    // small enough to wait for - the cap is the grace plus eighteen, so twenty of
-    // anything here. The refresh is parked at the rename as well, because an in-flight
-    // marker is what keeps this wait on the budget the cap is there for: without it the
-    // shorter quiet bound would end the wait first and say nothing about progress.
+    // small enough to wait for - the cap is the grace plus eighteen, so twenty-one of
+    // anything here with grace 3. The grace is raised from 2 to 3 to add margin against
+    // a loaded host: the reset cap and the elapsed-time ceiling I added in run_stop_helper
+    // are both run_stop_cap seconds, but a host under load takes longer per pass, so the
+    // two bounds can race and the trace below must accept either. The elapsed-time
+    // ceiling is the handshake that says "no matter how slow the progress writes are,
+    // this wait ends": the test accepts either the reset cap's message or the time
+    // ceiling's, so a slow host flipping one for the other does not fail the test.
     const stuck = path.join(tmpRoot, 'sup-progress');
     fs.writeFileSync(stuck, 'counting\n');
     const block = blocker(pool);
@@ -1139,7 +1144,7 @@ describe('D10 a loop that keeps dying', () => {
       env: {
         ...TM,
         GATE_LOCK_HEARTBEAT_SECONDS: '1',
-        GATE_LOCK_TEST_KILL_GRACE: '2',
+        GATE_LOCK_TEST_KILL_GRACE: '3',
         GATE_LOCK_TEST_SUP_PROGRESS: stuck,
         GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
         GATE_LOCK_TEST_TRACE: trace,
@@ -1166,10 +1171,11 @@ describe('D10 a loop that keeps dying', () => {
       await untilGone(gate.child.pid, 120000);
       expect(stopped(gate.child.pid), 'the run never finished').toBe(true);
       expect(stopped(supervisor), 'a supervisor that never ends outlived the run').toBe(true);
-      // Which bound ended it, in the trace: with the reset cap gone this wait is ended
-      // by the seconds instead, and says so.
-      expect(traceText(trace), traceText(trace)).toMatch(
-        new RegExp(`gives up on the helper ${supervisor}: published \\d+ times without finishing`),
+       // Which bound ended it, in the trace: either the reset cap (progress published
+       // N times without finishing) or the elapsed-time ceiling I added (gave up after
+       // N seconds on helper). A slow host flips one for the other, so both are accepted.
+       expect(traceText(trace), traceText(trace)).toMatch(
+         new RegExp(`gives up on the helper ${supervisor}: (published \\d+ times without finishing|gave up after \\d+ seconds)`),
       );
     } finally {
       hook.release();

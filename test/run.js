@@ -211,11 +211,17 @@ function stopRun(pid) {
   // helpers this just ended - they were KILLed too, so the last one that could have
   // taken it away is gone with them. Tests here KILL runs on purpose, so the harness
   // takes that directory away instead; where a test pointed the run's temp root
-  // somewhere else, it removes that one itself.
-  try {
-    fs.rmSync(path.join(os.tmpdir(), `gate-lock-run.${pid}`), { recursive: true, force: true });
-  } catch {
-    /* already gone, or not ours to remove */
+  // somewhere else, it removes that one itself. The run_scratch loop in bin/gate-lock
+  // can name the directory gate-lock-run.<pid>.<k> for k >= 1 when a recycled pid left
+  // one behind, so every such suffix is cleaned.
+  for (const p of fs.readdirSync(os.tmpdir(), { withFileTypes: true })) {
+    if (p.name === `gate-lock-run.${pid}` || p.name.startsWith(`gate-lock-run.${pid}.`)) {
+      try {
+        fs.rmSync(path.join(os.tmpdir(), p.name), { recursive: true, force: true });
+      } catch {
+        /* already gone, or not ours to remove */
+      }
+    }
   }
 }
 

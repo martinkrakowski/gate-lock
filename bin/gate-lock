@@ -2196,6 +2196,14 @@ run_stop_helper() {
     [ -e "$2" ] && return 0
     kill -0 "$3" 2>/dev/null || return 0
     touch_file "$1" || true
+    # An absolute elapsed-time ceiling on the whole wait. The reset cap and the busy
+    # cap are each run_stop_cap seconds, but a progress file that keeps changing resets
+    # the busy counter - so without a clock-bound the worst case is cap squared. The
+    # supervisor's own worst case is the grace plus thirteen (see run_stop_cap's
+    # comment), and the cap already holds five seconds of slack over that; this ceiling
+    # is the cap once, which is generous and still bounded.
+    now_s
+    run_stop_start=$now
     run_stop_waited=0
     run_stop_busy=0
     run_stop_spin=0
@@ -2203,6 +2211,11 @@ run_stop_helper() {
     run_stop_resets=0
     run_stop_why=
     while [ -e "$1" ] && [ ! -e "$2" ]; do
+      now_s
+      if [ "$((now - run_stop_start))" -ge "$run_stop_cap" ]; then
+        run_stop_why="gave up after $((now - run_stop_start)) seconds on helper $3"
+        break
+      fi
       run_stop_spin=$((run_stop_spin + 1))
       if [ "$run_stop_spin" -lt 200 ]; then
         continue
@@ -2896,7 +2909,11 @@ run_beat_loop() {
       rm -f "$rb_stop"
       exit 0
     fi
-    touch_file "$rb_inflight" || true
+     # The inflight marker is published without touching(1): a redirect on a group is
+     # a builtin, and in dash `touch` is an external command that forks on every
+     # refresh (production). The redirect must be on the group, not on the bare
+     # printf, so the shell itself owns the file-open failure and it stays silent.
+     { printf '' >"$rb_inflight"; } 2>/dev/null || true
     trace "loop $$ refreshing $rb_slot, inflight published"
     # The child's answer is captured rather than read straight off the caller's
     # stderr, so that the trace can carry its status *and* its message - and it is
@@ -2914,8 +2931,12 @@ run_beat_loop() {
     # A loop whose run has taken its private directory away has nothing to capture
     # into, and a redirection into a path that is gone is reported by the shell itself -
     # and under bash in POSIX mode it ends the shell (C23's twin). So that is checked
-    # rather than tried, and the loop ends: a run that has taken its directory away is a
-    # run on its way out, which is the case the top of this pass reports as 3.
+    # rather than tried, and the loop exits 3: a run that has taken its directory away
+    # is a run on its way out, but it may still be alive. When it is alive the
+    # supervisor takes the lost-lock tail below (the loop's status 3 reaches the tail,
+    # and the run is still there to be stopped the hard way); only when the run itself
+    # is gone does sv_orphaned fire above. The two paths agree on stopping the command,
+    # but the reason is reported differently in the trace.
     if [ ! -d "$rb_dir" ]; then
       trace "loop $$ finds its private directory $rb_dir gone, and ends"
       exit 3
