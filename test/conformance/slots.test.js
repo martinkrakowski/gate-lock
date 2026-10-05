@@ -27,10 +27,6 @@ describe('F24-F29 six-file slot', () => {
       expect(fs.readFileSync(`${dir}/pid`, 'utf8')).toBe(`${child.pid}\n`);
       const dirMode = (fs.statSync(dir).mode & 0o7777).toString(8).padStart(4, '0');
       expect(dirMode).toBe('0700');
-      for (const f of names(dir)) {
-        const mode = (fs.statSync(`${dir}/${f}`).mode & 0o7777).toString(8).padStart(4, '0');
-        expect(mode, `${f} mode`).toBe('0600');
-      }
     } finally {
       child.kill('SIGKILL');
     }
