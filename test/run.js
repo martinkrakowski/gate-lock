@@ -203,7 +203,7 @@ function killPid(pid) {
  * to stop it, and one that has to be KILLed to go is the shape that was found on this
  * host hours after the test that made it.
  */
-function stopRun(recorded) {
+export function stopRun(recorded) {
   const pid = recorded.pid;
   const tmpRoot = recorded.tmpRoot;
   const trace = recorded.trace;
@@ -225,9 +225,7 @@ function stopRun(recorded) {
       /* trace file may not exist yet */
     }
     if (traceText) {
-      const match = traceText.match(
-        new RegExp(`run ${pid} private directory (.+)\n`),
-      );
+      const match = traceText.match(new RegExp(`run ${pid} private directory (.+)\n`));
       if (match) dir = match[1];
     }
   }
