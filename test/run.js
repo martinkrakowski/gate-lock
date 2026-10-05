@@ -203,25 +203,22 @@ function killPid(pid) {
  * to stop it, and one that has to be KILLed to go is the shape that was found on this
  * host hours after the test that made it.
  */
-function stopRun(pid) {
+function stopRun(recorded) {
+  const pid = recorded.pid;
+  const tmpRoot = recorded.tmpRoot;
   const helpers = descendants(pid);
   for (const helper of helpers) killPid(helper);
   killPid(pid);
-  // A run that is KILLed cannot remove its own private directory, and neither can the
-  // helpers this just ended - they were KILLed too, so the last one that could have
-  // taken it away is gone with them. Tests here KILL runs on purpose, so the harness
-  // takes that directory away instead; where a test pointed the run's temp root
-  // somewhere else, it removes that one itself. The run_scratch loop in bin/gate-lock
-  // can name the directory gate-lock-run.<pid>.<k> for k >= 1 when a recycled pid left
-  // one behind, so every such suffix is cleaned.
-  for (const p of fs.readdirSync(os.tmpdir(), { withFileTypes: true })) {
-    if (p.name === `gate-lock-run.${pid}` || p.name.startsWith(`gate-lock-run.${pid}.`)) {
-      try {
-        fs.rmSync(path.join(os.tmpdir(), p.name), { recursive: true, force: true });
-      } catch {
-        /* already gone, or not ours to remove */
-      }
-    }
+  // Remove only the private directory this specific run created, identified by
+  // the temp root it resolved and its pid. The run_scratch loop in bin/gate-lock
+  // names the directory gate-lock-run.<pid>; only when a recycled pid left one
+  // behind does it append .<k>. We remove the base name only - never infer
+  // ownership from a PID-prefix scan of the shared temp root, which can match a
+  // recycled PID's newer directory and delete it while that run uses it.
+  try {
+    fs.rmSync(runDirOf(pid, tmpRoot), { recursive: true, force: true });
+  } catch {
+    /* already gone, or not ours to remove */
   }
 }
 
@@ -355,7 +352,7 @@ export function startRun(pool, lane, cmd, { args = [], env = {}, cwd } = {}) {
   // A run that is still alive when its test ends would keep beating every
   // period for as long as the host is up, so every started run is remembered
   // here and stopped after the test, failed or not.
-  startedRuns.push(started.child.pid);
+  startedRuns.push({ pid: started.child.pid, tmpRoot: env.GATE_LOCK_TEST_TMP_ROOT });
   return started;
 }
 
