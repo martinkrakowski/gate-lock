@@ -1097,29 +1097,32 @@ describe('D10 a loop that keeps dying', () => {
     // own and has published that heartbeat's pid beside itself.
     await waitForFile(hook.seam);
     const dir = path.join(tmpRoot, `gate-lock-run.${gate.child.pid}`);
-    await until(() => fs.readFileSync(path.join(dir, 'beat-child'), 'utf8').trim() !== '', 10000);
-    const heartbeat = Number(fs.readFileSync(path.join(dir, 'beat-child'), 'utf8').trim());
-    expect(heartbeat).toBeGreaterThan(0);
-    const loop = beatPids(out)[0] ?? 0;
-    const supervisor = parentOf(loop);
-    // The watch ends with the loop still live, so the supervisor ends it - and this is
-    // the moment after the reap, where a pid of a heartbeat that is now dead and
-    // reaped must be gone from the file. Restart-once is about to start a new loop, and
-    // a new loop's own KILL reads that file: a pid left there is a pid the kernel is
-    // free to have given to somebody else.
-    await untilTraced(() => /sees loop \d+ status 137/.test(traceText(trace)), trace, 90000);
-    const left = fs.existsSync(path.join(dir, 'beat-child'))
-      ? fs.readFileSync(path.join(dir, 'beat-child'), 'utf8').trim()
-      : '';
-    expect(left, 'a heartbeat pid outlived the heartbeat').not.toBe(String(heartbeat));
-    await untilGone(heartbeat, 15000);
-    expect(stopped(heartbeat), 'the heartbeat under a KILLed loop is still running').toBe(true);
-    block.release();
-    hook.release();
-    const r = await gate.done;
-    expect(r.status, traceText(trace)).toBe(0);
-    expect(names(pool), traceText(trace)).toEqual(['.format']);
-    expect(stopped(supervisor), 'the supervisor outlived its run').toBe(true);
+    try {
+      await until(() => fs.readFileSync(path.join(dir, 'beat-child'), 'utf8').trim() !== '', 10000);
+      const heartbeat = Number(fs.readFileSync(path.join(dir, 'beat-child'), 'utf8').trim());
+      expect(heartbeat).toBeGreaterThan(0);
+      const loop = beatPids(out)[0] ?? 0;
+      const supervisor = parentOf(loop);
+      // The watch ends with the loop still live, so the supervisor ends it - and this is
+      // the moment after the reap, where a pid of a heartbeat that is now dead and
+      // reaped must be gone from the file. Restart-once is about to start a new loop, and
+      // a new loop's own KILL reads that file: a pid left there is a pid the kernel is
+      // free to have given to somebody else.
+      await untilTraced(() => /sees loop \d+ status 137/.test(traceText(trace)), trace, 90000);
+      const left = fs.existsSync(path.join(dir, 'beat-child'))
+        ? fs.readFileSync(path.join(dir, 'beat-child'), 'utf8').trim()
+        : '';
+      expect(left, 'a heartbeat pid outlived the heartbeat').not.toBe(String(heartbeat));
+      await untilGone(heartbeat, 15000);
+      expect(stopped(heartbeat), 'the heartbeat under a KILLed loop is still running').toBe(true);
+      block.release();
+      const r = await gate.done;
+      expect(r.status, traceText(trace)).toBe(0);
+      expect(names(pool), traceText(trace)).toEqual(['.format']);
+      expect(stopped(supervisor), 'the supervisor outlived its run').toBe(true);
+    } finally {
+      hook.release();
+    }
   }, 150_000);
 
   it('D10 a supervisor that publishes progress and never finishes is given up on: the teardown ends within the cap', async () => {
