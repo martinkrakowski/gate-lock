@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshPool, livePid, lockEnv, nowS, runCli, writeSlot, wtDir } from './helpers.js';
+import { freshPool, deadPid, livePid, lockEnv, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 const TM = { GATE_LOCK_TEST_MODE: '1' };
 
@@ -66,9 +66,10 @@ describe('F57-F61 forged and foreign slots', () => {
     fs.mkdirSync(target, { mode: 0o700 });
     fs.chmodSync(target, 0o700);
     const now = nowS();
+    const dead = deadPid();
     writeSlot(target, 'gate.lock', {
       owner: 'real',
-      pid: 999989,
+      pid: dead,
       started: now,
       beat: now,
       worktree: '/wt',
@@ -84,12 +85,13 @@ describe('F57-F61 forged and foreign slots', () => {
   it('T61 a slot owned by a different uid is invisible (uid seam)', () => {
     const pool = freshPool();
     const now = nowS();
+    const dead = deadPid();
     writeSlot(
       pool,
       'gate.lock',
       {
         owner: 'foreigner',
-        pid: 999988,
+        pid: dead,
         started: now,
         beat: now,
         worktree: '/wt',
@@ -118,9 +120,10 @@ describe('F57-F61 forged and foreign slots', () => {
     fs.mkdirSync(target, { mode: 0o700 });
     fs.chmodSync(target, 0o700);
     const now = nowS();
+    const dead = deadPid();
     writeSlot(target, 'gate.lock', {
       owner: 'holder',
-      pid: 4242,
+      pid: dead,
       started: now,
       beat: now,
       worktree: '/wt',
@@ -129,7 +132,7 @@ describe('F57-F61 forged and foreign slots', () => {
     const linkPath = path.join(pool, 'gate.lock');
     fs.symlinkSync(target, linkPath);
     const r = runCli(['release', 'holder'], {
-      env: { ...lockEnv(pool, TM), GATE_LOCK_SLOT_PATH: linkPath, GATE_LOCK_CALLER_PID: '4242' },
+      env: { ...lockEnv(pool, TM), GATE_LOCK_SLOT_PATH: linkPath, GATE_LOCK_CALLER_PID: String(dead) },
       cwd: wtDir(pool),
     });
     expect(r.status).toBe(2);

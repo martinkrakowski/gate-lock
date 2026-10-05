@@ -37,13 +37,13 @@ describe('F30 four-file compatibility slot', () => {
   it('T57 a four-file slot (no worktree/project) is valid and never blocks a same-worktree acquirer', () => {
     const pool = freshPool();
     const now = nowS();
-    const dead = deadPid();
+    const live = livePid();
     const dir = writeSlot(
       pool,
       'gate.lock',
       {
         owner: 'old',
-        pid: dead,
+        pid: live,
         started: now,
         beat: now,
       },
@@ -55,6 +55,23 @@ describe('F30 four-file compatibility slot', () => {
     expect(r.stdout).toContain('project unknown');
     const files = names(dir);
     expect(files).toEqual(['beat', 'owner', 'pid', 'started']);
+    // A same-worktree acquirer is not blocked: the four-file holder has no worktree,
+    // so the same-worktree scan finds no match, and the acquirer takes slot 1.
+    const child = spawn('sleep', ['600'], { stdio: 'ignore' });
+    try {
+      const a = runCli(['acquire', 'newlane'], {
+        env: { ...lockEnv(pool), GATE_LOCK_CALLER_PID: String(child.pid), GATE_LOCK_SLOTS: '2' },
+        cwd: wtDir(pool, 'wt1'),
+      });
+      expect(a.status).toBe(0);
+      expect(a.stdout).toContain('acquired by newlane');
+      // Slot 0 remains untouched: four files, same content, same pid.
+      expect(names(dir)).toEqual(['beat', 'owner', 'pid', 'started']);
+      expect(fs.readFileSync(`${dir}/pid`, 'utf8')).toBe(`${live}\n`);
+      expect(fs.readFileSync(`${dir}/owner`, 'utf8')).toBe('old\n');
+    } finally {
+      child.kill('SIGKILL');
+    }
   });
 });
 
