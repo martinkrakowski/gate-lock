@@ -216,19 +216,7 @@ export function stopRun(recorded) {
   // (when a trace seam was set), so that case is resolved to the right name rather
   // than inferred from a PID-prefix scan of the shared temp root - which can match a
   // recycled PID's newer directory and delete it while that run uses it.
-  let dir = runDirOf(pid, tmpRoot);
-  if (trace) {
-    let traceText;
-    try {
-      traceText = fs.readFileSync(trace, 'utf8');
-    } catch {
-      /* trace file may not exist yet */
-    }
-    if (traceText) {
-      const match = traceText.match(new RegExp(`run ${pid} private directory (.+)\n`));
-      if (match) dir = match[1];
-    }
-  }
+  const dir = runDirOf(pid, tmpRoot, trace);
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch {

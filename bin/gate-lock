@@ -2826,18 +2826,18 @@ run_scratch() {
     [ "$run_k" -le 20 ] ||
       die "cannot create a private directory for the slot path in $tmp_phys; no lock was taken"
   done
-   if [ -h "$run_dir" ] || [ ! -d "$run_dir" ] || ! owned_by "$run_dir" "$real_uid" ||
-     ! mode_is_0700 "$run_dir"; then
-     rm -rf "${run_dir:?}" 2>/dev/null
-     run_dir=
-     die "$tmp_phys/gate-lock-run.$$ is not a private directory of ours (mode 0700, owned by uid $real_uid, not a symlink); no lock was taken"
-   fi
-   run_slot_out=$run_dir/slot
-   # The private directory this run actually created, for the test harness to clean up
-   # when a recycled pid left a `gate-lock-run.<pid>` behind and run_scratch took the
-   # `.<k>` suffix instead: stopRun must remove only what this run created.
-   trace "run $$ private directory $run_dir"
- }
+  if [ -h "$run_dir" ] || [ ! -d "$run_dir" ] || ! owned_by "$run_dir" "$real_uid" ||
+    ! mode_is_0700 "$run_dir"; then
+    rm -rf "${run_dir:?}" 2>/dev/null
+    run_dir=
+    die "$tmp_phys/gate-lock-run.$$ is not a private directory of ours (mode 0700, owned by uid $real_uid, not a symlink); no lock was taken"
+  fi
+  run_slot_out=$run_dir/slot
+  # The private directory this run actually created, for the test harness to clean up
+  # when a recycled pid left a `gate-lock-run.<pid>` behind and run_scratch took the
+  # `.<k>` suffix instead: stopRun must remove only what this run created.
+  trace "run $$ private directory $run_dir"
+}
 
 # run_beat_loop SLOT PERIOD ALIVE STATUS (C37, C42, D10): the heartbeat loop.
 # It refreshes the beat once per period with run's pid and the pin run took, and
