@@ -2283,7 +2283,20 @@ run_stop_helper() {
       # run past the ceiling while $4 still names a refresh in progress, and the
       # ceiling then ending the wait would KILL the helper mid-refresh, which is
       # exactly what the in-flight wait exists to prevent.
+      #
+      # An exception: when progress was seen (run_stop_resets > 0), this in-flight
+      # wait is part of an alternating supervisor the ceiling exists for. The
+      # progress branch `continue`s before the ceiling, and so does this in-flight
+      # branch, so without checking it here such a supervisor is never bounded by
+      # the clock. A pure in-flight wait with no progress stays bounded by the busy
+      # cap only, so a single honest refresh is never cut short.
       if [ -n "$4" ] && [ -e "$4" ]; then
+        if [ "$run_stop_resets" -gt 0 ] && [ -n "$run_stop_start" ]; then
+          if clock_now && [ "$((rs_now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then
+            run_stop_why="gave up after $((rs_now - run_stop_start)) seconds on helper $3"
+            break
+          fi
+        fi
         run_stop_busy=$((run_stop_busy + 1))
         if [ "$run_stop_busy" -ge "$run_stop_cap" ]; then
           run_stop_why="$run_stop_busy seconds with a refresh in flight"
@@ -2292,15 +2305,17 @@ run_stop_helper() {
         sleep 1
         continue
       fi
-      # An absolute elapsed-time ceiling on the whole wait, checked only when no
-      # progress was seen this round and no refresh is in flight. The reset cap
-      # and the busy cap are each run_stop_cap seconds, but a progress file that
-      # keeps changing resets the busy counter - so without a clock-bound the worst
-      # case is cap squared. The ceiling is twice run_stop_cap: generous enough that
-      # a loaded host inside its grace-plus-13 passes is never cut short by the
-      # clock, tight enough to still kill the cap-squared case. The clock is read
-      # once per round (after the spin), not on every spin, and never fatal: a
-      # clock failure in teardown would skip the release, so a failed read just
+      # An absolute elapsed-time ceiling on the whole wait, checked when no
+      # progress was seen this round and no refresh is in flight, and also inside
+      # the in-flight branch when progress has been seen (run_stop_resets > 0):
+      # see the comment on that branch. The reset cap and the busy cap are each
+      # run_stop_cap seconds, but a progress file that keeps changing resets the
+      # busy counter - so without a clock-bound the worst case is cap squared.
+      # The ceiling is twice run_stop_cap: generous enough that a loaded host
+      # inside its grace-plus-13 passes is never cut short by the clock, tight
+      # enough to still kill the cap-squared case. The clock is read once per
+      # round (after the spin), not on every spin, and never fatal: a clock
+      # failure in teardown would skip the release, so a failed read just
       # postpones the ceiling check for that round.
       if [ -n "$run_stop_start" ]; then
         if clock_now && [ "$((rs_now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then

@@ -1454,6 +1454,92 @@ describe('D10 a loop that keeps dying', () => {
     expect(r.status, traceText(trace)).toBe(0);
     expect(r.stdout, traceText(trace)).toContain('released by lane');
   }, 120_000);
+
+  it('D10 the elapsed-time ceiling fires for a supervisor that published progress and then went in-flight, when the clock advances past it', async () => {
+    const pool = freshPool();
+    const tmpRoot = scratchOf(pool);
+    const trace = path.join(tmpRoot, 'trace.log');
+    const hook = beatHook(pool);
+    const now = nowS();
+    let clockVal = now;
+    const clockFile = path.join(tmpRoot, 'clock');
+    fs.writeFileSync(clockFile, String(clockVal), 'utf8');
+    // A refresh parked at the beat rename: beat-inflight is live. The supervisor
+    // is NOT wedged yet — it is running in its normal watch, publishing its
+    // progress file (supervisor.alive). That publication is what sets
+    // run_stop_resets > 0 in run_stop_helper, and the fix applies the elapsed
+    // ceiling inside the in-flight branch when that flag is set: an alternating
+    // supervisor (progress, then in-flight, then progress...) is the shape the
+    // ceiling exists for, and without the fix it is never bounded by the clock.
+    const wedge = path.join(tmpRoot, 'sup-wedge');
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '3',
+        GATE_LOCK_TEST_NOW_FILE: clockFile,
+        GATE_LOCK_TEST_SUP_WEDGE: wedge,
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        GATE_LOCK_TEST_TRACE: trace,
+        GATE_LOCK_TEST_TMP_ROOT: tmpRoot,
+      },
+    });
+    let out = '';
+    gate.child.stdout.setEncoding('utf8').on('data', (d) => {
+      out += d;
+    });
+    await waitForFile(hook.seam);
+    await up(block);
+    await until(() => beatPids(out).length > 0, 10000);
+    const loop = beatPids(out)[0] ?? 0;
+    const supervisor = parentOf(loop);
+    expect(parentOf(supervisor), `the supervisor is a child of the run: ${out}`).toBe(
+      gate.child.pid,
+    );
+    // The refresh is parked at the rename, so beat-inflight is live. Confirm it.
+    const dir = runDirOf(gate.child.pid, tmpRoot, trace);
+    expect(
+      fs.existsSync(path.join(dir, 'beat-inflight')),
+      'the in-flight marker was not present',
+    ).toBe(true);
+    // Let the supervisor publish its progress file at least once in normal watch.
+    const svPass = path.join(dir, 'supervisor.alive');
+    await until(() => fs.existsSync(svPass) && fs.readFileSync(svPass, 'utf8').trim() !== '', 5000);
+    // Now wedge the supervisor: it will stop publishing, so the progress branch in
+    // run_stop_helper will not fire on the next round. The in-flight branch fires
+    // instead — and since run_stop_resets > 0, the ceiling is checked there.
+    fs.writeFileSync(wedge, 'wedged\n');
+    // Let the supervisor enter the wedge loop and stop publishing sv_pass.
+    const seen = fs.readFileSync(svPass, 'utf8');
+    await until(() => fs.readFileSync(svPass, 'utf8') === seen, 5000);
+    await new Promise((r) => setTimeout(r, 1000));
+    // Advance the clock by +100 each second past the ceiling.
+    const bump = setInterval(() => {
+      clockVal += 100;
+      fs.writeFileSync(clockFile, String(clockVal), 'utf8');
+    }, 1000);
+    block.release();
+    try {
+      await untilGone(gate.child.pid, 90000);
+      expect(stopped(gate.child.pid), 'the run never finished').toBe(true);
+      // The ceiling fired: "gave up after N seconds on helper <supervisor>".
+      expect(traceText(trace), traceText(trace)).toMatch(
+        new RegExp(`gives up on the helper ${supervisor}: gave up after \\d+ seconds`),
+      );
+    } finally {
+      clearInterval(bump);
+      hook.release();
+      fs.rmSync(wedge, { force: true });
+    }
+    await until(() => stagedBeats(pool).length === 0, 20000);
+    await untilGone(loop, 20000);
+    expect(names(pool), traceText(trace)).toEqual(['.format']);
+    // The supervisor was KILled by the ceiling — the command status stands.
+    const r = await gate.done;
+    expect(r.status, traceText(trace)).toBe(0);
+    expect(r.stdout, traceText(trace)).toContain('released by lane');
+  }, 120_000);
 });
 
 describe('D21 the file recording the slot path', () => {
