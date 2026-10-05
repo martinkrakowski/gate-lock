@@ -1245,6 +1245,80 @@ describe('D10 a loop that keeps dying', () => {
     expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
   }, 180_000);
 
+  it('D10 the elapsed-time ceiling fires when the clock advances past twice the cap, and the slot decides: the command status stands', async () => {
+    const pool = freshPool();
+    const tmpRoot = scratchOf(pool);
+    const trace = path.join(tmpRoot, 'trace.log');
+    // GATE_LOCK_TEST_NOW_FILE names a file whose value clock_now() reads each
+    // round in run_stop_helper. The test writes the current epoch, then advances
+    // it by +100 each second: the ceiling (2 * run_stop_cap, 42 with grace 3)
+    // fires in the first or second round — well before the wait cap (8 rounds)
+    // and well under the 40s wall budget.
+    const now = nowS();
+    let clockVal = now;
+    const clockFile = path.join(tmpRoot, 'clock');
+    fs.writeFileSync(clockFile, String(clockVal), 'utf8');
+    // A wedged supervisor publishes no progress and holds no refresh in flight,
+    // so only the elapsed ceiling and the wait cap can end it — the reset cap
+    // and the busy cap are both starved.
+    const wedge = path.join(tmpRoot, 'sup-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '3',
+        GATE_LOCK_TEST_NOW_FILE: clockFile,
+        GATE_LOCK_TEST_SUP_WEDGE: wedge,
+        GATE_LOCK_TEST_TRACE: trace,
+        GATE_LOCK_TEST_TMP_ROOT: tmpRoot,
+      },
+    });
+    let out = '';
+    gate.child.stdout.setEncoding('utf8').on('data', (d) => {
+      out += d;
+    });
+    await up(block);
+    await until(() => beatPids(out).length > 0, 10000);
+    const loop = beatPids(out)[0] ?? 0;
+    const supervisor = parentOf(loop);
+    expect(parentOf(supervisor), `the supervisor is a child of the run: ${out}`).toBe(
+      gate.child.pid,
+    );
+    // Advance the clock by +100 each second; the first round that reads a new
+    // value after run_stop_start passes the 42-second ceiling in one step.
+    const bump = setInterval(() => {
+      clockVal += 100;
+      fs.writeFileSync(clockFile, String(clockVal), 'utf8');
+    }, 1000);
+    block.release();
+    try {
+      await untilGone(gate.child.pid, 30000);
+      expect(stopped(gate.child.pid), 'the run never finished').toBe(true);
+      // The elapsed-time ceiling fired: "gave up after N seconds on helper PID".
+      expect(traceText(trace), traceText(trace)).toMatch(
+        new RegExp(
+          `gives up on the helper ${supervisor}: gave up after \\d+ seconds on helper ${supervisor}`,
+        ),
+      );
+    } finally {
+      clearInterval(bump);
+    }
+    await until(() => stagedBeats(pool).length === 0, 20000);
+    await untilGone(loop, 20000);
+    expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
+    expect(stopped(supervisor), 'the supervisor was KILLed by the ceiling').toBe(true);
+    // Verdict table, unproven row (137): the slot verified as this run's, so
+    // the command's own status (0) stands, and stderr warns that the supervisor
+    // was stopped the hard way.
+    const r = await gate.done;
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('stopped the hard way');
+    expect(r.stderr).not.toContain('lock lost');
+    expect(r.stdout).toContain('released by lane');
+  }, 60_000);
+
   it('D10 a supervisor that will not be stopped at all is KILLed, and the slot decides: the command status stands', async () => {
     const pool = freshPool();
     const wedge = path.join(scratchOf(pool), 'sup-wedge');

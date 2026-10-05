@@ -650,6 +650,27 @@ usage_error() {
   exit 2
 }
 
+# clock_now: the clock in epoch seconds (digits) in $rs_now. Honours, in order:
+# GATE_LOCK_TEST_NOW (a fixed value), GATE_LOCK_TEST_NOW_FILE (a file holding
+# epoch seconds, so tests can advance the clock), and date(1) on the host.
+# Returns 1 without dying when no digit string is available: callers can skip
+# the decision that depends on the clock rather than abort.
+clock_now() {
+  rs_now=
+  seam GATE_LOCK_TEST_NOW
+  if [ -n "$seam_value" ]; then
+    rs_now=$seam_value
+  else
+    seam GATE_LOCK_TEST_NOW_FILE
+    if [ -n "$seam_value" ] && [ -r "$seam_value" ]; then
+      rs_now=$(cat "$seam_value" 2>/dev/null)
+    else
+      rs_now=$(date +%s 2>/dev/null) || rs_now=
+    fi
+  fi
+  is_digits "$rs_now" || return 1
+}
+
 # now_s: the clock in epoch seconds, as digits, in $now. The test seam
 # GATE_LOCK_TEST_NOW fixes it, so the threshold boundary can be hit exactly.
 now_s() {
@@ -2211,11 +2232,7 @@ run_stop_helper() {
     # never fatal: a clock failure in teardown would skip the release, so a failed read
     # just postpones the ceiling check for that round.
     run_stop_start=
-    # The clock is read the same way now_s does, but never fatal: a failed read
-    # leaves run_stop_start empty and the ceiling check is skipped.
-    seam GATE_LOCK_TEST_NOW
-    run_stop_start=${seam_value:-$(date +%s 2>/dev/null)}
-    is_digits "$run_stop_start" || run_stop_start=
+    clock_now && run_stop_start=$rs_now
     while [ -e "$1" ] && [ ! -e "$2" ]; do
       run_stop_spin=$((run_stop_spin + 1))
       if [ "$run_stop_spin" -lt 200 ]; then
@@ -2226,10 +2243,7 @@ run_stop_helper() {
       # bounds the cap-squared worst case while leaving loaded-host slack: the supervisor's
       # own worst case is the grace plus thirteen, and 2 * (grace + 18) is well past that.
       if [ -n "$run_stop_start" ]; then
-        seam GATE_LOCK_TEST_NOW
-        rs_now=${seam_value:-$(date +%s 2>/dev/null)}
-        is_digits "$rs_now" || rs_now=
-        if [ -n "$rs_now" ] && [ "$((rs_now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then
+        if clock_now && [ "$((rs_now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then
           run_stop_why="gave up after $((rs_now - run_stop_start)) seconds on helper $3"
           break
         fi
