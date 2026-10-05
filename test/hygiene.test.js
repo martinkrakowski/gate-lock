@@ -107,11 +107,12 @@ describe('D16 the janitor pass', () => {
     // Held by a live pid with a fresh beat: the aside stays.
     const alive = freshPool();
     const liveName = `gate.lock.reclaim.${deadPid()}.1`;
+    const now = nowS();
     writeSlot(alive, liveName, {
       owner: 'gone',
       pid: livePid(),
-      beat: nowS(),
-      started: nowS(),
+      beat: now,
+      started: now,
       worktree: '/x',
       project: 'x',
     });

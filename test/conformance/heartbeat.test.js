@@ -36,11 +36,12 @@ describe('C17-C19 heartbeat', () => {
     const pool = freshPool();
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     try {
+      const seeded = nowS();
       writeSlot(pool, 'gate.lock', {
         owner: 'lane',
         pid: 999994,
-        started: nowS(),
-        beat: nowS(),
+        started: seeded,
+        beat: seeded,
         worktree: '/wt',
         project: 'wt',
       });
@@ -50,7 +51,7 @@ describe('C17-C19 heartbeat', () => {
       });
       expect(r.status).toBe(1);
       expect(r.stderr).toMatch(/heartbeat refused/);
-      expect(fs.readFileSync(`${pool}/gate.lock/beat`, 'utf8')).toBe(`${nowS()}\n`);
+      expect(fs.readFileSync(`${pool}/gate.lock/beat`, 'utf8')).toBe(`${seeded}\n`);
       // The beat is unchanged (still the seeded value).
     } finally {
       child.kill('SIGKILL');
@@ -78,11 +79,12 @@ describe('C18-C19 verify', () => {
     const pool = freshPool();
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     try {
+      const seeded = nowS();
       writeSlot(pool, 'gate.lock', {
         owner: 'lane',
         pid: child.pid,
-        started: nowS(),
-        beat: nowS(),
+        started: seeded,
+        beat: seeded,
         worktree: '/wt',
         project: 'wt',
       });
@@ -102,11 +104,12 @@ describe('C18-C19 verify', () => {
     const pool = freshPool();
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     try {
+      const seeded = nowS();
       writeSlot(pool, 'gate.lock', {
         owner: 'lane',
         pid: 999993,
-        started: nowS(),
-        beat: nowS(),
+        started: seeded,
+        beat: seeded,
         worktree: '/wt',
         project: 'wt',
       });
@@ -127,11 +130,12 @@ describe('C13-C17 release', () => {
     const pool = freshPool();
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     try {
+      const seeded = nowS();
       writeSlot(pool, 'gate.lock', {
         owner: 'lane',
         pid: child.pid,
-        started: nowS(),
-        beat: nowS(),
+        started: seeded,
+        beat: seeded,
         worktree: '/wt',
         project: 'wt',
       });
