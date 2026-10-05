@@ -1171,13 +1171,12 @@ describe('D10 a loop that keeps dying', () => {
       await untilGone(gate.child.pid, 120000);
       expect(stopped(gate.child.pid), 'the run never finished').toBe(true);
       expect(stopped(supervisor), 'a supervisor that never ends outlived the run').toBe(true);
-      // Which bound ended it, in the trace: either the reset cap (progress published
-      // N times without finishing) or the elapsed-time ceiling I added (gave up after
-      // N seconds on helper). A slow host flips one for the other, so both are accepted.
+      // Which bound ended it, in the trace: the reset cap, which is what the teardown's
+      // own cap on the resets decides - a supervisor that keeps publishing and never
+      // finishes is ended by the reset cap, not by the elapsed-time ceiling (which is
+      // twice run_stop_cap, well past the reset cap's reach).
       expect(traceText(trace), traceText(trace)).toMatch(
-        new RegExp(
-          `gives up on the helper ${supervisor}: (published \\d+ times without finishing|gave up after \\d+ seconds)`,
-        ),
+        new RegExp(`gives up on the helper ${supervisor}: published \\d+ times without finishing`),
       );
     } finally {
       hook.release();
@@ -1190,6 +1189,62 @@ describe('D10 a loop that keeps dying', () => {
     await untilGone(loop, 20000);
     expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
     expect(stopped(loop), 'a loop outlived the supervisor that was KILLed').toBe(true);
+  }, 180_000);
+
+  it('D10 the elapsed-time ceiling bounds a helper that never finishes, and is not the one that fires when progress is published', async () => {
+    const pool = freshPool();
+    const tmpRoot = scratchOf(pool);
+    const trace = path.join(tmpRoot, 'trace.log');
+    const hook = beatHook(pool);
+    // GATE_LOCK_TEST_NOW freezes the clock at the current second, so the
+    // elapsed-time ceiling in run_stop_helper never fires (elapsed is always 0).
+    // The reset cap does its job: the teardown gives up via "published N times
+    // without finishing", proving the ceiling is a safety net that steps aside
+    // when the clock is frozen rather than racing the caps.
+    const now = nowS();
+    const stuck = path.join(tmpRoot, 'sup-progress');
+    fs.writeFileSync(stuck, 'counting\n');
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '3',
+        GATE_LOCK_TEST_NOW: String(now),
+        GATE_LOCK_TEST_SUP_PROGRESS: stuck,
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        GATE_LOCK_TEST_TRACE: trace,
+        GATE_LOCK_TEST_TMP_ROOT: tmpRoot,
+      },
+    });
+    let out = '';
+    gate.child.stdout.setEncoding('utf8').on('data', (d) => {
+      out += d;
+    });
+    await waitForFile(hook.seam);
+    await until(() => beatPids(out).length > 0, 10000);
+    const loop = beatPids(out)[0] ?? 0;
+    const supervisor = parentOf(loop);
+    expect(parentOf(supervisor), `the supervisor is a child of the run: ${out}`).toBe(
+      gate.child.pid,
+    );
+    block.release();
+    try {
+      await untilGone(gate.child.pid, 120000);
+      expect(stopped(gate.child.pid), 'the run never finished').toBe(true);
+      // The clock is frozen, so the elapsed-time ceiling did not fire: the
+      // reset cap did, via "published N times without finishing".
+      expect(traceText(trace), traceText(trace)).toMatch(
+        new RegExp(`gives up on the helper ${supervisor}: published \\d+ times without finishing`),
+      );
+      // The reset cap fires at run_stop_cap (grace+18 = 21) seconds of real
+      // time, well within the 2*run_stop_cap (42) elapsed-time ceiling.
+    } finally {
+      hook.release();
+    }
+    await until(() => stagedBeats(pool).length === 0, 20000);
+    await untilGone(loop, 20000);
+    expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
   }, 180_000);
 
   it('D10 a supervisor that will not be stopped at all is KILLed, and the slot decides: the command status stands', async () => {
