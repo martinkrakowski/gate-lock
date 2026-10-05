@@ -41,7 +41,10 @@ describe('F20-F23 transient names', () => {
     writeTransient(pool, 'gate.lock.beatnew.12345');
     writeTransient(pool, 'gate.lock.reclaim.12345.1');
     writeTransient(pool, '.format.tmp.12345');
-    const r = runCli(['status'], { env: { ...lockEnv(pool), GATE_LOCK_SLOTS: '1' }, cwd: wtDir(pool) });
+    const r = runCli(['status'], {
+      env: { ...lockEnv(pool), GATE_LOCK_SLOTS: '1' },
+      cwd: wtDir(pool),
+    });
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('gate.lock held by holder');
     expect(r.stdout).toContain('gate.lock.1 held by beyond');
@@ -79,7 +82,7 @@ describe('F20-F23 transient names', () => {
     expect(r.stdout).not.toMatch(/gate\.lock\.100/);
   });
 
-   it('D16 clean removes a stale transient whose creator pid is dead and is older than the threshold', () => {
+  it('D16 clean removes a stale transient whose creator pid is dead and is older than the threshold', () => {
     const pool = freshPool();
     const creator = deadPid();
     const t = writeTransient(pool, `gate.lock.cand.${creator}`);

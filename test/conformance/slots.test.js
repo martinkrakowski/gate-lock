@@ -2,7 +2,17 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { freshPool, deadPid, livePid, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
+import {
+  freshPool,
+  deadPid,
+  livePid,
+  lockEnv,
+  names,
+  nowS,
+  runCli,
+  writeSlot,
+  wtDir,
+} from './helpers.js';
 
 describe('F24-F29 six-file slot', () => {
   it('T2 the six files per §2 are written by the CLI after a successful acquire', () => {

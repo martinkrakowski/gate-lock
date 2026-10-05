@@ -132,7 +132,11 @@ describe('F57-F61 forged and foreign slots', () => {
     const linkPath = path.join(pool, 'gate.lock');
     fs.symlinkSync(target, linkPath);
     const r = runCli(['release', 'holder'], {
-      env: { ...lockEnv(pool, TM), GATE_LOCK_SLOT_PATH: linkPath, GATE_LOCK_CALLER_PID: String(dead) },
+      env: {
+        ...lockEnv(pool, TM),
+        GATE_LOCK_SLOT_PATH: linkPath,
+        GATE_LOCK_CALLER_PID: String(dead),
+      },
       cwd: wtDir(pool),
     });
     expect(r.status).toBe(2);
