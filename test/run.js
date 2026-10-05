@@ -206,17 +206,33 @@ function killPid(pid) {
 function stopRun(recorded) {
   const pid = recorded.pid;
   const tmpRoot = recorded.tmpRoot;
+  const trace = recorded.trace;
   const helpers = descendants(pid);
   for (const helper of helpers) killPid(helper);
   killPid(pid);
-  // Remove only the private directory this specific run created, identified by
-  // the temp root it resolved and its pid. The run_scratch loop in bin/gate-lock
-  // names the directory gate-lock-run.<pid>; only when a recycled pid left one
-  // behind does it append .<k>. We remove the base name only - never infer
-  // ownership from a PID-prefix scan of the shared temp root, which can match a
+  // Remove only the private directory this specific run created. The run_scratch loop
+  // in bin/gate-lock names it gate-lock-run.<pid>; only when a recycled pid left one
+  // behind does it append .<k>. The run publishes its actual directory in its trace
+  // (when a trace seam was set), so that case is resolved to the right name rather
+  // than inferred from a PID-prefix scan of the shared temp root - which can match a
   // recycled PID's newer directory and delete it while that run uses it.
+  let dir = runDirOf(pid, tmpRoot);
+  if (trace) {
+    let traceText;
+    try {
+      traceText = fs.readFileSync(trace, 'utf8');
+    } catch {
+      /* trace file may not exist yet */
+    }
+    if (traceText) {
+      const match = traceText.match(
+        new RegExp(`run ${pid} private directory (.+)\n`),
+      );
+      if (match) dir = match[1];
+    }
+  }
   try {
-    fs.rmSync(runDirOf(pid, tmpRoot), { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
   } catch {
     /* already gone, or not ours to remove */
   }
@@ -284,10 +300,20 @@ export async function waitForDead(pid, timeoutMs = 10000) {
  * The private directory a run keeps in the temp root: `$tmpRoot/gate-lock-run.<pid>`
  * of the run whose pid is `pid`. `tmpRoot` is the directory the run resolved, which
  * a test knows when it sets `GATE_LOCK_TEST_TMP_ROOT` and otherwise is the system
- * one.
+ * one. When the run created a `gate-lock-run.<pid>.<k>` directory (because a leftover
+ * base existed), pass the trace file it wrote so the actual name is read back.
  */
-export function runDirOf(pid, tmpRoot) {
-  return path.join(tmpRoot ?? os.tmpdir(), `gate-lock-run.${pid}`);
+export function runDirOf(pid, tmpRoot, trace) {
+  const base = path.join(tmpRoot ?? os.tmpdir(), `gate-lock-run.${pid}`);
+  if (!trace) return base;
+  let traceText;
+  try {
+    traceText = fs.readFileSync(trace, 'utf8');
+  } catch {
+    return base;
+  }
+  const match = traceText.match(new RegExp(`run ${pid} private directory (.+)\n`));
+  return match ? match[1] : base;
 }
 
 /**
@@ -300,8 +326,24 @@ export function runDirOf(pid, tmpRoot) {
  * ENOTEMPTY, which is what macOS CI saw, so this waits for the directory to be gone
  * and therefore for every helper that writes into it to have left.
  */
-export async function waitRunGone(gate, { tmpRoot, timeoutMs = 30000 } = {}) {
-  await until(() => !fs.existsSync(runDirOf(gate.child.pid, tmpRoot)), timeoutMs);
+export async function waitRunGone(gate, { tmpRoot, trace, timeoutMs = 30000 } = {}) {
+  const dir = runDirOf(gate.child.pid, tmpRoot, trace);
+  await until(() => !fs.existsSync(dir), timeoutMs);
+}
+
+/**
+ * Both the base name and any `.<k>` suffixed directory for `pid`: a leftover
+ * `gate-lock-run.<pid>` may sit beside the `.<k>` the run actually created, and a
+ * test that removes one must not take the other.
+ */
+export function runDirNames(pid, tmpRoot) {
+  tmpRoot = tmpRoot ?? os.tmpdir();
+  const list = [path.join(tmpRoot, `gate-lock-run.${pid}`)];
+  for (let k = 1; k <= 20; k++) {
+    const p = path.join(tmpRoot, `gate-lock-run.${pid}.${k}`);
+    if (fs.existsSync(p)) list.push(p);
+  }
+  return list;
 }
 
 /**
@@ -352,7 +394,11 @@ export function startRun(pool, lane, cmd, { args = [], env = {}, cwd } = {}) {
   // A run that is still alive when its test ends would keep beating every
   // period for as long as the host is up, so every started run is remembered
   // here and stopped after the test, failed or not.
-  startedRuns.push({ pid: started.child.pid, tmpRoot: env.GATE_LOCK_TEST_TMP_ROOT });
+  startedRuns.push({
+    pid: started.child.pid,
+    tmpRoot: env.GATE_LOCK_TEST_TMP_ROOT,
+    trace: env.GATE_LOCK_TEST_TRACE,
+  });
   return started;
 }
 

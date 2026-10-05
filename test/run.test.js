@@ -29,6 +29,7 @@ import {
   freshPool,
   heldListing,
   parentOf,
+  runDirOf,
   runOnce,
   runRaw,
   script,
@@ -1371,6 +1372,88 @@ describe('D10 a loop that keeps dying', () => {
     expect(r.stderr).not.toContain('the lock was lost while the command ran');
     expect(names(pool)).toEqual(['.format']);
   }, 60_000);
+
+  it('D10 the elapsed-time ceiling does not fire when a refresh is in flight, even past the cap; the in-flight bound ends it instead', async () => {
+    const pool = freshPool();
+    const tmpRoot = scratchOf(pool);
+    const trace = path.join(tmpRoot, 'trace.log');
+    const hook = beatHook(pool);
+    // A refresh parked at the beat rename: beat-inflight is still published, so
+    // run_stop_helper's in-flight check ($4) is true. The supervisor is also wedged
+    // (GATE_LOCK_TEST_SUP_WEDGE) so it cannot end on its own and write supervisor.gone,
+    // which is what forces run_stop_helper to stay in its wait loop with the in-flight
+    // marker present and count its in-flight bound. The clock is advanced past the
+    // ceiling (2 * run_stop_cap) so the old ordering — ceiling before the in-flight
+    // check — would have fired it and KILLED the supervisor mid-refresh. The fix checks
+    // in-flight first, skipping the ceiling, so the helper ends through the in-flight
+    // bound instead.
+    const now = nowS();
+    let clockVal = now;
+    const clockFile = path.join(tmpRoot, 'clock');
+    fs.writeFileSync(clockFile, String(clockVal), 'utf8');
+    const wedge = path.join(tmpRoot, 'sup-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_KILL_GRACE: '3',
+        GATE_LOCK_TEST_NOW_FILE: clockFile,
+        GATE_LOCK_TEST_SUP_WEDGE: wedge,
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        GATE_LOCK_TEST_TRACE: trace,
+        GATE_LOCK_TEST_TMP_ROOT: tmpRoot,
+      },
+    });
+    let out = '';
+    gate.child.stdout.setEncoding('utf8').on('data', (d) => {
+      out += d;
+    });
+    await waitForFile(hook.seam);
+    await up(block);
+    await until(() => beatPids(out).length > 0, 10000);
+    const loop = beatPids(out)[0] ?? 0;
+    const supervisor = parentOf(loop);
+    expect(parentOf(supervisor), `the supervisor is a child of the run: ${out}`).toBe(
+      gate.child.pid,
+    );
+    // The refresh is parked at the rename, so beat-inflight is live. Confirm it.
+    const dir = runDirOf(gate.child.pid, tmpRoot, trace);
+    expect(
+      fs.existsSync(path.join(dir, 'beat-inflight')),
+      'the in-flight marker was not present',
+    ).toBe(true);
+    // Advance the clock by +100 each second past the ceiling; the old code would
+    // have fired the ceiling in the first round and KILLED the supervisor mid-refresh.
+    const bump = setInterval(() => {
+      clockVal += 100;
+      fs.writeFileSync(clockFile, String(clockVal), 'utf8');
+    }, 1000);
+    block.release();
+    try {
+      await untilGone(gate.child.pid, 90000);
+      expect(stopped(gate.child.pid), 'the run never finished').toBe(true);
+      // The ceiling did NOT fire: the trace shows the in-flight bound instead.
+      expect(traceText(trace), traceText(trace)).not.toMatch(
+        new RegExp(`gives up on the helper ${supervisor}: gave up after`),
+      );
+      expect(traceText(trace), traceText(trace)).toMatch(
+        new RegExp(`gives up on the helper ${supervisor}: \\d+ seconds with a refresh in flight`),
+      );
+    } finally {
+      clearInterval(bump);
+      hook.release();
+      fs.rmSync(wedge, { force: true });
+    }
+    await until(() => stagedBeats(pool).length === 0, 20000);
+    await untilGone(loop, 20000);
+    expect(names(pool), traceText(trace)).toEqual(['.format']);
+    // The supervisor was not KILked by the ceiling — the command status stands.
+    const r = await gate.done;
+    expect(r.status, traceText(trace)).toBe(0);
+    expect(r.stdout, traceText(trace)).toContain('released by lane');
+  }, 120_000);
 });
 
 describe('D21 the file recording the slot path', () => {

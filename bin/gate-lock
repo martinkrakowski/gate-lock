@@ -2273,27 +2273,16 @@ run_stop_helper() {
           continue
         fi
       fi
-      # An absolute elapsed-time ceiling on the whole wait, checked only when no
-      # progress was seen this round. The reset cap and the busy cap are each
-      # run_stop_cap seconds, but a progress file that keeps changing resets the
-      # busy counter - so without a clock-bound the worst case is cap squared.
-      # The ceiling is twice run_stop_cap: generous enough that a loaded host
-      # inside its grace-plus-13 passes is never cut short by the clock, tight
-      # enough to still kill the cap-squared case. The clock is read once per
-      # round (after the spin), not on every spin, and never fatal: a clock
-      # failure in teardown would skip the release, so a failed read just
-      # postpones the ceiling check for that round.
-      if [ -n "$run_stop_start" ]; then
-        if clock_now && [ "$((rs_now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then
-          run_stop_why="gave up after $((rs_now - run_stop_start)) seconds on helper $3"
-          break
-        fi
-      fi
       # A refresh of the helper's own is in flight: it is busy, not wedged, and
       # C41 says that refresh is never cut short. Those seconds are counted apart
       # from the bound below, and the busy count has a cap of its own so that a
       # marker nobody takes away - a helper wedged with a refresh published for
       # ever - still ends. $4 is that marker's path, or empty where there is none.
+      # The in-flight wait has its own cap, so the elapsed ceiling below is only
+      # applied when no refresh is in flight: on a loaded host one wait round can
+      # run past the ceiling while $4 still names a refresh in progress, and the
+      # ceiling then ending the wait would KILL the helper mid-refresh, which is
+      # exactly what the in-flight wait exists to prevent.
       if [ -n "$4" ] && [ -e "$4" ]; then
         run_stop_busy=$((run_stop_busy + 1))
         if [ "$run_stop_busy" -ge "$run_stop_cap" ]; then
@@ -2302,6 +2291,22 @@ run_stop_helper() {
         fi
         sleep 1
         continue
+      fi
+      # An absolute elapsed-time ceiling on the whole wait, checked only when no
+      # progress was seen this round and no refresh is in flight. The reset cap
+      # and the busy cap are each run_stop_cap seconds, but a progress file that
+      # keeps changing resets the busy counter - so without a clock-bound the worst
+      # case is cap squared. The ceiling is twice run_stop_cap: generous enough that
+      # a loaded host inside its grace-plus-13 passes is never cut short by the
+      # clock, tight enough to still kill the cap-squared case. The clock is read
+      # once per round (after the spin), not on every spin, and never fatal: a
+      # clock failure in teardown would skip the release, so a failed read just
+      # postpones the ceiling check for that round.
+      if [ -n "$run_stop_start" ]; then
+        if clock_now && [ "$((rs_now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then
+          run_stop_why="gave up after $((rs_now - run_stop_start)) seconds on helper $3"
+          break
+        fi
       fi
       run_stop_waited=$((run_stop_waited + 1))
       if [ "$run_stop_waited" -ge "$run_stop_bound" ]; then
@@ -2806,14 +2811,18 @@ run_scratch() {
     [ "$run_k" -le 20 ] ||
       die "cannot create a private directory for the slot path in $tmp_phys; no lock was taken"
   done
-  if [ -h "$run_dir" ] || [ ! -d "$run_dir" ] || ! owned_by "$run_dir" "$real_uid" ||
-    ! mode_is_0700 "$run_dir"; then
-    rm -rf "${run_dir:?}" 2>/dev/null
-    run_dir=
-    die "$tmp_phys/gate-lock-run.$$ is not a private directory of ours (mode 0700, owned by uid $real_uid, not a symlink); no lock was taken"
-  fi
-  run_slot_out=$run_dir/slot
-}
+   if [ -h "$run_dir" ] || [ ! -d "$run_dir" ] || ! owned_by "$run_dir" "$real_uid" ||
+     ! mode_is_0700 "$run_dir"; then
+     rm -rf "${run_dir:?}" 2>/dev/null
+     run_dir=
+     die "$tmp_phys/gate-lock-run.$$ is not a private directory of ours (mode 0700, owned by uid $real_uid, not a symlink); no lock was taken"
+   fi
+   run_slot_out=$run_dir/slot
+   # The private directory this run actually created, for the test harness to clean up
+   # when a recycled pid left a `gate-lock-run.<pid>` behind and run_scratch took the
+   # `.<k>` suffix instead: stopRun must remove only what this run created.
+   trace "run $$ private directory $run_dir"
+ }
 
 # run_beat_loop SLOT PERIOD ALIVE STATUS (C37, C42, D10): the heartbeat loop.
 # It refreshes the beat once per period with run's pid and the pin run took, and
