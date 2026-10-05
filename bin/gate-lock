@@ -2239,32 +2239,24 @@ run_stop_helper() {
         continue
       fi
       run_stop_spin=0
-      # Clock check once per round, not on every spin. Two times run_stop_cap seconds
-      # bounds the cap-squared worst case while leaving loaded-host slack: the supervisor's
-      # own worst case is the grace plus thirteen, and 2 * (grace + 18) is well past that.
-      if [ -n "$run_stop_start" ]; then
-        if clock_now && [ "$((rs_now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then
-          run_stop_why="gave up after $((rs_now - run_stop_start)) seconds on helper $3"
-          break
-        fi
-      fi
       # $5, where there is one, is the file that helper rewrites as it goes, and a
       # change in it starts the busy budget again. It is what tells a helper that is
       # slow from one that is wedged: the two sides count the same wait in different
       # currencies - this one in seconds, the supervisor in passes of its own, and a
-      # pass takes more than a second whenever the host is loaded - so a supervisor
-      # that is still asking, still counting, still waiting out a refresh it will not
-      # cut short, is given up on by a clock alone at exactly the moment it was about
-      # to end that wait itself.
+      # pass takes more than a second whenever the host is loaded.
       #
-      # And it is bounded as well, or a helper that publishes progress without ever
-      # finishing - a supervisor bug, or a wedged loop behind a supervisor that counts
-      # forever - would hold this teardown for as long as it liked. So the resets are
-      # counted too, against the same budget: a helper has to be both silent and
-      # finished, or neither for more than run_stop_cap, and a run that cannot get that
-      # answer is ended rather than waited for. The supervisor's own worst case is the
-      # grace plus thirteen (see run_stop_cap), so thirteen-plus does not come close to
-      # the cap and the counting supervisor is never given up on.
+      # Progress is checked before the elapsed-time ceiling below: a helper that is
+      # still publishing progress must not be given up on by the clock in the same
+      # round it just advanced, which on a loaded host can fire before the reset
+      # cap that bounds it. The `continue` here skips the elapsed ceiling for this
+      # round, so only the reset cap - not the clock - ends a progress-publishing
+      # helper. A helper that is silent (or has no progress marker) falls through to
+      # the ceiling below, and a wedge that publishes nothing is ended by that
+      # ceiling alone. The reset cap and the busy cap each bound the same wait, and
+      # a run that cannot get that answer is ended rather than waited for. The
+      # supervisor's own worst case is the grace plus thirteen (see run_stop_cap),
+      # so thirteen-plus does not come close to the cap and the counting supervisor
+      # is never given up on.
       if [ -n "${5:-}" ]; then
         run_stop_now=
         {
@@ -2279,6 +2271,22 @@ run_stop_helper() {
           fi
           run_stop_busy=0
           continue
+        fi
+      fi
+      # An absolute elapsed-time ceiling on the whole wait, checked only when no
+      # progress was seen this round. The reset cap and the busy cap are each
+      # run_stop_cap seconds, but a progress file that keeps changing resets the
+      # busy counter - so without a clock-bound the worst case is cap squared.
+      # The ceiling is twice run_stop_cap: generous enough that a loaded host
+      # inside its grace-plus-13 passes is never cut short by the clock, tight
+      # enough to still kill the cap-squared case. The clock is read once per
+      # round (after the spin), not on every spin, and never fatal: a clock
+      # failure in teardown would skip the release, so a failed read just
+      # postpones the ceiling check for that round.
+      if [ -n "$run_stop_start" ]; then
+        if clock_now && [ "$((rs_now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then
+          run_stop_why="gave up after $((rs_now - run_stop_start)) seconds on helper $3"
+          break
         fi
       fi
       # A refresh of the helper's own is in flight: it is busy, not wedged, and
