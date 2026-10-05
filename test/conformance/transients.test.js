@@ -18,6 +18,7 @@ describe('F20-F23 transient names', () => {
     const pool = freshPool();
     const now = nowS();
     const dead = deadPid();
+    // Slot 0 is within the configured count.
     writeSlot(pool, 'gate.lock', {
       owner: 'holder',
       pid: dead,
@@ -26,14 +27,24 @@ describe('F20-F23 transient names', () => {
       worktree: '/x',
       project: 'x',
     });
+    // Slot 1 is beyond the configured count of 1, but status must still list it.
+    writeSlot(pool, 'gate.lock.1', {
+      owner: 'beyond',
+      pid: dead,
+      started: now,
+      beat: now,
+      worktree: '/y',
+      project: 'y',
+    });
     // Transients that must not appear in status.
     writeTransient(pool, 'gate.lock.cand.12345');
     writeTransient(pool, 'gate.lock.beatnew.12345');
     writeTransient(pool, 'gate.lock.reclaim.12345.1');
     writeTransient(pool, '.format.tmp.12345');
-    const r = runCli(['status'], { env: lockEnv(pool), cwd: wtDir(pool) });
+    const r = runCli(['status'], { env: { ...lockEnv(pool), GATE_LOCK_SLOTS: '1' }, cwd: wtDir(pool) });
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('gate.lock held by holder');
+    expect(r.stdout).toContain('gate.lock.1 held by beyond');
     expect(r.stdout).not.toContain('cand');
     expect(r.stdout).not.toContain('beatnew');
     expect(r.stdout).not.toContain('reclaim');
