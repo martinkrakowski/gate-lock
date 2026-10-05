@@ -1131,10 +1131,10 @@ describe('D10 a loop that keeps dying', () => {
     // `run`'s wait cannot tell from progress. A short grace keeps the cap it is held to
     // small enough to wait for - the cap is the grace plus eighteen, so twenty-one of
     // anything here with grace 3. The grace is raised from 2 to 3 to add margin against
-    // a loaded host: the reset cap and the elapsed-time ceiling in run_stop_helper are
-    // both run_stop_cap seconds, but the elapsed-time ceiling is twice run_stop_cap,
-    // so a host under load that takes longer per pass can make the two bounds race. The
-    // reset cap fires first on a normal host, and the trace below asserts it exactly.
+    // a loaded host: the reset cap is run_stop_cap seconds (grace+18 = 21 with
+    // grace 3), while the elapsed-time ceiling is twice that (42). A host under
+    // load that takes longer per pass can make the two bounds race: the reset cap
+    // fires first on a normal host, and the trace below asserts it exactly.
     const stuck = path.join(tmpRoot, 'sup-progress');
     fs.writeFileSync(stuck, 'counting\n');
     const block = blocker(pool);
