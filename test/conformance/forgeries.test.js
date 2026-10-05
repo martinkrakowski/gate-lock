@@ -2,35 +2,61 @@
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshPool, lockEnv, nowS, runCli, writeSlot, wtDir } from './helpers.js';
+import { freshPool, livePid, lockEnv, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 const TM = { GATE_LOCK_TEST_MODE: '1' };
 
 describe('F57-F61 forged and foreign slots', () => {
-  it('T59 non-canonical names (.0, .007) carrying a real holder are invisible to status', () => {
+  it('T59 non-canonical names (.0, .007) carrying a real holder are invisible to status; an unpinned heartbeat moves only the real slot', () => {
     const pool = freshPool();
+    const pid = livePid();
     const now = nowS();
-    writeSlot(pool, 'gate.lock.1', {
+    const oldBeat = now - 700;
+    // Real holder at canonical slot 1, with a stale beat so the heartbeat will move it.
+    const realDir = writeSlot(pool, 'gate.lock.1', {
       owner: 'real',
-      pid: 999990,
-      started: now,
-      beat: now,
+      pid,
+      started: now - 700,
+      beat: oldBeat,
       worktree: '/wt',
       project: 'wt',
     });
-    // Non-canonical name carrying the same owner/pid: must not be read as a slot.
-    writeSlot(pool, 'gate.lock.1.cand.42', {
-      owner: 'real',
-      pid: 999990,
-      started: now,
-      beat: now,
-      worktree: '/wt',
-      project: 'wt',
-    });
+    // Non-canonical names carrying the same owner/pid: must not be read as slots (F19).
+    const planted = ['gate.lock.0', 'gate.lock.007'];
+    for (const name of planted) {
+      writeSlot(pool, name, {
+        owner: 'real',
+        pid,
+        started: now - 700,
+        beat: oldBeat,
+        worktree: '/wt',
+        project: 'wt',
+      });
+    }
     const r = runCli(['status'], { env: { ...lockEnv(pool), ...TM }, cwd: wtDir(pool) });
     expect(r.status).toBe(0);
+    // Only the canonical name shows up as held.
     expect(r.stdout).toContain('gate.lock.1 held by real');
-    expect(r.stdout).not.toMatch(/gate\.lock\.1\.cand/);
+    expect(r.stdout).not.toMatch(/gate\.lock\.0/);
+    expect(r.stdout).not.toMatch(/gate\.lock\.007/);
+    // Unpinned heartbeat moves only the real slot's beat, not the plants'.
+    const beatBefore = fs.readFileSync(`${path.join(pool, 'gate.lock.1', 'beat')}`, 'utf8');
+    expect(beatBefore, 'real beat is the seeded old value').toBe(`${oldBeat}\n`);
+
+    const hb = runCli(['heartbeat'], {
+      env: { ...lockEnv(pool, TM), GATE_LOCK_CALLER_PID: String(pid) },
+      cwd: wtDir(pool, 'wt0'),
+    });
+    expect(hb.status).toBe(0);
+    // The real slot's beat moved past the seeded value.
+    const beatAfter = fs.readFileSync(`${realDir}/beat`, 'utf8');
+    expect(beatAfter, 'beat moved').not.toBe(beatBefore);
+    // The planted directories' beats are untouched.
+    for (const dir of planted) {
+      expect(fs.readFileSync(`${path.join(pool, dir, 'beat')}`, 'utf8'), 'plant beat').toBe(
+        beatBefore,
+      );
+    }
   });
 
   it('T60 a symlink at a canonical name is invisible to status', () => {
@@ -108,7 +134,9 @@ describe('F57-F61 forged and foreign slots', () => {
     });
     expect(r.status).toBe(2);
     expect(r.stderr).toMatch(/is not a valid slot/);
-    expect(fs.existsSync(path.join(pool, 'gate.lock', 'owner'))).toBe(false);
+    // The symlink is left in place (still a symlink), and the target's slot is untouched.
+    expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(path.join(target, 'gate.lock', 'owner'), 'utf8')).toBe('holder\n');
     expect(fs.existsSync(target)).toBe(true);
   });
 });

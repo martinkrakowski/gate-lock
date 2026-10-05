@@ -1068,7 +1068,7 @@ describe('D10 a loop that keeps dying', () => {
     expect(stopped(heartbeat), 'a heartbeat outlived the supervisor that owned it').toBe(true);
     expect(stopped(loop), 'a loop outlived the supervisor that owned it').toBe(true);
     await untilGone(block.pid(), 20000);
-    expect(stopped(block.pid()), 'the command outlived a run that was KILed').toBe(true);
+    expect(stopped(block.pid()), 'the command outlived a run that was KILLed').toBe(true);
     expect(traceText(trace), traceText(trace)).toMatch(/stopping command \d+: run \d+ is gone/);
     hook.release();
   }, 150_000);
@@ -1131,12 +1131,10 @@ describe('D10 a loop that keeps dying', () => {
     // `run`'s wait cannot tell from progress. A short grace keeps the cap it is held to
     // small enough to wait for - the cap is the grace plus eighteen, so twenty-one of
     // anything here with grace 3. The grace is raised from 2 to 3 to add margin against
-    // a loaded host: the reset cap and the elapsed-time ceiling I added in run_stop_helper
-    // are both run_stop_cap seconds, but a host under load takes longer per pass, so the
-    // two bounds can race and the trace below must accept either. The elapsed-time
-    // ceiling is the handshake that says "no matter how slow the progress writes are,
-    // this wait ends": the test accepts either the reset cap's message or the time
-    // ceiling's, so a slow host flipping one for the other does not fail the test.
+    // a loaded host: the reset cap and the elapsed-time ceiling in run_stop_helper are
+    // both run_stop_cap seconds, but the elapsed-time ceiling is twice run_stop_cap,
+    // so a host under load that takes longer per pass can make the two bounds race. The
+    // reset cap fires first on a normal host, and the trace below asserts it exactly.
     const stuck = path.join(tmpRoot, 'sup-progress');
     fs.writeFileSync(stuck, 'counting\n');
     const block = blocker(pool);

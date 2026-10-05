@@ -1,37 +1,38 @@
 // F24-F42: slot files, heartbeat cadence, liveness. Fixtures are written directly per §2.
 import { describe, expect, it } from 'vitest';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { freshPool, livePid, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 describe('F24-F29 six-file slot', () => {
-  it('T2 the six files written per §2 are read back byte for byte', () => {
+  it('T2 the six files per §2 are written by the CLI after a successful acquire', () => {
     const pool = freshPool();
-    const pid = livePid();
-    const now = nowS();
-    const dir = writeSlot(pool, 'gate.lock', {
-      owner: 'mylane',
-      pid,
-      started: now,
-      beat: now,
-      worktree: '/work/tree',
-      project: 'tree',
-    });
-    const r = runCli(['status'], { env: lockEnv(pool), cwd: wtDir(pool) });
-    expect(r.status).toBe(0);
-    expect(r.stdout).toContain('held by mylane');
-    expect(r.stdout).toContain('project tree');
-    expect(r.stdout).toContain('pid ' + pid + ' alive');
-    const files = names(dir);
-    expect(files).toEqual(['beat', 'owner', 'pid', 'project', 'started', 'worktree']);
-    for (const [f, expected] of [
-      ['owner', 'mylane'],
-      ['pid', String(pid)],
-      ['started', String(now)],
-      ['beat', String(now)],
-      ['worktree', '/work/tree'],
-      ['project', 'tree'],
-    ]) {
-      expect(fs.readFileSync(`${dir}/${f}`, 'utf8')).toBe(`${expected}\n`);
+    const child = spawn('sleep', ['600'], { stdio: 'ignore' });
+    try {
+      const r = runCli(['acquire', 'mylane'], {
+        env: { ...lockEnv(pool), GATE_LOCK_CALLER_PID: String(child.pid) },
+        cwd: wtDir(pool, 'wt0'),
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('acquired by mylane');
+      expect(r.stdout).toContain(`at ${pool}/gate.lock`);
+      const dir = `${pool}/gate.lock`;
+      const files = names(dir);
+      expect(files).toEqual(['beat', 'owner', 'pid', 'project', 'started', 'worktree']);
+      for (const f of files) {
+        const mode = (fs.statSync(`${dir}/${f}`).mode & 0o7777).toString(8).padStart(4, '0');
+        expect(mode, `${f} mode`).toBe('0600');
+      }
+      expect(fs.readFileSync(`${dir}/owner`, 'utf8')).toBe('mylane\n');
+      expect(fs.readFileSync(`${dir}/pid`, 'utf8')).toBe(`${child.pid}\n`);
+      const dirMode = (fs.statSync(dir).mode & 0o7777).toString(8).padStart(4, '0');
+      expect(dirMode).toBe('0700');
+      for (const f of names(dir)) {
+        const mode = (fs.statSync(`${dir}/${f}`).mode & 0o7777).toString(8).padStart(4, '0');
+        expect(mode, `${f} mode`).toBe('0600');
+      }
+    } finally {
+      child.kill('SIGKILL');
     }
   });
 });
@@ -147,23 +148,35 @@ describe('F40-F42 liveness', () => {
   });
 });
 
-describe('F24-F32 slot directory listing', () => {
-  it('T2 acquire creates exactly the six files with mode 0600 and the slot dir 0700', () => {
+describe('F33 busy refusal leaves the holder untouched', () => {
+  it('T5 a busy acquire leaves the holder slot byte-for-byte as found', () => {
     const pool = freshPool();
-    const caller = livePid();
-    const r = runCli(['acquire', 'lane'], {
-      env: { ...lockEnv(pool), GATE_LOCK_CALLER_PID: String(caller) },
-      cwd: wtDir(pool, 'wt0'),
+    const pid = livePid();
+    const now = nowS();
+    const dir = writeSlot(pool, 'gate.lock', {
+      owner: 'holder',
+      pid,
+      started: now,
+      beat: now,
+      worktree: '/wt',
+      project: 'wt',
     });
-    expect(r.status).toBe(0);
-    expect(r.stdout).toContain('acquired by lane');
-    const slotDir = `${pool}/gate.lock`;
-    expect(names(slotDir)).toEqual(['beat', 'owner', 'pid', 'project', 'started', 'worktree']);
-    for (const f of ['beat', 'owner', 'pid', 'project', 'started', 'worktree']) {
-      const mode = (fs.statSync(`${slotDir}/${f}`).mode & 0o7777).toString(8).padStart(4, '0');
-      expect(mode, `${f} mode`).toBe('0600');
+    // Snapshot every file's bytes before the busy acquire.
+    const snapshot = {};
+    for (const f of ['owner', 'pid', 'started', 'beat', 'worktree', 'project']) {
+      snapshot[f] = fs.readFileSync(`${dir}/${f}`);
     }
-    const dirMode = (fs.statSync(slotDir).mode & 0o7777).toString(8).padStart(4, '0');
-    expect(dirMode).toBe('0700');
+    const snapshotNames = names(dir);
+    const r = runCli(['acquire', 'newlane'], {
+      env: { ...lockEnv(pool), GATE_LOCK_CALLER_PID: String(livePid()) },
+      cwd: wtDir(pool, 'wt1'),
+    });
+    expect(r.status).toBe(75);
+    expect(r.stderr).toMatch(/busy/);
+    // F33: the holder's directory contents are unchanged in name and bytes.
+    expect(names(dir)).toEqual(snapshotNames);
+    for (const [f, expected] of Object.entries(snapshot)) {
+      expect(fs.readFileSync(`${dir}/${f}`), `${f} was modified`).toEqual(expected);
+    }
   });
 });

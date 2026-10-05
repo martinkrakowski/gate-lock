@@ -38,13 +38,31 @@ describe('F20-F23 transient names', () => {
     expect(r.stdout).not.toContain('format.tmp');
   });
 
-  it('F19 a transient at a canonical-looking name (.0, .64, .100) is not a slot name', () => {
+  it('F19 non-canonical names (.0, .007, .64, .100) are not slot names', () => {
     const pool = freshPool();
-    // These are not slots: they do not match F19's name rule. Status shows free.
-    writeTransient(pool, 'gate.lock.1.cand.1');
+    const now = nowS();
+    // Plant directories at each name from F19: they carry a real holder's owner
+    // and pid and sort before slot 1, but must not be read as slots.
+    for (const name of ['gate.lock.0', 'gate.lock.007', 'gate.lock.64', 'gate.lock.100']) {
+      writeSlot(pool, name, {
+        owner: 'planter',
+        pid: 999980,
+        started: now,
+        beat: now,
+        worktree: '/x',
+        project: 'x',
+      });
+    }
+    // Also plant a transient at one of the names to make sure the F21 transient
+    // filter is what keeps it out, not the name filter.
+    writeTransient(pool, 'gate.lock.0.cand.1');
     const r = runCli(['status'], { env: lockEnv(pool), cwd: wtDir(pool) });
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('free:');
+    expect(r.stdout).not.toMatch(/gate\.lock\.0/);
+    expect(r.stdout).not.toMatch(/gate\.lock\.007/);
+    expect(r.stdout).not.toMatch(/gate\.lock\.64\b/);
+    expect(r.stdout).not.toMatch(/gate\.lock\.100/);
   });
 
   it('D16 clean removes a stale transient whose creator pid is dead and is older than the threshold', () => {

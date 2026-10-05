@@ -187,31 +187,6 @@ export function setAge(target, seconds) {
   fs.utimesSync(target, when, when);
 }
 
-export function listing(root, { modes = true } = {}) {
-  const entries = [];
-  const walk = (dir, prefix) => {
-    for (const entry of fs.readdirSync(dir)) {
-      const full = path.join(dir, entry);
-      const rel = prefix ? `${prefix}/${entry}` : entry;
-      const st = fs.lstatSync(full);
-      const perms = (st.mode & 0o7777).toString(8).padStart(4, '0');
-      let text = rel;
-      let head = perms;
-      if (st.isSymbolicLink()) {
-        text = `${rel} -> ${fs.readlinkSync(full)}`;
-        head = `l${perms}`;
-      } else if (st.isDirectory()) {
-        text = `${rel}/`;
-      }
-      entries.push({ key: rel, line: modes ? `${head} ${text}` : text });
-      if (st.isDirectory() && !st.isSymbolicLink()) walk(full, rel);
-    }
-  };
-  walk(root, '');
-  entries.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-  return entries.map((e) => e.line);
-}
-
 export function readFile(pool, rel) {
   return fs.readFileSync(path.join(pool, rel), 'utf8');
 }
@@ -231,16 +206,6 @@ export function nowS() {
 export function livePid() {
   const child = spawn('sleep', ['600'], { stdio: 'ignore' });
   children.push(child);
-  afterEach(() => {
-    while (children.length > 0) {
-      const c = children.pop();
-      try {
-        c.kill('SIGKILL');
-      } catch {
-        /* already gone */
-      }
-    }
-  });
   return child.pid;
 }
 

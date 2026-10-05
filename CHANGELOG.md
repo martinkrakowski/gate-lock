@@ -88,6 +88,5 @@ format 1, and a wrapper that holds a slot around one command.
   incomplete slot at a canonical name. This client behaved correctly
   throughout, and the defect was reported to that client's maintainers.
 
-## [Unreleased]: https://github.com/martinkrakowski/gate-lock/compare/v0.1.0...HEAD
-
-## [0.1.0]: https://github.com/martinkrakowski/gate-lock/releases/tag/v0.1.0
+[Unreleased]: https://github.com/martinkrakowski/gate-lock/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/martinkrakowski/gate-lock/releases/tag/v0.1.0

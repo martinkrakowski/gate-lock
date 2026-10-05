@@ -2916,10 +2916,10 @@ run_beat_loop() {
       rm -f "$rb_stop"
       exit 0
     fi
-     # The inflight marker is published without touching(1): a redirect on a group is
+     # The inflight marker is published without touching(1): a redirect on a command is
      # a builtin, and in dash `touch` is an external command that forks on every
-     # refresh (production). The redirect must be on the group, not on the bare
-     # printf, so the shell itself owns the file-open failure and it stays silent.
+     # refresh (production). Only the `2>/dev/null` is on the group, so a file-open
+     # failure is silent; the `>"$rb_inflight"` is on the printf, which is what creates it.
      { printf '' >"$rb_inflight"; } 2>/dev/null || true
     trace "loop $$ refreshing $rb_slot, inflight published"
     # The child's answer is captured rather than read straight off the caller's
