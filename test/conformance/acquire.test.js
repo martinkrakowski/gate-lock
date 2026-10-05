@@ -90,19 +90,23 @@ describe('F43-F51 reclaim rules', () => {
     const pool = freshPool();
     const now = nowS();
     const dead = deadPid();
+    // Create the caller's worktree first so its resolved path can be used as
+    // the holder's worktree: same-worktree identity must match to isolate the
+    // reclaim rule, not a different path.
+    const callerWd = wtDir(pool, 'wd');
     writeSlot(pool, 'gate.lock.1', {
       owner: 'deadholder',
       pid: dead,
-      started: now - 700,
-      beat: now - 700,
-      worktree: '/work',
+      started: now,
+      beat: now,
+      worktree: callerWd,
       project: 'work',
     });
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     try {
       const r = runCli(['acquire', 'newlane'], {
         env: { ...lockEnv(pool), GATE_LOCK_CALLER_PID: String(child.pid), GATE_LOCK_SLOTS: '2' },
-        cwd: wtDir(pool, 'wd'),
+        cwd: callerWd,
       });
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('acquired by newlane');
