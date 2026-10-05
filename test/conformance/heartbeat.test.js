@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { freshPool, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
+import { freshPool, deadPid, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 describe('C17-C19 heartbeat', () => {
   it('T17 heartbeat moves the beat past the seeded value (1000), exit 0, silent', () => {
@@ -37,9 +37,10 @@ describe('C17-C19 heartbeat', () => {
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     try {
       const seeded = nowS();
+      const dead = deadPid();
       writeSlot(pool, 'gate.lock', {
         owner: 'lane',
-        pid: 999994,
+        pid: dead,
         started: seeded,
         beat: seeded,
         worktree: '/wt',
@@ -105,9 +106,10 @@ describe('C18-C19 verify', () => {
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     try {
       const seeded = nowS();
+      const dead = deadPid();
       writeSlot(pool, 'gate.lock', {
         owner: 'lane',
-        pid: 999993,
+        pid: dead,
         started: seeded,
         beat: seeded,
         worktree: '/wt',
@@ -165,9 +167,10 @@ describe('C13-C17 release', () => {
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     try {
       const now = nowS();
+      const dead = deadPid();
       writeSlot(pool, 'gate.lock', {
         owner: 'lane',
-        pid: 999992,
+        pid: dead,
         started: now,
         beat: now,
         worktree: '/wt',

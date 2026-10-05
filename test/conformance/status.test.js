@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { freshPool, lockEnv, nowS, runCli, writeRaw, writeSlot, wtDir } from './helpers.js';
+import { freshPool, deadPid, lockEnv, nowS, runCli, writeRaw, writeSlot, wtDir } from './helpers.js';
 
 describe('C25-C27 status', () => {
   it('T19 status on an empty host exits 0 and says "free"', () => {
@@ -57,12 +57,13 @@ describe('C25-C27 status', () => {
     }
   });
 
-  it('T19 status with a dead holder says "not alive"', () => {
+   it('T19 status with a dead holder says "not alive"', () => {
     const pool = freshPool();
     const now = nowS();
+    const dead = deadPid();
     writeSlot(pool, 'gate.lock', {
       owner: 'deadone',
-      pid: 999991,
+      pid: dead,
       started: now,
       beat: now,
       worktree: '/wt',
@@ -70,7 +71,7 @@ describe('C25-C27 status', () => {
     });
     const r = runCli(['status'], { env: lockEnv(pool), cwd: wtDir(pool) });
     expect(r.status).toBe(0);
-    expect(r.stdout).toContain('pid 999991 not alive');
+    expect(r.stdout).toContain(`pid ${dead} not alive`);
   });
 });
 

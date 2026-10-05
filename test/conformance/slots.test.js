@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { freshPool, livePid, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
+import { freshPool, deadPid, livePid, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 describe('F24-F29 six-file slot', () => {
   it('T2 the six files per §2 are written by the CLI after a successful acquire', () => {
@@ -37,12 +37,13 @@ describe('F30 four-file compatibility slot', () => {
   it('T57 a four-file slot (no worktree/project) is valid and never blocks a same-worktree acquirer', () => {
     const pool = freshPool();
     const now = nowS();
+    const dead = deadPid();
     const dir = writeSlot(
       pool,
       'gate.lock',
       {
         owner: 'old',
-        pid: 999999,
+        pid: dead,
         started: now,
         beat: now,
       },
@@ -105,9 +106,10 @@ describe('F40-F42 liveness', () => {
   it('T6 a dead pid is reclaimed: exit 0, stdout contains "reclaiming" and "not alive"', () => {
     const pool = freshPool();
     const now = nowS();
+    const dead = deadPid();
     writeSlot(pool, 'gate.lock', {
       owner: 'deadholder',
-      pid: 999998,
+      pid: dead,
       started: now - 100,
       beat: now - 100,
       worktree: '/somewhere',

@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   freshPool,
+  deadPid,
   lockEnv,
   names,
   nowS,
@@ -16,9 +17,10 @@ describe('F20-F23 transient names', () => {
   it('T48 status lists slots (including beyond count) and never lists transients', () => {
     const pool = freshPool();
     const now = nowS();
+    const dead = deadPid();
     writeSlot(pool, 'gate.lock', {
       owner: 'holder',
-      pid: 999997,
+      pid: dead,
       started: now,
       beat: now,
       worktree: '/x',
@@ -41,12 +43,13 @@ describe('F20-F23 transient names', () => {
   it('F19 non-canonical names (.0, .007, .64, .100) are not slot names', () => {
     const pool = freshPool();
     const now = nowS();
+    const dead = deadPid();
     // Plant directories at each name from F19: they carry a real holder's owner
     // and pid and sort before slot 1, but must not be read as slots.
     for (const name of ['gate.lock.0', 'gate.lock.007', 'gate.lock.64', 'gate.lock.100']) {
       writeSlot(pool, name, {
         owner: 'planter',
-        pid: 999980,
+        pid: dead,
         started: now,
         beat: now,
         worktree: '/x',
@@ -65,16 +68,17 @@ describe('F20-F23 transient names', () => {
     expect(r.stdout).not.toMatch(/gate\.lock\.100/);
   });
 
-  it('D16 clean removes a stale transient whose creator pid is dead and is older than the threshold', () => {
+   it('D16 clean removes a stale transient whose creator pid is dead and is older than the threshold', () => {
     const pool = freshPool();
-    const t = writeTransient(pool, 'gate.lock.cand.999999');
+    const creator = deadPid();
+    const t = writeTransient(pool, `gate.lock.cand.${creator}`);
     setAge(t, 700);
     const r = runCli(['clean'], {
       env: { ...lockEnv(pool), GATE_LOCK_STALE_SECONDS: '600' },
       cwd: wtDir(pool),
     });
     expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/janitor: removed gate.lock.cand.999999/);
+    expect(r.stdout).toMatch(new RegExp(`janitor: removed gate\\.lock\\.cand\\.${creator}`));
     expect(names(pool)).toEqual(['.format']);
   });
 });

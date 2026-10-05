@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import { freshPool, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
+import { freshPool, deadPid, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 describe('C6-C12 acquire', () => {
   it('T3 acquire with no caller pid is refused (exit 2), stderr names the variable, nothing created', () => {
@@ -38,9 +38,10 @@ describe('C6-C12 acquire', () => {
   it('T6 a dead pid is reclaimed: exit 0, stdout contains "reclaiming" and "not alive"', () => {
     const pool = freshPool();
     const now = nowS();
+    const dead = deadPid();
     writeSlot(pool, 'gate.lock', {
       owner: 'deadholder',
-      pid: 999996,
+      pid: dead,
       started: now - 600,
       beat: now - 600,
       worktree: '/old',
@@ -88,9 +89,10 @@ describe('F43-F51 reclaim rules', () => {
   it('T54 a dead same-worktree holder in slot 1 does not block an acquire into slot 0', () => {
     const pool = freshPool();
     const now = nowS();
+    const dead = deadPid();
     writeSlot(pool, 'gate.lock.1', {
       owner: 'deadholder',
-      pid: 999995,
+      pid: dead,
       started: now - 700,
       beat: now - 700,
       worktree: '/work',
