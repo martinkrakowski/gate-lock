@@ -2211,7 +2211,11 @@ run_stop_helper() {
     # never fatal: a clock failure in teardown would skip the release, so a failed read
     # just postpones the ceiling check for that round.
     run_stop_start=
-    now_s 2>/dev/null && run_stop_start=$now || true
+    # The clock is read the same way now_s does, but never fatal: a failed read
+    # leaves run_stop_start empty and the ceiling check is skipped.
+    seam GATE_LOCK_TEST_NOW
+    run_stop_start=${seam_value:-$(date +%s 2>/dev/null)}
+    is_digits "$run_stop_start" || run_stop_start=
     while [ -e "$1" ] && [ ! -e "$2" ]; do
       run_stop_spin=$((run_stop_spin + 1))
       if [ "$run_stop_spin" -lt 200 ]; then
@@ -2222,9 +2226,11 @@ run_stop_helper() {
       # bounds the cap-squared worst case while leaving loaded-host slack: the supervisor's
       # own worst case is the grace plus thirteen, and 2 * (grace + 18) is well past that.
       if [ -n "$run_stop_start" ]; then
-        now_s 2>/dev/null || true
-        if [ -n "$now" ] && [ "$((now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then
-          run_stop_why="gave up after $((now - run_stop_start)) seconds on helper $3"
+        seam GATE_LOCK_TEST_NOW
+        rs_now=${seam_value:-$(date +%s 2>/dev/null)}
+        is_digits "$rs_now" || rs_now=
+        if [ -n "$rs_now" ] && [ "$((rs_now - run_stop_start))" -ge "$((run_stop_cap * 2))" ]; then
+          run_stop_why="gave up after $((rs_now - run_stop_start)) seconds on helper $3"
           break
         fi
       fi
