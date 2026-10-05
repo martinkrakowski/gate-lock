@@ -2,15 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import {
-  freshPool,
-  lockEnv,
-  names,
-  nowS,
-  runCli,
-  writeSlot,
-  wtDir,
-} from './helpers.js';
+import { freshPool, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 describe('C6-C12 acquire', () => {
   it('T3 acquire with no caller pid is refused (exit 2), stderr names the variable, nothing created', () => {

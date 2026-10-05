@@ -1,19 +1,7 @@
 // F24-F42: slot files, heartbeat cadence, liveness. Fixtures are written directly per §2.
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
-import {
-  freshPool,
-  listing,
-  livePid,
-  lockEnv,
-  names,
-  nowS,
-  runCli,
-  writeFormat,
-  writeRaw,
-  writeSlot,
-  wtDir,
-} from './helpers.js';
+import { freshPool, livePid, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 describe('F24-F29 six-file slot', () => {
   it('T2 the six files written per §2 are read back byte for byte', () => {
@@ -52,12 +40,17 @@ describe('F30 four-file compatibility slot', () => {
   it('T57 a four-file slot (no worktree/project) is valid and never blocks a same-worktree acquirer', () => {
     const pool = freshPool();
     const now = nowS();
-    const dir = writeSlot(pool, 'gate.lock', {
-      owner: 'old',
-      pid: 999999,
-      started: now,
-      beat: now,
-    }, { files: 4 });
+    const dir = writeSlot(
+      pool,
+      'gate.lock',
+      {
+        owner: 'old',
+        pid: 999999,
+        started: now,
+        beat: now,
+      },
+      { files: 4 },
+    );
     const r = runCli(['status'], { env: lockEnv(pool), cwd: wtDir(pool) });
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('held by old');
@@ -99,7 +92,11 @@ describe('F34-F38 heartbeat freshness and stale threshold', () => {
       project: 'somewhere',
     });
     const r2 = runCli(['acquire', 'newlane'], {
-      env: { ...lockEnv(pool2), GATE_LOCK_CALLER_PID: String(livePid()), GATE_LOCK_STALE_SECONDS: '3600' },
+      env: {
+        ...lockEnv(pool2),
+        GATE_LOCK_CALLER_PID: String(livePid()),
+        GATE_LOCK_STALE_SECONDS: '3600',
+      },
       cwd: wtDir(pool2, 'wt2'),
     });
     expect(r2.status).toBe(75);

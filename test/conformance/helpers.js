@@ -103,7 +103,9 @@ afterEach(() => {
     const child = children.pop();
     try {
       child.kill('SIGKILL');
-    } catch {}
+    } catch {
+      /* already gone */
+    }
   }
 });
 
@@ -234,7 +236,9 @@ export function livePid() {
       const c = children.pop();
       try {
         c.kill('SIGKILL');
-      } catch {}
+      } catch {
+        /* already gone */
+      }
     }
   });
   return child.pid;

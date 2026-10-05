@@ -1,6 +1,5 @@
 // F20-F23, D16: transient names and the janitor. Fixtures are written directly per §2.
 import { describe, expect, it } from 'vitest';
-import fs from 'node:fs';
 import {
   freshPool,
   lockEnv,
@@ -52,7 +51,10 @@ describe('F20-F23 transient names', () => {
     const pool = freshPool();
     const t = writeTransient(pool, 'gate.lock.cand.999999');
     setAge(t, 700);
-    const r = runCli(['clean'], { env: { ...lockEnv(pool), GATE_LOCK_STALE_SECONDS: '600' }, cwd: wtDir(pool) });
+    const r = runCli(['clean'], {
+      env: { ...lockEnv(pool), GATE_LOCK_STALE_SECONDS: '600' },
+      cwd: wtDir(pool),
+    });
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/janitor: removed gate.lock.cand.999999/);
     expect(names(pool)).toEqual(['.format']);

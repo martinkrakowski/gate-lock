@@ -86,7 +86,8 @@ format 1, and a wrapper that holds a slot around one command.
   found a §2.4 defect on the other client's side: it removes a slot in place
   rather than renaming it aside first, so a watcher can briefly see an
   incomplete slot at a canonical name. This client behaved correctly
-   throughout, and the defect was reported to that client's maintainers.
+  throughout, and the defect was reported to that client's maintainers.
 
 ## [Unreleased]: https://github.com/martinkrakowski/gate-lock/compare/v0.1.0...HEAD
+
 ## [0.1.0]: https://github.com/martinkrakowski/gate-lock/releases/tag/v0.1.0

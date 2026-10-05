@@ -2,15 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import {
-  freshPool,
-  lockEnv,
-  nowS,
-  runCli,
-  writeRaw,
-  writeSlot,
-  wtDir,
-} from './helpers.js';
+import { freshPool, lockEnv, nowS, runCli, writeRaw, writeSlot, wtDir } from './helpers.js';
 
 describe('C25-C27 status', () => {
   it('T19 status on an empty host exits 0 and says "free"', () => {
@@ -148,7 +140,3 @@ describe('T70-T72 format marker via CLI', () => {
     expect(r.stderr).toMatch(/lock format/);
   });
 });
-
-function names(dir) {
-  return fs.readdirSync(dir).sort();
-}

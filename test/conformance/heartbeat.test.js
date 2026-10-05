@@ -2,22 +2,13 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import {
-  freshPool,
-  lockEnv,
-  names,
-  nowS,
-  runCli,
-  writeSlot,
-  wtDir,
-} from './helpers.js';
+import { freshPool, lockEnv, names, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 describe('C17-C19 heartbeat', () => {
   it('T17 heartbeat moves the beat past the seeded value (1000), exit 0, silent', () => {
     const pool = freshPool();
     const child = spawn('sleep', ['600'], { stdio: 'ignore' });
     try {
-      const now = nowS();
       writeSlot(pool, 'gate.lock', {
         owner: 'lane',
         pid: child.pid,

@@ -2,14 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import {
-  freshPool,
-  lockEnv,
-  nowS,
-  runCli,
-  writeSlot,
-  wtDir,
-} from './helpers.js';
+import { freshPool, lockEnv, nowS, runCli, writeSlot, wtDir } from './helpers.js';
 
 const TM = { GATE_LOCK_TEST_MODE: '1' };
 
@@ -65,14 +58,19 @@ describe('F57-F61 forged and foreign slots', () => {
   it('T61 a slot owned by a different uid is invisible (uid seam)', () => {
     const pool = freshPool();
     const now = nowS();
-    writeSlot(pool, 'gate.lock', {
-      owner: 'foreigner',
-      pid: 999988,
-      started: now,
-      beat: now,
-      worktree: '/wt',
-      project: 'wt',
-    }, { dirMode: 0o755, fileMode: 0o644 });
+    writeSlot(
+      pool,
+      'gate.lock',
+      {
+        owner: 'foreigner',
+        pid: 999988,
+        started: now,
+        beat: now,
+        worktree: '/wt',
+        project: 'wt',
+      },
+      { dirMode: 0o755, fileMode: 0o644 },
+    );
     // With the uid seam naming a foreign uid, the slot is invisible.
     const r = runCli(['status'], {
       env: { ...lockEnv(pool, TM), GATE_LOCK_TEST_SLOT_UID: '65534' },

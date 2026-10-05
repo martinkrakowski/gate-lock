@@ -1,16 +1,7 @@
 // F11-F17: the .format marker. Fixtures are written directly per §2, never via the CLI.
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
-import {
-  freshPool,
-  listing,
-  lockEnv,
-  names,
-  runCli,
-  writeFormat,
-  writeRaw,
-  wtDir,
-} from './helpers.js';
+import { freshPool, lockEnv, names, runCli, writeRaw, writeFormat, wtDir } from './helpers.js';
 
 describe('F11 the .format marker', () => {
   it('T71 existing marker "1\\n" is accepted, stderr empty, bytes unchanged', () => {

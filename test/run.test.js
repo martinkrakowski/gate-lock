@@ -1061,17 +1061,17 @@ describe('D10 a loop that keeps dying', () => {
     // point is what would be left behind.
     gate.child.kill('SIGKILL');
     await untilTraced(() => /stops waiting for a quiet loop/.test(traceText(trace)), trace, 90000);
-     // The loop and the heartbeat under it are gone, and the command is stopped by the
-     // supervisor's tail - which cannot happen at all unless the loop was ended first.
-     await untilGone(heartbeat, 15000);
-     await untilGone(loop, 15000);
-     expect(stopped(heartbeat), 'a heartbeat outlived the supervisor that owned it').toBe(true);
-     expect(stopped(loop), 'a loop outlived the supervisor that owned it').toBe(true);
-     await untilGone(block.pid(), 20000);
-     expect(stopped(block.pid()), 'the command outlived a run that was KILed').toBe(true);
-     expect(traceText(trace), traceText(trace)).toMatch(/stopping command \d+: run \d+ is gone/);
-     hook.release();
-   }, 150_000);
+    // The loop and the heartbeat under it are gone, and the command is stopped by the
+    // supervisor's tail - which cannot happen at all unless the loop was ended first.
+    await untilGone(heartbeat, 15000);
+    await untilGone(loop, 15000);
+    expect(stopped(heartbeat), 'a heartbeat outlived the supervisor that owned it').toBe(true);
+    expect(stopped(loop), 'a loop outlived the supervisor that owned it').toBe(true);
+    await untilGone(block.pid(), 20000);
+    expect(stopped(block.pid()), 'the command outlived a run that was KILed').toBe(true);
+    expect(traceText(trace), traceText(trace)).toMatch(/stopping command \d+: run \d+ is gone/);
+    hook.release();
+  }, 150_000);
 
   it('D10 a loop KILLed with a heartbeat in flight leaves no pid behind for the next loop to signal', async () => {
     const pool = freshPool();
@@ -1171,11 +1171,13 @@ describe('D10 a loop that keeps dying', () => {
       await untilGone(gate.child.pid, 120000);
       expect(stopped(gate.child.pid), 'the run never finished').toBe(true);
       expect(stopped(supervisor), 'a supervisor that never ends outlived the run').toBe(true);
-       // Which bound ended it, in the trace: either the reset cap (progress published
-       // N times without finishing) or the elapsed-time ceiling I added (gave up after
-       // N seconds on helper). A slow host flips one for the other, so both are accepted.
-       expect(traceText(trace), traceText(trace)).toMatch(
-         new RegExp(`gives up on the helper ${supervisor}: (published \\d+ times without finishing|gave up after \\d+ seconds)`),
+      // Which bound ended it, in the trace: either the reset cap (progress published
+      // N times without finishing) or the elapsed-time ceiling I added (gave up after
+      // N seconds on helper). A slow host flips one for the other, so both are accepted.
+      expect(traceText(trace), traceText(trace)).toMatch(
+        new RegExp(
+          `gives up on the helper ${supervisor}: (published \\d+ times without finishing|gave up after \\d+ seconds)`,
+        ),
       );
     } finally {
       hook.release();
