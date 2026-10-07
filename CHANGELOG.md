@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The conformance suite in `test/conformance/`, a black-box suite that never
+writes fixtures through the CLI. Spec-exact helpers create 4-file and 6-file
+slots, `.format`, transients and planted forgeries byte for byte from section 2
+of the specification; the suite asserts the CLI's effects as golden directory
+listings and exact file bytes for `acquire`, `release`, `verify`, `heartbeat`,
+`status --json` and `clean`.
+
 ## [0.1.0] - 2026-10-04
 
 The first release: a host-wide gate lock with a shared pool of slots, on-disk
@@ -78,3 +87,6 @@ format 1, and a wrapper that holds a slot around one command.
   rather than renaming it aside first, so a watcher can briefly see an
   incomplete slot at a canonical name. This client behaved correctly
   throughout, and the defect was reported to that client's maintainers.
+
+[Unreleased]: https://github.com/martinkrakowski/gate-lock/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/martinkrakowski/gate-lock/releases/tag/v0.1.0

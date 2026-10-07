@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { scratchOf, waitForFile } from './harness.js';
-import { TM, names, readSlot, until } from './slots.js';
+import { TM, names, readSlot, until, deadPid } from './slots.js';
 import {
   beatPids,
   blocker,
@@ -23,6 +23,7 @@ import {
   runDirOf,
   startRun,
   stopHelpers,
+  stopRun,
   untilGone,
   stopped,
   track,
@@ -200,4 +201,32 @@ describe('D25 a helper does not outlive the run', () => {
       'the private directory outlived its run',
     ).toBe(false);
   }, 60_000);
+});
+
+describe('stopRun removes only the directory a run created', () => {
+  it('a leftover gate-lock-run.<pid> base is left alone when the run took gate-lock-run.<pid>.<k>', () => {
+    const pool = freshPool();
+    const tmpRoot = scratchOf(pool);
+    const pid = deadPid();
+    // Pre-create the base directory with a marker that must survive cleanup.
+    const base = path.join(tmpRoot, `gate-lock-run.${pid}`);
+    fs.mkdirSync(base);
+    fs.writeFileSync(path.join(base, 'base-marker'), 'leftover');
+    // The run's actual directory — the .<k> variant the run_scratch loop takes
+    // when the base is already there.
+    const suffix = path.join(tmpRoot, `gate-lock-run.${pid}.1`);
+    fs.mkdirSync(suffix);
+    fs.writeFileSync(path.join(suffix, 'suffix-marker'), 'run');
+    // The trace line run_scratch publishes in test mode, naming the suffix.
+    const trace = path.join(tmpRoot, 'trace.log');
+    fs.writeFileSync(trace, `gate-lock trace: run ${pid} private directory ${suffix}\n`);
+    stopRun({ pid, tmpRoot, trace });
+    expect(fs.existsSync(path.join(base, 'base-marker')), 'the leftover base was removed').toBe(
+      true,
+    );
+    expect(fs.existsSync(suffix), 'the run directory was not removed').toBe(false);
+    expect(fs.readdirSync(base), 'the base still holds only its own contents').toEqual([
+      'base-marker',
+    ]);
+  });
 });

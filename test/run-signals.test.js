@@ -712,10 +712,11 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
-    expect(hook.released(), 'the seam is one-shot: it cannot park a refresh once released').toBe(
-      true,
+    // The seam is one-shot: it cannot park a refresh once released. `released()` is set
+    // by release() itself, so the vacuous property is reparked() being false.
+    expect(hook.reparked(), 'the seam is one-shot: it cannot park a refresh once released').toBe(
+      false,
     );
-    expect(hook.reparked(), 'a later refresh parked on the released seam').toBe(false);
     expect(gone(beatPids(r.stdout)[0])).toBe(true);
   });
 
@@ -867,9 +868,7 @@ describe('T35 / R7 / T36 release waits for an in-flight refresh', () => {
     // One parked refresh, which is what this test means: a seam that re-parked would
     // have taken a second refresh and the trace would say so.
     expect(refreshesIn(trace), traceText(trace)).toHaveLength(1);
-    expect(hook.released(), 'the seam is one-shot: it cannot park a refresh once released').toBe(
-      true,
-    );
+    // The seam is one-shot: no refresh parked on it after release.
     expect(hook.reparked(), 'a second refresh parked on the released seam').toBe(false);
     expect(gone(beatPids(r.stdout)[0])).toBe(true);
   }, 90_000);

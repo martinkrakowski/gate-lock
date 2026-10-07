@@ -141,8 +141,10 @@ Rev 2 applies an adversarial plan review: 2 blockers, 10 should-fix items and th
 - Each lane gets an independent pre-PR review and the bot reviews. CI must be green on both OSes.
 
 ## Release
-1. **The owner does the first publish of 0.1.0 with 2FA:** `npm publish --access public` from a clean checkout of the tag.
+1. **Bump the version on the release PR first:** set the version in `package.json`; `publish.yml` checks that the tag matches it after `npm ci` and `npm test`.
+2. **Tag the merge commit:** `git tag -a vX.Y.Z <merge-sha>`, then push it (`git push origin vX.Y.Z`). The CI tag trigger runs `publish.yml`, which fails with an OIDC error until the trusted publisher exists for this package - that failure is expected for the first tag and is not a bug.
+3. **The owner does the first publish of 0.1.0 with 2FA:** `npm publish --access public` from a clean checkout of the tag.
    - It carries **no provenance**: provenance requires OIDC, so this gap is expected and is not a bug.
-   - The owner then configures the trusted publisher (repo `gate-lock`, workflow `publish.yml`) and sets the package to trusted-publisher-only.
-2. Later versions are published by tag through CI, with provenance.
-3. After 0.1.0, consuming projects pin the package and run their lanes on a shared host through `gate-lock run`, with workers capped by `resolveMaxWorkers`.
+    - The owner then configures the trusted publisher (repo `gate-lock`, workflow `publish.yml`) and sets the package to trusted-publisher-only.
+4. Later versions are published by tag through CI, with provenance.
+5. After 0.1.0, consuming projects pin the package and run their lanes on a shared host through `gate-lock run`, with workers capped by `resolveMaxWorkers`.

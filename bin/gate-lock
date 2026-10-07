@@ -2212,19 +2212,18 @@ run_stop_helper() {
       # change in it starts the busy budget again. It is what tells a helper that is
       # slow from one that is wedged: the two sides count the same wait in different
       # currencies - this one in seconds, the supervisor in passes of its own, and a
-      # pass takes more than a second whenever the host is loaded - so a supervisor
-      # that is still asking, still counting, still waiting out a refresh it will not
-      # cut short, is given up on by a clock alone at exactly the moment it was about
-      # to end that wait itself.
+      # pass takes more than a second whenever the host is loaded.
       #
-      # And it is bounded as well, or a helper that publishes progress without ever
-      # finishing - a supervisor bug, or a wedged loop behind a supervisor that counts
-      # forever - would hold this teardown for as long as it liked. So the resets are
-      # counted too, against the same budget: a helper has to be both silent and
-      # finished, or neither for more than run_stop_cap, and a run that cannot get that
-      # answer is ended rather than waited for. The supervisor's own worst case is the
-      # grace plus thirteen (see run_stop_cap), so thirteen-plus does not come close to
-      # the cap and the counting supervisor is never given up on.
+      # Progress is checked first: a helper that is still publishing progress must not
+      # be ended by the busy cap in the same round it just advanced, which on a loaded
+      # host can fire before the reset cap that bounds it. The `continue` here skips the
+      # rest of the loop for this round, so only the reset cap - not the busy cap - ends
+      # a progress-publishing helper. A helper that is silent (or has no progress marker)
+      # falls through to the busy cap below, and a wedge that publishes nothing is ended
+      # by that cap alone. The reset cap and the busy cap each bound the same wait, and a
+      # run that cannot get that answer is ended rather than waited for. The supervisor's
+      # own worst case is the grace plus thirteen (see run_stop_cap), so thirteen-plus
+      # does not come close to the cap and the counting supervisor is never given up on.
       if [ -n "${5:-}" ]; then
         run_stop_now=
         {
@@ -2242,10 +2241,10 @@ run_stop_helper() {
         fi
       fi
       # A refresh of the helper's own is in flight: it is busy, not wedged, and
-      # C41 says that refresh is never cut short. Those seconds are counted apart
-      # from the bound below, and the busy count has a cap of its own so that a
-      # marker nobody takes away - a helper wedged with a refresh published for
-      # ever - still ends. $4 is that marker's path, or empty where there is none.
+      # C41 says that refresh is never cut short. Those seconds are counted apart from
+      # the bound below, and the busy count has a cap of its own so that a marker
+      # nobody takes away - a helper wedged with a refresh published for ever - still
+      # ends. $4 is that marker's path, or empty where there is none.
       if [ -n "$4" ] && [ -e "$4" ]; then
         run_stop_busy=$((run_stop_busy + 1))
         if [ "$run_stop_busy" -ge "$run_stop_cap" ]; then
@@ -2765,6 +2764,10 @@ run_scratch() {
     die "$tmp_phys/gate-lock-run.$$ is not a private directory of ours (mode 0700, owned by uid $real_uid, not a symlink); no lock was taken"
   fi
   run_slot_out=$run_dir/slot
+  # The private directory this run actually created, for the test harness to clean up
+  # when a recycled pid left a `gate-lock-run.<pid>` behind and run_scratch took the
+  # `.<k>` suffix instead: stopRun must remove only what this run created.
+  trace "run $$ private directory $run_dir"
 }
 
 # run_beat_loop SLOT PERIOD ALIVE STATUS (C37, C42, D10): the heartbeat loop.
@@ -2896,7 +2899,11 @@ run_beat_loop() {
       rm -f "$rb_stop"
       exit 0
     fi
-    touch_file "$rb_inflight" || true
+     # The inflight marker is published without touching(1): a redirect on a command is
+     # a builtin, and in dash `touch` is an external command that forks on every
+     # refresh (production). Only the `2>/dev/null` is on the group, so a file-open
+     # failure is silent; the `>"$rb_inflight"` is on the printf, which is what creates it.
+     { printf '' >"$rb_inflight"; } 2>/dev/null || true
     trace "loop $$ refreshing $rb_slot, inflight published"
     # The child's answer is captured rather than read straight off the caller's
     # stderr, so that the trace can carry its status *and* its message - and it is
@@ -2914,8 +2921,12 @@ run_beat_loop() {
     # A loop whose run has taken its private directory away has nothing to capture
     # into, and a redirection into a path that is gone is reported by the shell itself -
     # and under bash in POSIX mode it ends the shell (C23's twin). So that is checked
-    # rather than tried, and the loop ends: a run that has taken its directory away is a
-    # run on its way out, which is the case the top of this pass reports as 3.
+    # rather than tried, and the loop exits 3: a run that has taken its directory away
+    # is a run on its way out, but it may still be alive. When it is alive the
+    # supervisor takes the lost-lock tail below (the loop's status 3 reaches the tail,
+    # and the run is still there to be stopped the hard way); only when the run itself
+    # is gone does sv_orphaned fire above. The two paths agree on stopping the command,
+    # but the reason is reported differently in the trace.
     if [ ! -d "$rb_dir" ]; then
       trace "loop $$ finds its private directory $rb_dir gone, and ends"
       exit 3

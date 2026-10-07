@@ -237,11 +237,12 @@ describe('F56a the same-worktree scan applies the liveness rule and nothing stri
 
     const stale = freshPool();
     const wtStale = wt0(stale);
+    const now = nowS();
     seed(stale, 'gate.lock', {
       owner: 'silent',
       pid: livePid(),
-      beat: nowS() - 700,
-      started: nowS() - 700,
+      beat: now - 700,
+      started: now - 700,
       worktree: wtStale,
       project: 'wt0',
     });
@@ -268,11 +269,12 @@ describe('F56a the same-worktree scan applies the liveness rule and nothing stri
   it('F56a a live pid with a stale beat does not block either', () => {
     const pool = freshPool();
     const wt = wt0(pool);
+    const now = nowS();
     seed(pool, 'gate.lock.1', {
       owner: 'silent',
       pid: livePid(),
-      beat: nowS() - 700,
-      started: nowS() - 700,
+      beat: now - 700,
+      started: now - 700,
       worktree: wt,
       project: 'wt0',
     });
