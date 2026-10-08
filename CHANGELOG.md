@@ -13,6 +13,11 @@ of the specification; the suite asserts the CLI's effects as golden directory
 listings and exact file bytes for `acquire`, `release`, `verify`, `heartbeat`,
 `status --json` and `clean`.
 
+### Fixed
+
+- `gate-lock run`: a command that ignores TERM and is KILLed by the run's watchdog no
+  longer leaks the shell's own job notice onto the caller's stderr.
+
 ## [0.1.0] - 2026-10-04
 
 The first release: a host-wide gate lock with a shared pool of slots, on-disk

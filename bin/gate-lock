@@ -2613,11 +2613,15 @@ run_verify_lock() {
   if [ -n "$run_sig" ] || [ -z "$run_slot" ]; then
     return 0
   fi
-  if run_child env "GATE_LOCK_CALLER_PID=$$" "GATE_LOCK_SLOT_PATH=$run_slot" "$self" verify "$run_lane"; then
+  if run_child env "GATE_LOCK_CALLER_PID=$$" "GATE_LOCK_SLOT_PATH=$run_slot" "$self" verify "$run_lane" 2>"$run_dir/verify.err"; then
     run_verify_ok=1
   else
     run_verify_ok=0
   fi
+  # After `exec 2>/dev/null` in do_run, this run's own stderr is /dev/null, so a
+  # verify failure would be swallowed there: hand it back through descriptor 9, the
+  # way run_release_lock does for release (T33/T37 read a verify failure off stderr).
+  cat "$run_dir/verify.err" >&"$run_err_fd"
 }
 
 # run_release_lock (C36): give the slot back, pinned, with run's own pid, and say
@@ -3721,6 +3725,22 @@ do_run() {
   # unchanged (no capture, no buffering) and its stdin null.
   "$@" </dev/null 9>&- &
   run_cmd_pid=$!
+  # C31/C32/D15: the command was forked one line up and holds the caller's stderr
+  # through the descriptor it inherited at fork; from here this run no longer needs its
+  # own stderr, every line it prints going to descriptor 9 (run_err_fd). Turn it away
+  # once, for good: a watchdog KILL of a command that ignores TERM is a job of this
+  # shell, and bash may defer the notice about that death to any boundary this run
+  # reaches afterwards - run_stop_supervisor, the release, run_scratch_rm, the exit.
+  # With fd 2 pointing at /dev/null there the notice is swallowed wherever bash
+  # flushes it, and nothing of the tool's own is lost (it speaks through descriptor 9).
+  # The command, the heartbeat loop and the verify/release children keep the caller's
+  # stderr through the descriptors they were given at their own forks (C31/C32).
+  #
+  # The cost, accepted: a complaint of the shell itself after this point - an unset
+  # variable under `set -u`, a malformed test - is not printed either. The run still
+  # ends non-zero and the cleanup still releases; the caller sees the status and no
+  # words. A message this tool means to print must go through run_err_fd.
+  exec 2>/dev/null
   # A shell runs a pending signal between two commands, so a signal can arrive
   # between the fork above and the assignment, when the handler had no pid to
   # forward TERM to. The handler has already recorded that it was signalled, so
@@ -3730,7 +3750,12 @@ do_run() {
   if [ -n "$run_sig" ]; then
     run_forward_term
   fi
-  run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" "$$" 9>&- &
+  # The supervisor is launched with fd 2 set to descriptor 9's target (the caller's
+  # stderr) and descriptor 9 then closed, so the heartbeat loop - a child of it -
+  # still has the caller's stderr for its "refresh failed" reports (D15), which this
+  # run's own fd 2 no longer does. Descriptor 9 is closed as usual so no helper holds
+  # the caller's pipe through a second reference.
+  run_supervise "$run_slot" "$heartbeat_seconds" "$run_lane" "$run_cmd_pid" "$run_dir" "$$" 2>&9 9>&- &
   run_sup_pid=$!
   # This supervisor's own pid, published beside the watchdog's for the same reason:
   # a subshell cannot portably name itself, and a test that KILLs a run has to know

@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { listing, scratchOf, waitForFile } from './harness.js';
+import { BIN, listing, scratchOf, waitForFile } from './harness.js';
 import { TM, livePid, names, readSlot, until } from './slots.js';
 import {
   HAS_PGREP,
@@ -15,6 +15,7 @@ import {
   beatPids,
   blocker,
   childrenMatching,
+  deafRun,
   freshPool,
   runDirOf,
   runOnce,
@@ -198,6 +199,57 @@ describe('C40 a command that will not stop', () => {
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
   }, 60_000);
+
+  it('issue #11 a command the watchdog KILLs after it ignores TERM leaks no shell job notice onto stderr', async () => {
+    const pool = freshPool();
+    // Put the watchdog's private directory somewhere this test owns, so the marker
+    // that says it fired can be read while the run is still tearing down.
+    const tmpRoot = path.join(scratchOf(pool), 'tmp-root');
+    fs.mkdirSync(tmpRoot, { mode: 0o700 });
+    const { gate, victim } = await deafRun(pool, {
+      env: { GATE_LOCK_TEST_TMP_ROOT: tmpRoot },
+    });
+    // The command ignores TERM, so the run's own TERM below cannot stop it: the
+    // escalator's KILL after the grace is the only end this run has, which is
+    // exactly the death whose shell notice must not reach the caller's stderr.
+    // Waiting for the watchdog's published pid proves that KILL path is armed.
+    // Honest caveat: this can only fail on a shell that prints such job notices at
+    // all (bash 3.2 on macOS); bash 5 prints nothing, so on this host it is green
+    // before and after the fix - the proof is a repeated run under bash 3.2.
+    gate.child.kill('SIGTERM');
+    await until(() => runDirWith(tmpRoot, 'escalator.pid'), 15000);
+    const r = await gate.done;
+    expect(r.status, JSON.stringify(r.stderr)).toBe(143);
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
+    expect(r.stdout).toContain('released by lane');
+    expect(names(pool)).toEqual(['.format']);
+    // Give the command time to be gone before the next test; like the D15 test
+    // above, this does not assert on it: under load the wait can run out, and
+    // the claim here is about stderr.
+    await waitForDead(victim, 10000);
+  }, 60_000);
+
+  it('issue #11 a command that writes to stderr after being forked still reaches the caller (C31/C32)', async () => {
+    const pool = freshPool();
+    // The command sleeps a moment - so its write lands after `run` has forked it
+    // and turned its own stderr away with `exec 2>/dev/null` - then writes a line
+    // to stderr and exits. The fork happened before the exec, so that line must
+    // arrive on the caller's stderr exactly once, and the run's own stderr empty.
+    const cmd = [
+      script(
+        pool,
+        'late-stderr.sh',
+        `sleep 1
+printf 'the command spoke\\n' >&2
+exit 0`,
+      ),
+    ];
+    const r = runOnce(pool, 'lane', cmd);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('released by lane');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('the command spoke\n');
+    expect(names(pool)).toEqual(['.format']);
+  }, 30_000);
 
   it('D15 a signal into a run that is waiting still leaves the tool own lines on the caller stderr', async () => {
     const pool = freshPool();
@@ -1119,5 +1171,36 @@ describe('the default heartbeat period', () => {
     const r = runOnce(pool, 'lane', ['true']);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('every 60s while lane runs');
+  });
+});
+
+// Issue #11, the part every shell can check. The stderr test above can only go
+// red on a shell that prints job notices (bash 3.2); these two read the script
+// itself, so the arrangement that test relies on cannot quietly disappear.
+describe('issue #11 the run speaks through descriptor 9, not its own stderr', () => {
+  const lines = fs.readFileSync(BIN, 'utf8').split('\n');
+  const lineOf = (text) => lines.findIndex((line) => line.trim() === text);
+
+  it('turns its own stderr away after the command is forked and before the supervisor is', () => {
+    const fork = lineOf('"$@" </dev/null 9>&- &');
+    const away = lineOf('exec 2>/dev/null');
+    const supervisor = lines.findIndex((line) => /^\s*run_supervise\b.*&\s*$/.test(line));
+    expect(fork, 'the fork of the command').toBeGreaterThan(-1);
+    expect(away, 'exec 2>/dev/null').toBeGreaterThan(fork);
+    expect(supervisor, 'the fork of the supervisor').toBeGreaterThan(away);
+    // The supervisor's children report on stderr, so it is handed the caller's.
+    expect(lines[supervisor]).toContain('2>&9 9>&-');
+  });
+
+  it('writes to plain stderr only from the heartbeat loop, which is handed the caller stderr', () => {
+    const plain = lines
+      .map((text, index) => ({ text, line: index + 1 }))
+      .filter(({ text }) => /(^|[^0-9])>&2(\s|$)/.test(text) && !/^\s*#/.test(text));
+    // `exec 9>&2` saves the caller's stderr and is not a write. Not vacuous:
+    // the two loop reports exist.
+    expect(plain.length).toBe(2);
+    for (const { text, line } of plain) {
+      expect(text, `line ${line} writes to plain stderr`).toMatch(/\$rb_/);
+    }
   });
 });

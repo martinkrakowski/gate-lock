@@ -395,6 +395,27 @@ export async function up(block) {
 }
 
 /**
+ * A run whose command ignores TERM, so only the watchdog's KILL after the grace
+ * can stop it (the C40 shape). The run is left waiting on its command; `victim`
+ * is the command's pid, tracked for cleanup. This is the only way a command's
+ * death can be a KILL, and a KILLed job is the one whose shell notice a signalled
+ * run must not leak onto the caller's stderr (issue #11).
+ */
+export async function deafRun(pool, { grace = 1, env = {} } = {}) {
+  const block = blocker(pool, 'deaf', { ignoreTerm: true });
+  const gate = startRun(pool, 'lane', block.cmd, {
+    env: {
+      ...TM,
+      GATE_LOCK_HEARTBEAT_SECONDS: '1',
+      GATE_LOCK_TEST_KILL_GRACE: String(grace),
+      ...env,
+    },
+  });
+  const victim = track(await up(block));
+  return { block, gate, victim };
+}
+
+/**
  * A live view of a started run's stderr: the test can wait for output it has not
  * received yet (the harness only hands over the full text when the run ends).
  */
