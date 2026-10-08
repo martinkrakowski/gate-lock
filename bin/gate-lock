@@ -2159,6 +2159,18 @@ run_stop_bound=8
 # disk for the next teardown to wait on. Five seconds of slack over the worst case:
 # 10 + 13 + 5.
 run_stop_cap=$((run_kill_grace + 18))
+# Test seam: override run_stop_cap for tests that need it small. Inert outside
+# test mode; accepted only if all digits and at least 1.
+seam GATE_LOCK_TEST_STOP_CAP
+case "${seam_value:-}" in
+  '' | *[!0-9]*) ;;
+  *) [ "$seam_value" -ge 1 ] && run_stop_cap=$seam_value ;;
+esac
+# The total cap is larger than each existing bound, so it never fires before
+# them; it is more than twice the supervisor's worst case; and it counts sleeps
+# of at least a second each, so on a loaded host it takes longer in wall time
+# and can never fire early.
+run_stop_total_cap=$((run_stop_bound + 2 * run_stop_cap))
 
 # run_signal NAME CODE (D15, C38-C40): HUP, QUIT and TERM all forward TERM to
 # the command, and INT does too, because an asynchronous command starts with INT
@@ -2180,9 +2192,17 @@ run_stop_cap=$((run_kill_grace + 18))
 # the supervisor's lost-lock exit). A pid that is not a process at all is the same
 # answer without a file.
 #
-# The wait is bounded - 200 spins, then eight one-second rounds, which is more than
-# the supervisor's own three asks (it will not cut a refresh short, C41/R7) and is
-# only reached when a helper really is wedged. The only signal it falls back to is
+# The wait is bounded - 200 spins, then one of three one-second bounds. The
+# first is the silent wedge: `run_stop_bound` (8) one-second rounds with no refresh
+# in flight, which is more than the supervisor's own three asks and is only reached when
+# a helper really is wedged. The second is the busy cap: `run_stop_cap` seconds with a
+# refresh in flight, the supervisor's worst case (the grace plus thirteen) plus five
+# seconds of slack. The third is the total cap: `run_stop_bound + 2 * run_stop_cap`
+# one-second rounds in all, counted as the function's own sleeping rounds; it is larger
+# than each of the other two bounds (so it never preempts them on a helper that the others
+# would answer on time) and it is the backstop for a helper that keeps publishing progress
+# often enough to reset the busy cap, yet does not finish - the case that used to take
+# `run_stop_cap` squared seconds. The only signal it falls back to is
 # KILL, which cannot be trapped and so cannot reach bash 3.2's `run_pending_traps`
 # defect: sending TERM to a subshell that may still be installing its own traps
 # makes that shell print two lines of its own on the caller's stderr and resend
@@ -2199,6 +2219,7 @@ run_stop_helper() {
     run_stop_waited=0
     run_stop_busy=0
     run_stop_spin=0
+    run_stop_total=0
     run_stop_prog=
     run_stop_resets=0
     run_stop_why=
@@ -2251,12 +2272,22 @@ run_stop_helper() {
           run_stop_why="$run_stop_busy seconds with a refresh in flight"
           break
         fi
+        run_stop_total=$((run_stop_total + 1))
+        if [ "$run_stop_total" -ge "$run_stop_total_cap" ]; then
+          run_stop_why="$run_stop_total rounds in all"
+          break
+        fi
         sleep 1
         continue
       fi
       run_stop_waited=$((run_stop_waited + 1))
       if [ "$run_stop_waited" -ge "$run_stop_bound" ]; then
         run_stop_why="$run_stop_waited seconds without a refresh in flight"
+        break
+      fi
+      run_stop_total=$((run_stop_total + 1))
+      if [ "$run_stop_total" -ge "$run_stop_total_cap" ]; then
+        run_stop_why="$run_stop_total rounds in all"
         break
       fi
       sleep 1

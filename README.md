@@ -118,6 +118,16 @@ to the command and KILL after a ten second grace period. If a refresh fails - th
 lock was reclaimed, or the slot was replaced - the run says the lock was lost,
 stops the command, and exits 2 without releasing a lock that is not its own.
 
+When the command has ended, `run` asks its supervisor to stop and waits for it
+before it releases. That wait is bounded in all: `run` gives up on a supervisor
+that will not stop after at most `8 + 2 x (grace + 18)` one-second rounds, where
+the grace is the ten seconds above. That is 64 rounds, about a minute. It then
+stops the supervisor the hard way, says so on stderr, and decides from the slot
+itself whether the lock is still its own. A round is at least a second, so on a
+loaded host the wait is longer than a minute, never shorter. (Before this bound a
+supervisor that kept reporting progress without finishing could hold the slot
+for about thirteen minutes.)
+
 ### acquire, release, verify, heartbeat
 
 These are for a caller that wants to hold a slot across several steps, which is

@@ -17,6 +17,10 @@ listings and exact file bytes for `acquire`, `release`, `verify`, `heartbeat`,
 
 - `gate-lock run`: a command that ignores TERM and is KILLed by the run's watchdog no
   longer leaks the shell's own job notice onto the caller's stderr.
+- `gate-lock run`: the teardown's wait for its supervisor is bounded in all, at
+  `8 + 2 x (grace + 18)` one-second rounds (64, about a minute, at the default
+  grace). A supervisor that kept reporting progress without finishing could hold
+  the slot for about thirteen minutes before.
 
 ## [0.1.0] - 2026-10-04
 

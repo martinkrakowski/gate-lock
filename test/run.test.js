@@ -29,6 +29,7 @@ import {
   freshPool,
   heldListing,
   parentOf,
+  runDirOf,
   runOnce,
   runRaw,
   script,
@@ -1185,6 +1186,86 @@ describe('D10 a loop that keeps dying', () => {
     expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
     expect(stopped(loop), 'a loop outlived the supervisor that was KILLed').toBe(true);
   }, 180_000);
+
+  it('D10 a helper that alternates progress and a refresh in flight is ended by the total: 48 rounds in all, and progress never resets it', async () => {
+    const pool = freshPool();
+    const tmpRoot = scratchOf(pool);
+    const trace = path.join(tmpRoot, 'trace.log');
+    // The supervisor is parked where it hears nothing, and a refresh is held in
+    // flight for the whole test: every round of the teardown's wait is a busy round.
+    const hook = beatHook(pool);
+    const wedge = path.join(tmpRoot, 'sup-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        // The busy cap and the reset cap are 20 each, so the total is 8 + 2 * 20 = 48.
+        GATE_LOCK_TEST_STOP_CAP: '20',
+        GATE_LOCK_TEST_SUP_WEDGE: wedge,
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        GATE_LOCK_TEST_TRACE: trace,
+        GATE_LOCK_TEST_TMP_ROOT: tmpRoot,
+      },
+    });
+    await waitForFile(hook.seam);
+    // Progress, published on the parked supervisor's behalf: once now, then every
+    // fifteen seconds, nineteen times at most. Each one starts the busy count again,
+    // which is what used to let this wait run for the cap squared.
+    //
+    // This is the one thing here paced by time and not by a handshake, because
+    // progress has to arrive BETWEEN the wait's rounds. The numbers are chosen so the
+    // outcome does not depend on how slow a round is on a loaded host:
+    //   - fifteen seconds is under the busy cap of 20 rounds (a round is at least a
+    //     second), so the busy cap never fires while progress keeps coming;
+    //   - nineteen publications is under the reset cap of 20, so that never fires;
+    //   - and by the last publication the total is so far along that the 48th round
+    //     comes before twenty more busy ones, as long as a round takes under about
+    //     ten seconds.
+    // At one round a second the total ends the wait after about 48 seconds.
+    const alive = path.join(runDirOf(gate.child.pid, tmpRoot, trace), 'supervisor.alive');
+    let published = 0;
+    const publish = () => {
+      if (published >= 19) return;
+      try {
+        published += 1;
+        fs.writeFileSync(`${alive}.test`, `published by the test ${published}\n`);
+        fs.renameSync(`${alive}.test`, alive);
+      } catch {
+        // The run directory is gone: the run has ended.
+      }
+    };
+    publish();
+    const timer = setInterval(publish, 15000);
+    // The command must be up before it is let go, or the release is missed and
+    // the run never reaches its teardown.
+    await up(block);
+    block.release();
+    try {
+      await untilGone(gate.child.pid, 280000).catch(() => {
+        // Say where the wait stood: a bare timeout says nothing about which bound
+        // was or was not reached.
+        throw new Error(`the run did not end after ${published} publications: ${traceText(trace)}`);
+      });
+      const said = traceText(trace);
+      // The total ended it, at exactly its cap. A total that progress could reset
+      // would not have reached 48 here; the wait would have gone on to the reset cap.
+      expect(said, said).toContain(': 48 rounds in all');
+      expect(published, 'progress was published during the wait').toBeGreaterThanOrEqual(3);
+      expect(said, said).not.toContain('times without finishing');
+      expect(said, said).not.toContain('seconds with a refresh in flight');
+      expect(said, said).not.toContain('seconds without a refresh in flight');
+    } finally {
+      clearInterval(timer);
+      hook.release();
+    }
+    // The KILLed supervisor's loop was waiting on the heartbeat the seam held; both
+    // end when the seam goes.
+    await until(() => stagedBeats(pool).length === 0, 20000);
+    await until(() => names(pool).length === 1, 20000);
+    expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
+  }, 320_000);
 
   it('D10 a supervisor that will not be stopped at all is KILLed, and the slot decides: the command status stands', async () => {
     const pool = freshPool();
