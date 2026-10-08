@@ -1237,6 +1237,12 @@ describe('D10 a loop that keeps dying', () => {
         // The run directory is gone: the run has ended.
       }
     };
+    // The loop and the parked heartbeat, as the run's own directory names them.
+    const dir = path.dirname(alive);
+    const loopPid = Number(fs.readFileSync(path.join(dir, 'beat.pid'), 'utf8').trim());
+    const beatPid = Number(fs.readFileSync(path.join(dir, 'beat-child'), 'utf8').trim());
+    expect(loopPid, 'the loop published its pid').toBeGreaterThan(1);
+    expect(beatPid, 'the parked heartbeat is published').toBeGreaterThan(1);
     let timer;
     try {
       publish();
@@ -1261,13 +1267,23 @@ describe('D10 a loop that keeps dying', () => {
       expect(said, said).not.toContain('seconds without a refresh in flight');
 
       // What giving up may cost is the run's own tidiness, never the slot's
-      // exclusivity. The first run's command had ended before the teardown began,
-      // its supervisor was KILLed, and it released its slot itself. What it left
-      // behind is the supervisor's loop with a heartbeat still parked on the seam,
-      // a refresh staged for a slot that is no longer its own. A second run takes
-      // the slot now, while that heartbeat is still parked:
+      // exclusivity. The hard stop took the supervisor's loop and the parked
+      // heartbeat with it, before the release: each was read from the run's own
+      // directory and checked to be the child it claims to be. So when the first
+      // run has ended, nothing of it is alive and nothing of it is staged.
+      await untilGone(loopPid, 20000);
+      await untilGone(beatPid, 20000);
       expect(names(pool), 'the first run released its slot').not.toContain('gate.lock');
-      expect(stagedBeats(pool).length, 'the orphaned heartbeat is still staged').toBe(1);
+      expect(stagedBeats(pool), 'the KILLed heartbeat left its stage behind').toEqual([]);
+      const r1 = await gate.done;
+      // What the operator saw, and all there is to do about it: the command's own
+      // status, and the one line that says the supervisor was stopped hard.
+      expect(r1.status, r1.stderr).toBe(0);
+      expect(r1.stderr).toContain('the heartbeat supervisor was stopped the hard way');
+      expect(r1.stderr).toContain("so the command's status stands\n");
+      // A second run takes the slot, the seam is opened for anything that might
+      // still be parked on it, and the slot is byte for byte what the second run
+      // wrote: nothing of the first run is left to write into it.
       const block2 = blocker(pool, 'second');
       const gate2 = startRun(pool, 'second-lane', block2.cmd, {
         env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '60' },
@@ -1275,23 +1291,14 @@ describe('D10 a loop that keeps dying', () => {
       await up(block2);
       const held = readSlot(pool, 'gate.lock');
       expect(held.pid, 'the second run holds the slot').toBe(String(gate2.child.pid));
-      // ...and the orphaned heartbeat is let go. It checks the holder again
-      // immediately before it would write (D24), finds a slot that is not its
-      // own, and writes nothing: the second run's slot is byte for byte what it was.
       clearInterval(timer);
       hook.release();
-      await until(() => stagedBeats(pool).length === 0, 20000);
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      expect(stagedBeats(pool), 'something staged a beat beside the second run').toEqual([]);
       expect(
         readSlot(pool, 'gate.lock'),
-        'the orphan wrote into a slot that is not its own',
+        "something of the first run wrote into the second run's slot",
       ).toEqual(held);
-      // What the operator of the first run saw, and all there is to do about it:
-      // the command's own status, and the one line that says the supervisor was
-      // stopped hard. (Read only now: the orphan held the run's pipes open.)
-      const r1 = await gate.done;
-      expect(r1.status, r1.stderr).toBe(0);
-      expect(r1.stderr).toContain('the heartbeat supervisor was stopped the hard way');
-      expect(r1.stderr).toContain("so the command's status stands");
       block2.release();
       const r2 = await gate2.done;
       expect(r2.status, r2.stderr).toBe(0);
@@ -1303,6 +1310,75 @@ describe('D10 a loop that keeps dying', () => {
     await until(() => names(pool).length === 1, 20000);
     expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
   }, 320_000);
+
+  it('D10 a heartbeat whose published pid cannot be read is left alone and named; it re-checks the holder and writes nothing into the next run (D24)', async () => {
+    const pool = freshPool();
+    const tmpRoot = scratchOf(pool);
+    const trace = path.join(tmpRoot, 'trace.log');
+    // The same wedged supervisor with a refresh parked in flight, and a short busy
+    // cap so the teardown gives up after three rounds.
+    const hook = beatHook(pool);
+    const wedge = path.join(tmpRoot, 'sup-wedge');
+    fs.writeFileSync(wedge, 'wedged\n');
+    const block = blocker(pool);
+    const gate = startRun(pool, 'lane', block.cmd, {
+      env: {
+        ...TM,
+        GATE_LOCK_HEARTBEAT_SECONDS: '1',
+        GATE_LOCK_TEST_STOP_CAP: '3',
+        GATE_LOCK_TEST_SUP_WEDGE: wedge,
+        GATE_LOCK_TEST_PAUSE_BEFORE_BEAT_RENAME: hook.seam,
+        GATE_LOCK_TEST_TRACE: trace,
+        GATE_LOCK_TEST_TMP_ROOT: tmpRoot,
+      },
+    });
+    try {
+      await waitForFile(hook.seam);
+      const dir = runDirOf(gate.child.pid, tmpRoot, trace);
+      const loopPid = Number(fs.readFileSync(path.join(dir, 'beat.pid'), 'utf8').trim());
+      // The heartbeat's pid, as published, is made unreadable: the run must not
+      // guess at it, so that heartbeat outlives the run.
+      fs.writeFileSync(path.join(dir, 'beat-child'), 'not a pid\n');
+      await up(block);
+      block.release();
+      await untilGone(gate.child.pid, 60000);
+      await untilGone(loopPid, 20000);
+      expect(names(pool), 'the first run released its slot').not.toContain('gate.lock');
+      expect(stagedBeats(pool).length, 'the heartbeat left alone is still staged').toBe(1);
+      // A second run takes the slot while that heartbeat is still parked...
+      const block2 = blocker(pool, 'second');
+      const gate2 = startRun(pool, 'second-lane', block2.cmd, {
+        env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '60' },
+      });
+      await up(block2);
+      const held = readSlot(pool, 'gate.lock');
+      expect(held.pid, 'the second run holds the slot').toBe(String(gate2.child.pid));
+      // ...and the heartbeat is let go. It checks the holder again immediately
+      // before it would write (D24), finds a slot that is not its own, and writes
+      // nothing: the second run's slot is byte for byte what it was.
+      hook.release();
+      await until(() => stagedBeats(pool).length === 0, 20000);
+      expect(
+        readSlot(pool, 'gate.lock'),
+        'the leftover heartbeat wrote into a slot that is not its own',
+      ).toEqual(held);
+      // The first run said, in its one line, what it left alone. (Read only now:
+      // the leftover heartbeat held the run's pipes open.)
+      const r1 = await gate.done;
+      expect(r1.status, r1.stderr).toBe(0);
+      expect(r1.stderr).toContain(
+        "so the command's status stands; its heartbeat's pid could not be read and that heartbeat was left alone\n",
+      );
+      block2.release();
+      const r2 = await gate2.done;
+      expect(r2.status, r2.stderr).toBe(0);
+      expect(r2.stdout).toContain('released by second-lane');
+    } finally {
+      hook.release();
+    }
+    await until(() => names(pool).length === 1, 20000);
+    expect(names(pool), 'the pool holds the marker and nothing else').toEqual(['.format']);
+  }, 180_000);
 
   it('D10 a supervisor that will not be stopped at all is KILLed, and the slot decides: the command status stands', async () => {
     const pool = freshPool();

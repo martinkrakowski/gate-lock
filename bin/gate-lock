@@ -1877,6 +1877,14 @@ do_heartbeat() {
   # than for nearly always has to hold the slot itself. The window is left open
   # deliberately: closing it needs a lock around the check and the rename, and a
   # stale beat on a slot nobody is beating any more is the janitor's job (D16).
+  #
+  # What it can cost, exactly: this rename writes the beat and nothing else, never
+  # the pid or the owner, and the new holder's next refresh replaces it. A slot is
+  # lost through it only if the beat written is older than the stale threshold and
+  # a janitor runs before that next refresh. The caller most likely to be here is a
+  # refresh that outlived its run, which is why a run that has to KILL its
+  # supervisor takes the loop and this child with it before it releases
+  # (run_stop_find_kin); the window is still here for any path that leaves one alive.
   if [ -d "$target/beat" ] || ! mv -f "$hb_stage" "$target/beat" 2>/dev/null; then
     rm -f "$hb_stage" 2>/dev/null
     fail1 "heartbeat: cannot replace the beat in $target (the lock may be gone)"
@@ -2307,10 +2315,107 @@ run_stop_helper() {
     # print anything about itself. It is not sent to a subshell that has finished:
     # that one is only waiting to be reaped, and its pid is about to be a stranger's.
     if [ -e "$1" ] && [ ! -e "$2" ]; then
-      kill -KILL "$3" 2>/dev/null
+      # $6, where there is one, is the helper's private directory, and it is given
+      # only for a helper that has children of its own: the supervisor. KILLing the
+      # supervisor alone leaves its loop behind, and under the loop a heartbeat that
+      # may be anywhere between its last look at the holder and its rename - alive
+      # after this run has released, when the slot can be somebody else's. So they
+      # go with it, in the one signal call, and before the release (see
+      # run_stop_find_kin for which pids, and why only those).
+      run_stop_kin=
+      run_stop_kin_child=
+      [ -z "${6:-}" ] || run_stop_find_kin "$3" "$6"
+      # shellcheck disable=SC2086 # a list of pids, each checked to be digits
+      kill -KILL "$3" $run_stop_kin 2>/dev/null
+      if [ -n "$run_stop_kin_child" ]; then
+        # KILL is not instant: a call the heartbeat was inside finishes first. It is
+        # waited for here, briefly and without a signal, so that whatever it was
+        # doing is done while the slot is still this run's. It is not this shell's
+        # child, so there is nothing to reap; a pid that is still there afterwards is
+        # said out loud rather than waited for.
+        run_stop_spin=0
+        while kill -0 "$run_stop_kin_child" 2>/dev/null; do
+          run_stop_spin=$((run_stop_spin + 1))
+          if [ "$run_stop_spin" -ge 600 ]; then
+            run_stop_kin_note="its heartbeat (pid $run_stop_kin_child) was sent KILL and had not gone when this run released"
+            break
+          fi
+          [ $((run_stop_spin % 200)) -ne 0 ] || sleep 1
+        done
+        # A KILLed heartbeat runs no trap, so the beat it staged beside the slot is
+        # this run's to take away, by the one name it can have.
+        [ -z "$run_slot" ] || rm -f "$run_slot.beatnew.$run_stop_kin_child" 2>/dev/null
+      fi
     fi
     return 0
   } 2>/dev/null
+}
+
+# run_stop_find_kin SUPERVISOR DIR: which of a supervisor's descendants may be
+# KILLed with it. Sets run_stop_kin (pids, space separated, possibly empty),
+# run_stop_kin_child (the heartbeat's pid when it is one of them) and
+# run_stop_kin_note (what could not be done, for the run's one line on stderr;
+# empty when there is nothing to say).
+#
+# Only a pid read from this run's own private directory is ever a candidate: the
+# loop's from `beat.pid`, which the supervisor writes, and the heartbeat's from
+# `beat-child`, which the loop writes before each refresh and removes after it. And
+# a pid from a file is still only a number, so each is checked against the one
+# thing a recycled pid cannot fake: its parent. The loop must be the supervisor's
+# child and the heartbeat the loop's, asked of `ps` while the supervisor is still
+# alive to be anybody's parent. Anything that does not check out is left alone and
+# named. A file that is absent or empty is the ordinary case - no loop yet, or no
+# refresh in flight - and is not worth a word.
+run_stop_note=
+run_stop_kin_note=
+run_stop_find_kin() {
+  run_stop_kin=
+  run_stop_kin_child=
+  run_stop_kin_note=
+  rk_loop=
+  rk_child=
+  { IFS= read -r rk_loop <"$2/beat.pid"; } 2>/dev/null
+  case ${rk_loop:-} in
+  '') return 0 ;;
+  *[!0-9]*)
+    run_stop_kin_note="its heartbeat loop's pid could not be read and nothing else was stopped"
+    return 0
+    ;;
+  esac
+  kill -0 "$rk_loop" 2>/dev/null || rk_loop=
+  if [ -n "$rk_loop" ]; then
+    rk_par=$(ps -o ppid= -p "$rk_loop" 2>/dev/null) || rk_par=
+    rk_par=${rk_par#"${rk_par%%[! ]*}"}
+    rk_par=${rk_par%"${rk_par##*[! ]}"}
+    if [ "$rk_par" = "$1" ]; then
+      run_stop_kin=$rk_loop
+    else
+      run_stop_kin_note="pid $rk_loop could not be shown to be its heartbeat loop and was left alone"
+      return 0
+    fi
+  fi
+  { IFS= read -r rk_child <"$2/beat-child"; } 2>/dev/null
+  case ${rk_child:-} in
+  '') return 0 ;;
+  *[!0-9]*)
+    run_stop_kin_note="its heartbeat's pid could not be read and that heartbeat was left alone"
+    return 0
+    ;;
+  esac
+  kill -0 "$rk_child" 2>/dev/null || return 0
+  rk_par=
+  if [ -n "$rk_loop" ]; then
+    rk_par=$(ps -o ppid= -p "$rk_child" 2>/dev/null) || rk_par=
+    rk_par=${rk_par#"${rk_par%%[! ]*}"}
+    rk_par=${rk_par%"${rk_par##*[! ]}"}
+  fi
+  if [ -n "$rk_loop" ] && [ "$rk_par" = "$rk_loop" ]; then
+    run_stop_kin="$run_stop_kin $rk_child"
+    run_stop_kin_child=$rk_child
+  else
+    run_stop_kin_note="pid $rk_child could not be shown to be its heartbeat and was left alone"
+  fi
+  return 0
 }
 
 run_signal() {
@@ -2557,7 +2662,9 @@ run_stop_supervisor() {
   # exited already - a lost lock ends the run before the cleanup does - so the files
   # are removed once the pids are reaped.
   touch_file "$run_dir/loop.stop" || true
-  run_stop_helper "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" "$run_sup" "$run_dir/beat-inflight" "$run_dir/supervisor.alive"
+  run_stop_kin_note=
+  run_stop_helper "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" "$run_sup" "$run_dir/beat-inflight" "$run_dir/supervisor.alive" "$run_dir"
+  run_stop_note=$run_stop_kin_note
   run_wait_supervisor "$run_sup"
   rm -f "$run_dir/loop.stop" "$run_dir/supervisor.stop" "$run_dir/supervisor.gone" 2>/dev/null
 }
@@ -2618,9 +2725,9 @@ run_sup_verdict() {
 run_sup_warning() {
   [ "$run_sup_unproven" = 1 ] || return 0
   if [ "${1:-0}" = 1 ]; then
-    printf "gate-lock: the heartbeat supervisor was stopped the hard way (status %s) while the command ran; the slot verified as this run to release, so the command's status stands\n" "$run_sup_status" >&"$run_err_fd"
+    printf "gate-lock: the heartbeat supervisor was stopped the hard way (status %s) while the command ran; the slot verified as this run to release, so the command's status stands%s\n" "$run_sup_status" "${run_stop_note:+; $run_stop_note}" >&"$run_err_fd"
   else
-    printf 'gate-lock: the heartbeat supervisor was stopped the hard way (status %s) while the command ran, and the slot was not verified afterwards\n' "$run_sup_status" >&"$run_err_fd"
+    printf 'gate-lock: the heartbeat supervisor was stopped the hard way (status %s) while the command ran, and the slot was not verified afterwards%s\n' "$run_sup_status" "${run_stop_note:+; $run_stop_note}" >&"$run_err_fd"
   fi
   return 0
 }
