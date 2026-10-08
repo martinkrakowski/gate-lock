@@ -129,6 +129,13 @@ at least a minute and, since a round is at least a second, longer on a loaded
 host. (Before this bound a supervisor that kept reporting progress without
 finishing could hold the slot for about thirteen minutes.)
 
+When the bound fires, the operator sees one line on stderr, `gate-lock: the
+heartbeat supervisor was stopped the hard way (status N) while the command ran;
+the slot verified as this run to release, so the command's status stands`, and
+has nothing to do: the slot was released, the exit status is the command's, and
+a heartbeat the stopped supervisor left in flight checks the holder before it
+writes, so it cannot touch the next run's slot.
+
 ### acquire, release, verify, heartbeat
 
 These are for a caller that wants to hold a slot across several steps, which is
