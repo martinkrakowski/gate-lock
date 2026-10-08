@@ -354,12 +354,19 @@ describe('--wait', () => {
       // It waited the number of seconds it was asked for, not the octal reading of
       // it, and not none at all.
       expect(elapsed, `${given} waited ${elapsed}ms`).toBeGreaterThanOrEqual((seconds - 1) * 1000);
-      // Upper bound: the measured deadline (run_wait + 1s — the +1 rounds up the
-      // whole-second clock the tool reads) plus one backoff step (the retry loop
-      // sleeps at most 5s before its final deadline check) plus 5s of margin for
-      // host load: macOS CI under full-suite load can make sleep oversleep, but
-      // the wait must still be shown to end.
-      expect(elapsed, given).toBeLessThan((seconds + 1) * 1000 + 5000 + 5000);
+      // Upper bound: the tool's deadline is run_wait + 1 whole seconds past the
+      // clock it reads once at the start (gate-lock:3459,
+      // `run_deadline=$((now + run_wait + 1))`), the +1 rounding up the
+      // whole-second clock. The retry loop clamps its pause to the deadline
+      // (gate-lock:3499: `run_pause=$((run_deadline - now))`) and breaks before a
+      // late attempt (gate-lock:3471: `[ $((now + 1)) -le $run_deadline ] || break`),
+      // so it runs at most ~1s past the deadline from a clamped sleep plus ~1s from
+      // whole-second truncation — about (seconds + 2)s from the code. A 5s load
+      // margin covers sleep oversleeping under host load (macOS CI under the full
+      // suite needed that much before). Formula: (seconds + 2) * 1000 + 5000, so
+      // 15s for 8 and 17s for 10. A doubled wait (16s and 20s) is above the bound
+      // in both cases.
+      expect(elapsed, given).toBeLessThan((seconds + 2) * 1000 + 5000);
     }
     // A ten-digit value is inside the limit the message states, so it is accepted
     // rather than refused: it is checked by letting the run answer its first busy

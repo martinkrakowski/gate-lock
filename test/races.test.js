@@ -83,26 +83,37 @@ describe('R3 reclaim arbitration', () => {
 });
 
 describe('R6 a reader never sees an empty or missing beat', () => {
-  it('R6 thousands of reads under a heartbeat loop see neither an empty nor a missing beat', async () => {
+  it('R6 a bounded time of reads under a heartbeat loop see neither an empty nor a missing beat', async () => {
     const pool = freshPool();
     const pid = livePid();
     expect(acquire(pool, 'lane', pid).status).toBe(0);
     const slot = path.join(pool, 'gate.lock');
     const reads = { total: 0, empty: 0, missing: 0 };
-    let stopping = false;
+    const beats = new Set();
+    // A 15s budget: well under half the 60s test timeout, leaving margin for
+    // startup and teardown on a loaded host, while still exercising the property
+    // for a meaningful interval.
+    const budgetSec = 15;
+    const budgetMs = budgetSec * 1000;
+    const budgetStart = Date.now();
     // The beat is replaced by rename (F38), so a reader only ever sees a whole
-    // old or new value; this is the reader that proves it, thousands of times.
+    // old or new value; this is the reader that proves it for a bounded interval
+    // rather than a fixed count of reads, so a slow host cannot make it time out
+    // by running fewer reads in the same window.
     const hammer = (async () => {
-      while (!stopping) {
+      while (Date.now() - budgetStart < budgetMs) {
         for (let k = 0; k < 250; k += 1) {
+          if (Date.now() - budgetStart >= budgetMs) break;
           try {
             const value = fs.readFileSync(path.join(slot, 'beat'), 'utf8');
             reads.total += 1;
             if (value.replace(/\n/g, '') === '') reads.empty += 1;
+            beats.add(value.replace(/\n/g, ''));
           } catch {
             reads.missing += 1;
           }
         }
+        // Yield so the heartbeat child can run between read bursts.
         await new Promise((resolve) => setTimeout(resolve, 1));
       }
     })();
@@ -110,9 +121,9 @@ describe('R6 a reader never sees an empty or missing beat', () => {
     // the harness's own environment (T110/H14) so nothing is inherited. The
     // binary is passed through the environment, not interpolated into the
     // script, so a checkout path with a space (or anything else the shell would
-    // read) cannot break the loop.
-    const refreshes = 40;
-    const script = `i=0; while [ "$i" -lt ${refreshes} ]; do "$GATE_LOCK_TEST_LOOP_BIN" heartbeat || exit 1; i=$((i + 1)); done`;
+    // read) cannot break the loop. The loop runs for the same time budget as
+    // the reads, so the beat keeps changing for the whole interval.
+    const script = `end=$(( $(date +%s) + ${budgetSec} )); while [ "$(date +%s)" -lt "$end" ]; do "$GATE_LOCK_TEST_LOOP_BIN" heartbeat || exit 1; done`;
     const [shellCmd, argv] = shellCommand(script);
     const loop = spawn(shellCmd, argv, {
       env: buildEnv({
@@ -127,16 +138,25 @@ describe('R6 a reader never sees an empty or missing beat', () => {
       loop.on('close', (code, signal) => resolve({ code, signal })),
     );
     const loopResult = await loopDone;
-    stopping = true;
+    // The heartbeat loop must outlive the reads: wait for both. If the loop
+    // exited early, loopResult is non-zero and the assertions below fail too.
     await hammer;
     expect(loopResult).toEqual({ code: 0, signal: null });
-    expect(reads.total).toBeGreaterThan(1000);
+    // The property: no read ever saw an empty or a missing beat.
     expect(reads.empty).toBe(0);
     expect(reads.missing).toBe(0);
-    // No assertion that the beat advanced by a second: all 40 refreshes can
-    // land in one epoch second, and the loop's exit status (checked above) is
-    // what proves they were made.
-  });
+    // A floor on the count: the loop really read this many times. Alone on this
+    // host the hammer sees ~10000 reads in ~2.5s (9750, 10250, 10000 in three
+    // runs); dividing by a generous factor of 10 gives 1000, which even under
+    // full-suite load on a 16-core laptop (the rate dropped ~20x there) stays
+    // well within reach.
+    expect(reads.total).toBeGreaterThan(1000);
+    // The beat advanced at least a few times during the reads: the heartbeat
+    // was alive for the whole budget, not dead early. Each heartbeat writes the
+    // current epoch second (F38), so one distinct beat per second is expected; a
+    // loop that died in the first second or two cannot pass this.
+    expect(beats.size).toBeGreaterThan(5);
+  }, 60_000);
 });
 
 describe('R10 the .format publication race (H1)', () => {
