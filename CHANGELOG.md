@@ -17,6 +17,16 @@ listings and exact file bytes for `acquire`, `release`, `verify`, `heartbeat`,
 
 - `gate-lock run`: a command that ignores TERM and is KILLed by the run's watchdog no
   longer leaks the shell's own job notice onto the caller's stderr.
+- `gate-lock run`: the teardown's wait for its supervisor is bounded in all, at
+  `8 + 2 x (grace + 18)` one-second rounds (64, about a minute, at the default
+  grace). A supervisor that kept reporting progress without finishing could hold
+  the slot for about thirteen minutes before.
+- `gate-lock run`: a run that has to KILL its supervisor now KILLs the
+  supervisor's heartbeat loop and any refresh in flight with it, before it
+  releases, and removes the beat that refresh had staged. Each pid is read from
+  the run's own directory and checked against its parent first; one that cannot
+  be checked is left alone and named on stderr. Before this a refresh could
+  outlive the run that started it.
 
 ## [0.1.0] - 2026-10-04
 

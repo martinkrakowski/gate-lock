@@ -118,6 +118,40 @@ to the command and KILL after a ten second grace period. If a refresh fails - th
 lock was reclaimed, or the slot was replaced - the run says the lock was lost,
 stops the command, and exits 2 without releasing a lock that is not its own.
 
+When the command has ended, `run` asks its supervisor to stop and waits for it
+before it releases. That wait is bounded in all: `run` gives up on a supervisor
+that will not stop after at most `8 + 2 x (grace + 18)` one-second rounds, where
+the grace is the ten seconds above. That is 64 rounds, about a minute. It then
+stops the supervisor the hard way, says so on stderr, and decides from the slot
+itself whether the lock is still its own. Most waits end far sooner (a supervisor
+that is simply gone costs eight rounds). A wait that does run to the bound takes
+at least a minute and, since a round is at least a second, longer on a loaded
+host. (Before this bound a supervisor that kept reporting progress without
+finishing could hold the slot for about thirteen minutes.)
+
+When the bound fires, the operator sees one line on stderr, `gate-lock: the
+heartbeat supervisor was stopped the hard way (status N) while the command ran;
+the slot verified as this run to release, so the command's status stands`, and
+has nothing to do: the slot was released and the exit status is the command's.
+(A run that is ending for another reason and has no time to verify says `and the
+slot was not verified afterwards` instead; `gate-lock status` then shows whether
+the slot is free.)
+
+The hard stop takes the supervisor's heartbeat loop and any refresh in flight
+with it, before the release. It KILLs only pids it read from the run's own
+private directory, and only after `ps` shows each to be the child it claims to
+be; one it cannot show that for is left alone and named at the end of the same
+line. This matters because of a window the heartbeat itself has: its last look
+at the holder and its rename of the beat are two calls, so a refresh left alive
+after its run has released could, if it stalled exactly between them while
+another run took the slot, write its own beat into that run's slot. It could
+overwrite the beat only, never the pid or the owner, and the next refresh of the
+new holder replaces it. The slot could be lost that way only if that beat were
+older than the stale threshold (600 seconds at least under a pool) and a janitor
+ran before the new holder's next refresh. Stopping the loop and the refresh with
+the supervisor removes the leftover in the ordinary case; the window remains for
+any path that does leave a refresh alive.
+
 ### acquire, release, verify, heartbeat
 
 These are for a caller that wants to hold a slot across several steps, which is
