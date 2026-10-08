@@ -213,6 +213,9 @@ describe('C40 a command that will not stop', () => {
     // escalator's KILL after the grace is the only end this run has, which is
     // exactly the death whose shell notice must not reach the caller's stderr.
     // Waiting for the watchdog's published pid proves that KILL path is armed.
+    // Honest caveat: this can only fail on a shell that prints such job notices at
+    // all (bash 3.2 on macOS); bash 5 prints nothing, so on this host it is green
+    // before and after the fix - the proof is a repeated run under bash 3.2.
     gate.child.kill('SIGTERM');
     await until(() => runDirWith(tmpRoot, 'escalator.pid'), 15000);
     const r = await gate.done;
@@ -223,6 +226,28 @@ describe('C40 a command that will not stop', () => {
     await waitForDead(victim, 10000);
     expect(stopped(victim)).toBe(true);
   }, 60_000);
+
+  it('issue #11 a command that writes to stderr after being forked still reaches the caller (C31/C32)', async () => {
+    const pool = freshPool();
+    // The command sleeps a moment - so its write lands after `run` has forked it
+    // and turned its own stderr away with `exec 2>/dev/null` - then writes a line
+    // to stderr and exits. The fork happened before the exec, so that line must
+    // arrive on the caller's stderr exactly once, and the run's own stderr empty.
+    const cmd = [
+      script(
+        pool,
+        'late-stderr.sh',
+        `sleep 1
+printf 'the command spoke\\n' >&2
+exit 0`,
+      ),
+    ];
+    const r = runOnce(pool, 'lane', cmd);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('released by lane');
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('the command spoke\n');
+    expect(names(pool)).toEqual(['.format']);
+  }, 30_000);
 
   it('D15 a signal into a run that is waiting still leaves the tool own lines on the caller stderr', async () => {
     const pool = freshPool();
