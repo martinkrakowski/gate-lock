@@ -27,6 +27,9 @@ listings and exact file bytes for `acquire`, `release`, `verify`, `heartbeat`,
   the run's own directory and checked against its parent first; one that cannot
   be checked is left alone and named on stderr. Before this a refresh could
   outlive the run that started it.
+- `gate-lock run`: the parent check before that KILL no longer accepts an empty
+  answer from `ps`, and the line about a heartbeat that had not gone says "still
+  listed", since a KILLed process can simply be waiting to be reaped.
 
 ## [0.1.0] - 2026-10-04
 
