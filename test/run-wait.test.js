@@ -361,11 +361,12 @@ describe('--wait', () => {
       // (gate-lock:3499: `run_pause=$((run_deadline - now))`) and breaks before a
       // late attempt (gate-lock:3471: `[ $((now + 1)) -le $run_deadline ] || break`),
       // so it runs at most ~1s past the deadline from a clamped sleep plus ~1s from
-      // whole-second truncation — about (seconds + 2)s from the code. A 3s load
-      // margin covers sleep oversleeping under host load. Formula:
-      // (seconds + 2) * 1000 + 3000. A doubled wait (2 * seconds * 1000) is at or
-      // above this bound for both 8 and 10.
-      expect(elapsed, given).toBeLessThan((seconds + 2) * 1000 + 3000);
+      // whole-second truncation — about (seconds + 2)s from the code. A 5s load
+      // margin covers sleep oversleeping under host load (macOS CI under the full
+      // suite needed that much before). Formula: (seconds + 2) * 1000 + 5000, so
+      // 15s for 8 and 17s for 10. A doubled wait (16s and 20s) is above the bound
+      // in both cases.
+      expect(elapsed, given).toBeLessThan((seconds + 2) * 1000 + 5000);
     }
     // A ten-digit value is inside the limit the message states, so it is accepted
     // rather than refused: it is checked by letting the run answer its first busy
