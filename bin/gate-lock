@@ -2621,7 +2621,7 @@ run_verify_lock() {
   # After `exec 2>/dev/null` in do_run, this run's own stderr is /dev/null, so a
   # verify failure would be swallowed there: hand it back through descriptor 9, the
   # way run_release_lock does for release (T33/T37 read a verify failure off stderr).
-  cat "$run_dir/verify.err" >&"$run_err_fd" 2>/dev/null
+  cat "$run_dir/verify.err" >&"$run_err_fd"
 }
 
 # run_release_lock (C36): give the slot back, pinned, with run's own pid, and say
