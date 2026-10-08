@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { listing, scratchOf, waitForFile } from './harness.js';
+import { BIN, listing, scratchOf, waitForFile } from './harness.js';
 import { TM, livePid, names, readSlot, until } from './slots.js';
 import {
   HAS_PGREP,
@@ -1171,5 +1171,36 @@ describe('the default heartbeat period', () => {
     const r = runOnce(pool, 'lane', ['true']);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('every 60s while lane runs');
+  });
+});
+
+// Issue #11, the part every shell can check. The stderr test above can only go
+// red on a shell that prints job notices (bash 3.2); these two read the script
+// itself, so the arrangement that test relies on cannot quietly disappear.
+describe('issue #11 the run speaks through descriptor 9, not its own stderr', () => {
+  const lines = fs.readFileSync(BIN, 'utf8').split('\n');
+  const lineOf = (text) => lines.findIndex((line) => line.trim() === text);
+
+  it('turns its own stderr away after the command is forked and before the supervisor is', () => {
+    const fork = lineOf('"$@" </dev/null 9>&- &');
+    const away = lineOf('exec 2>/dev/null');
+    const supervisor = lines.findIndex((line) => /^\s*run_supervise\b.*&\s*$/.test(line));
+    expect(fork, 'the fork of the command').toBeGreaterThan(-1);
+    expect(away, 'exec 2>/dev/null').toBeGreaterThan(fork);
+    expect(supervisor, 'the fork of the supervisor').toBeGreaterThan(away);
+    // The supervisor's children report on stderr, so it is handed the caller's.
+    expect(lines[supervisor]).toContain('2>&9 9>&-');
+  });
+
+  it('writes to plain stderr only from the heartbeat loop, which is handed the caller stderr', () => {
+    const plain = lines
+      .map((text, index) => ({ text, line: index + 1 }))
+      .filter(({ text }) => /(^|[^0-9])>&2(\s|$)/.test(text) && !/^\s*#/.test(text));
+    // `exec 9>&2` saves the caller's stderr and is not a write. Not vacuous:
+    // the two loop reports exist.
+    expect(plain.length).toBe(2);
+    for (const { text, line } of plain) {
+      expect(text, `line ${line} writes to plain stderr`).toMatch(/\$rb_/);
+    }
   });
 });

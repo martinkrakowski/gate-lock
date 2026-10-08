@@ -3735,6 +3735,11 @@ do_run() {
   # flushes it, and nothing of the tool's own is lost (it speaks through descriptor 9).
   # The command, the heartbeat loop and the verify/release children keep the caller's
   # stderr through the descriptors they were given at their own forks (C31/C32).
+  #
+  # The cost, accepted: a complaint of the shell itself after this point - an unset
+  # variable under `set -u`, a malformed test - is not printed either. The run still
+  # ends non-zero and the cleanup still releases; the caller sees the status and no
+  # words. A message this tool means to print must go through run_err_fd.
   exec 2>/dev/null
   # A shell runs a pending signal between two commands, so a signal can arrive
   # between the fork above and the assignment, when the handler had no pid to
