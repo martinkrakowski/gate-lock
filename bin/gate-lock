@@ -2159,17 +2159,23 @@ run_stop_bound=8
 # disk for the next teardown to wait on. Five seconds of slack over the worst case:
 # 10 + 13 + 5.
 run_stop_cap=$((run_kill_grace + 18))
-# Test seam: override run_stop_cap for tests that need it small. Inert outside
-# test mode; accepted only if all digits and at least 1.
+# Test seam: override run_stop_cap, for tests whose supervisor is wedged and will
+# never finish by itself. It breaks the rule above on purpose (a cap below the
+# supervisor's own worst case would give up on a healthy one), so it is not for a
+# test with a live supervisor. Inert outside test mode; accepted only as one to
+# three digits without a leading zero.
 seam GATE_LOCK_TEST_STOP_CAP
 case "${seam_value:-}" in
-  '' | *[!0-9]*) ;;
-  *) [ "$seam_value" -ge 1 ] && run_stop_cap=$seam_value ;;
+[1-9] | [1-9][0-9] | [1-9][0-9][0-9]) run_stop_cap=$seam_value ;;
 esac
-# The total cap is larger than each existing bound, so it never fires before
-# them; it is more than twice the supervisor's worst case; and it counts sleeps
-# of at least a second each, so on a loaded host it takes longer in wall time
-# and can never fire early.
+# The total cap is larger than each existing bound, so it never fires before them
+# on a helper they would have answered, and it is more than twice the supervisor's
+# own worst case (the grace plus thirteen of ITS passes). It counts this side's
+# sleeping rounds, at least a second each, and reads no clock. What it does not do
+# is stretch with the supervisor: a supervisor whose passes take more than about
+# 2.8 times as long as this side's rounds (64 against 23 at the default grace) can
+# be given up on while still on its way out. That is the price of a bound on the
+# whole wait; before it the same supervisor was simply waited for.
 run_stop_total_cap=$((run_stop_bound + 2 * run_stop_cap))
 
 # run_signal NAME CODE (D15, C38-C40): HUP, QUIT and TERM all forward TERM to

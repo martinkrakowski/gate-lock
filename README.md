@@ -123,10 +123,11 @@ before it releases. That wait is bounded in all: `run` gives up on a supervisor
 that will not stop after at most `8 + 2 x (grace + 18)` one-second rounds, where
 the grace is the ten seconds above. That is 64 rounds, about a minute. It then
 stops the supervisor the hard way, says so on stderr, and decides from the slot
-itself whether the lock is still its own. A round is at least a second, so on a
-loaded host the wait is longer than a minute, never shorter. (Before this bound a
-supervisor that kept reporting progress without finishing could hold the slot
-for about thirteen minutes.)
+itself whether the lock is still its own. Most waits end far sooner (a supervisor
+that is simply gone costs eight rounds). A wait that does run to the bound takes
+at least a minute and, since a round is at least a second, longer on a loaded
+host. (Before this bound a supervisor that kept reporting progress without
+finishing could hold the slot for about thirteen minutes.)
 
 ### acquire, release, verify, heartbeat
 

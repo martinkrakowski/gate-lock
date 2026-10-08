@@ -1222,7 +1222,8 @@ describe('D10 a loop that keeps dying', () => {
     //   - nineteen publications is under the reset cap of 20, so that never fires;
     //   - and by the last publication the total is so far along that the 48th round
     //     comes before twenty more busy ones, as long as a round takes under about
-    //     ten seconds.
+    //     ten seconds. (The limit this test waits to, 280 seconds, is the tighter
+    //     one: it is passed at about six seconds a round.)
     // At one round a second the total ends the wait after about 48 seconds.
     const alive = path.join(runDirOf(gate.child.pid, tmpRoot, trace), 'supervisor.alive');
     let published = 0;
@@ -1250,7 +1251,8 @@ describe('D10 a loop that keeps dying', () => {
       });
       const said = traceText(trace);
       // The total ended it, at exactly its cap. A total that progress could reset
-      // would not have reached 48 here; the wait would have gone on to the reset cap.
+      // would not have reached 48 here: the wait would have run on until the busy cap
+      // after the last publication, which is past this test's limit.
       expect(said, said).toContain(': 48 rounds in all');
       expect(published, 'progress was published during the wait').toBeGreaterThanOrEqual(3);
       expect(said, said).not.toContain('times without finishing');
