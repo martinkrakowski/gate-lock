@@ -2496,14 +2496,26 @@ run_reap_command() {
   if [ -z "$run_cmd_pid" ]; then
     return 0
   fi
-  run_last_cmd_pid=$run_cmd_pid
-  if [ "$run_sup_status" -ne 0 ] && [ "$run_sup_status" -ne 3 ]; then
-    run_forward_term
-  fi
-  run_wait_pid "$run_last_cmd_pid"
-  run_cmd_status=$wp_status
-  run_cmd_pid=
-  run_cancel_escalator
+  # The reap and everything that follows it until the command's pid is forgotten
+  # are turned away from this shell's own stderr as one region, for the reason
+  # errmsg gives by do_run: a command stopped by a watchdog's KILL is a job of this
+  # shell's, and the line bash writes about it is flushed at a command boundary
+  # after the wait. run_wait_pid turns stderr away for the wait itself, but not for
+  # this caller's boundary past it - `run_cmd_status=`, `run_cmd_pid=`, the externals
+  # of run_cancel_escalator - and on bash that is exactly where a deferred notice is
+  # reported. Folding the whole reap through the pid clearing into one redirected
+  # region swallows it there. The tool's own messages go through descriptor 9, and the
+  # command - forked earlier, holding its own stderr - is untouched (C31/C32).
+  {
+    run_last_cmd_pid=$run_cmd_pid
+    if [ "$run_sup_status" -ne 0 ] && [ "$run_sup_status" -ne 3 ]; then
+      run_forward_term
+    fi
+    run_wait_pid "$run_last_cmd_pid"
+    run_cmd_status=$wp_status
+    run_cmd_pid=
+    run_cancel_escalator
+  } 2>/dev/null
 }
 
 # run_stop_supervisor (C41, R7, R8d): TERM the supervisor, which stops its loop

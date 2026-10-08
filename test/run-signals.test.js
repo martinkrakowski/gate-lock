@@ -15,6 +15,7 @@ import {
   beatPids,
   blocker,
   childrenMatching,
+  deafRun,
   freshPool,
   runDirOf,
   runOnce,
@@ -197,6 +198,30 @@ describe('C40 a command that will not stop', () => {
     expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
     expect(r.stdout).toContain('released by lane');
     expect(names(pool)).toEqual(['.format']);
+  }, 60_000);
+
+  it('issue #11 a command the watchdog KILLs after it ignores TERM leaks no shell job notice onto stderr', async () => {
+    const pool = freshPool();
+    // Put the watchdog's private directory somewhere this test owns, so the marker
+    // that says it fired can be read while the run is still tearing down.
+    const tmpRoot = path.join(scratchOf(pool), 'tmp-root');
+    fs.mkdirSync(tmpRoot, { mode: 0o700 });
+    const { gate, victim } = await deafRun(pool, {
+      env: { GATE_LOCK_TEST_TMP_ROOT: tmpRoot },
+    });
+    // The command ignores TERM, so the run's own TERM below cannot stop it: the
+    // escalator's KILL after the grace is the only end this run has, which is
+    // exactly the death whose shell notice must not reach the caller's stderr.
+    // Waiting for the watchdog's published pid proves that KILL path is armed.
+    gate.child.kill('SIGTERM');
+    await until(() => runDirWith(tmpRoot, 'escalator.pid'), 15000);
+    const r = await gate.done;
+    expect(r.status, JSON.stringify(r.stderr)).toBe(143);
+    expect(r.stderr, JSON.stringify(r.stderr)).toBe('');
+    expect(r.stdout).toContain('released by lane');
+    expect(names(pool)).toEqual(['.format']);
+    await waitForDead(victim, 10000);
+    expect(stopped(victim)).toBe(true);
   }, 60_000);
 
   it('D15 a signal into a run that is waiting still leaves the tool own lines on the caller stderr', async () => {
