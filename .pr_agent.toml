@@ -1,0 +1,13 @@
+# Defaults for PR-Agent in this repository. PR-Agent reads this file from the default branch, so
+# a pull request cannot change the rules it is reviewed by. Everything that makes the correctness
+# reviewer what it is (model, caps, instructions) is set in its workflow's env block,
+# .github/workflows/pr-agent-correctness.yml, and wins over this file.
+
+[config]
+# Never push to the repository or apply a suggestion: the reviewer comments and nothing else.
+restricted_mode = true
+
+[github_action_config]
+auto_review = false
+auto_describe = false
+auto_improve = false
