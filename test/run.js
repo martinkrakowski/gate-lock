@@ -11,6 +11,7 @@ import path from 'node:path';
 import { afterEach } from 'vitest';
 import { runBin, scratchOf, startBin, waitForFile } from './harness.js';
 import { TM, freshPool as slotPool, livePid, names, until, wtDir } from './slots.js';
+import { scaled } from './wait-scale.js';
 
 export { TM, livePid, until };
 
@@ -276,7 +277,7 @@ export function stopped(pid) {
 
 /** Wait until `pid` is not a live process any more. */
 export async function waitForDead(pid, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaled(timeoutMs);
   while (Date.now() < deadline && alive(pid)) {
     await new Promise((r) => setTimeout(r, 20));
   }

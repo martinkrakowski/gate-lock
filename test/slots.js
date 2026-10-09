@@ -12,6 +12,7 @@ import {
   writeFormat,
   writeSlot,
 } from './harness.js';
+import { scaled } from './wait-scale.js';
 
 export { path };
 
@@ -137,7 +138,7 @@ function writeSlotDefaults(pool, name, fields, opts) {
 
 /** Wait until `fn()` is true; reject after timeoutMs. */
 export async function until(fn, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaled(timeoutMs);
   while (!fn()) {
     if (Date.now() >= deadline) throw new Error('timed out');
     await new Promise((r) => setTimeout(r, 20));

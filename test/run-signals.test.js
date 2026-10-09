@@ -30,6 +30,7 @@ import {
   waitForDead,
   waitRunGone,
 } from './run.js';
+import { scaled } from './wait-scale.js';
 
 /** Is `shell` (e.g. "bash --posix") installed and runnable here? */
 function hasShell(shell) {
@@ -51,7 +52,7 @@ async function signalledRun(pool, { name = 'victim', env = {}, shell } = {}) {
 
 /** Wait until the beat has moved off the start time: the loop is running. */
 async function beatMoved(pool, started, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaled(timeoutMs);
   while (Date.now() < deadline) {
     if (readSlot(pool, 'gate.lock').beat !== started) return;
     await new Promise((r) => setTimeout(r, 20));
@@ -725,6 +726,10 @@ describe('T25 / R6 the beat is never empty or missing', () => {
       }
     })();
     await beatMoved(pool, readSlot(pool, 'gate.lock').started);
+    // The reader is given the reads it needs, however slow the host: the count
+    // below is a floor on how hard the beat was read, not a measure of how many
+    // reads fit in the time one refresh takes on this machine.
+    await until(() => reads.total > 500);
     // The reader stops while the slot is still there: the release at the end of
     // the run removes the file, and a missing beat after that is the run's exit,
     // not a reader that saw a hole (R6).
