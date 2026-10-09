@@ -175,8 +175,10 @@ jobs:
       # PR-Agent can exit 0 without having produced a review: it posts a failure notice, or, when
       # it cannot parse the model's answer, posts nothing at all. A green check must not claim
       # work that never happened, so this step fails unless /review left its own comment in this
-      # run: one that BEGINS "## PR Reviewer Guide", created or updated since the run began. A red
-      # check here blocks nothing: no rule requires this job.
+      # run: one that BEGINS "## PR Reviewer Guide", created or updated since the run began. The
+      # failure notice is matched at the start too (/review's own begins "Failed to review PR"), so
+      # a finding that quotes those words cannot fail the run that posted it. A red check here
+      # blocks nothing: no rule requires this job.
       - name: Fail if the review did not actually run
         if: always()
         env:
@@ -188,7 +190,7 @@ jobs:
           gh api --paginate --slurp --method GET "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" > "$RUNNER_TEMP/issue.json"
           MINE='[.[][] | select(.user.login == "github-actions[bot]") | select(.updated_at >= $since)]'
           count() { jq --arg since "$STARTED_AT" "$MINE | map(select(.body | test(\"$1\"))) | length" "$2"; }
-          failed=$(count "Failed to generate" "$RUNNER_TEMP/issue.json")
+          failed=$(count "^Failed to review PR" "$RUNNER_TEMP/issue.json")
           review=$(count "^## PR Reviewer Guide" "$RUNNER_TEMP/issue.json")
           for n in "$failed" "$review"; do
             case "$n" in
