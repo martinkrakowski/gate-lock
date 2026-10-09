@@ -47,32 +47,35 @@ jobs:
           # GPT-6.1 Sol on every pull request. Never a Gemini or a Grok model through OpenRouter.
           config.model: 'openrouter/openai/gpt-6.1-sol'
           config.fallback_models: '["openrouter/anthropic/claude-haiku-4.5"]'
-          # The ceiling: at most 4 calls, each with at most 70,000 prompt tokens and 8,000
+          # The ceiling: one call, with at most 70,000 prompt tokens and 8,000
           # completion tokens, and 10 minutes per call inside the job's 20.
           config.custom_model_max_tokens: '128000'
           config.max_model_tokens: '70000'
           openrouter.max_tokens: '8000'
           config.ai_timeout: '600'
-          # Asked for, though 0.47.0 was seen to accept both and print nothing: the number of
-          # model calls and their time are read from this job's log instead.
+          # /review prints model, time and estimated cost in its comment; this job's log stays the
+          # record of calls.
           config.output_run_details: 'true'
           config.output_run_cost: 'true'
-          pr_reviewer.require_ticket_analysis_review: 'false'
-          github_action_config.auto_review: 'false'
+          github_action_config.auto_review: 'true'
           github_action_config.auto_describe: 'false'
-          github_action_config.auto_improve: 'true'
+          github_action_config.auto_improve: 'false'
           github_action_config.pr_actions: '["opened", "reopened", "ready_for_review"]'
-          pr_code_suggestions.focus_only_on_problems: 'true'
-          pr_code_suggestions.committable_code_suggestions: 'true'
-          # On: a review that finds nothing says so in a comment. The guard below counts this
-          # run's comments, and a run that posted none did not review (a model answer PR-Agent
-          # could not parse ends that way, with exit 0).
-          pr_code_suggestions.publish_output_no_suggestions: 'true'
-          pr_code_suggestions.num_code_suggestions_per_chunk: '5'
-          pr_code_suggestions.max_number_of_calls: '4'
-          pr_code_suggestions.parallel_calls: 'true'
-          pr_code_suggestions.suggestions_score_threshold: '0'
-          pr_code_suggestions.extra_instructions: |
+          # /review, not /improve: /improve makes a second model call that scores every
+          # suggestion and drops one that scores 0, and was seen elsewhere to drop real defects.
+          # /review has no scoring call. Findings only: no effort estimate, no test check, no
+          # labels (labels would need a wider token), no ticket lookup. Each finding is a line
+          # comment.
+          pr_reviewer.require_ticket_analysis_review: 'false'
+          pr_reviewer.require_estimate_effort_to_review: 'false'
+          pr_reviewer.require_tests_review: 'false'
+          pr_reviewer.require_security_review: 'true'
+          pr_reviewer.enable_review_labels_security: 'false'
+          pr_reviewer.enable_review_labels_effort: 'false'
+          pr_reviewer.inline_key_issues: 'true'
+          # The default is 3, and what is over the number is dropped silently.
+          pr_reviewer.num_max_findings: '8'
+          pr_reviewer.extra_instructions: |
             You are the correctness reviewer for gate-lock, a host-wide lock: every project and
             git worktree on one host shares a pool of N slots on disk, so at most N expensive
             gates run at once and never two in one worktree. The tool is one POSIX `sh` script,
@@ -165,13 +168,15 @@ jobs:
               contradicts it or breaks a rule above.
             - A fix that only turns a loud failure into a quiet one.
 
-            Prefer one real defect to five plausible ones. Do not acknowledge, praise or summarise.
+            Report a real defect even when you cannot write its complete fix: say what is wrong
+            and what a fix must do. Prefer one real defect to five plausible ones. Do not
+            acknowledge, praise or summarise.
 
       # PR-Agent can exit 0 without having produced a review: it posts a failure notice, or, when
       # it cannot parse the model's answer, posts nothing at all. A green check must not claim
-      # work that never happened, so this step fails unless this run left at least one comment
-      # and none of them is a failure notice. A red check here blocks nothing: no rule requires
-      # this job.
+      # work that never happened, so this step fails unless /review left its own comment in this
+      # run: one that BEGINS "## PR Reviewer Guide", created or updated since the run began. A red
+      # check here blocks nothing: no rule requires this job.
       - name: Fail if the review did not actually run
         if: always()
         env:
@@ -181,12 +186,11 @@ jobs:
         run: |
           set -euo pipefail
           gh api --paginate --slurp --method GET "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" > "$RUNNER_TEMP/issue.json"
-          gh api --paginate --slurp --method GET "repos/${GITHUB_REPOSITORY}/pulls/${PR}/comments" > "$RUNNER_TEMP/review.json"
-          MINE='[.[][] | select(.user.login == "github-actions[bot]") | select(.created_at >= $since)]'
-          failed=$(jq --arg since "$STARTED_AT" "$MINE | map(select(.body | test(\"Failed to generate\"))) | length" "$RUNNER_TEMP/issue.json")
-          posted_issue=$(jq --arg since "$STARTED_AT" "$MINE | length" "$RUNNER_TEMP/issue.json")
-          posted_review=$(jq --arg since "$STARTED_AT" "$MINE | length" "$RUNNER_TEMP/review.json")
-          for n in "$failed" "$posted_issue" "$posted_review"; do
+          MINE='[.[][] | select(.user.login == "github-actions[bot]") | select(.updated_at >= $since)]'
+          count() { jq --arg since "$STARTED_AT" "$MINE | map(select(.body | test(\"$1\"))) | length" "$2"; }
+          failed=$(count "Failed to generate" "$RUNNER_TEMP/issue.json")
+          review=$(count "^## PR Reviewer Guide" "$RUNNER_TEMP/issue.json")
+          for n in "$failed" "$review"; do
             case "$n" in
               ''|*[!0-9]*)
                 echo "Expected an integer from the comment scan, got: $n"
@@ -194,12 +198,14 @@ jobs:
                 ;;
             esac
           done
+          echo "/review: $review guide comment(s). Failure notices: $failed."
+          status=0
           if [ "$failed" -gt 0 ]; then
             echo "PR-Agent reported it could not generate a review."
-            exit 1
+            status=1
           fi
-          if [ $((posted_issue + posted_review)) -eq 0 ]; then
-            echo "PR-Agent left no comment in this run: it did not review this pull request."
-            exit 1
+          if [ "$review" -eq 0 ]; then
+            echo "/review left nothing in this run: it did not review this pull request."
+            status=1
           fi
-          echo "This run left $posted_issue comment(s) and $posted_review line comment(s)."
+          exit "$status"
