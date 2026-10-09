@@ -11,6 +11,7 @@ import path from 'node:path';
 import { afterEach } from 'vitest';
 import { runBin, scratchOf, startBin, waitForFile } from './harness.js';
 import { TM, freshPool as slotPool, livePid, names, until, wtDir } from './slots.js';
+import { scaled } from './wait-scale.js';
 
 export { TM, livePid, until };
 
@@ -53,18 +54,42 @@ export function waiting(pool, name = 'block') {
     done: `${dir}/done`,
     pid: () => Number(fs.readFileSync(`${dir}/ready`, 'utf8')),
     release: () => {
-      try {
-        // O_NONBLOCK: when the command is already gone there is no reader left, and
-        // a plain open for writing would wait for one for ever. With it, the open
-        // answers ENXIO at once, which is the "nothing to let go of" case.
-        const fd = fs.openSync(`${dir}/go`, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+      // O_NONBLOCK: when the command is already gone there is no reader left, and
+      // a plain open for writing would wait for one for ever. With it, the open
+      // answers ENXIO at once.
+      //
+      // ENXIO has a second meaning, and treating it as the first lost the release:
+      // the command writes `ready` and only THEN opens the fifo to read, so a test
+      // that sees `ready` and lets go at once can find no reader yet. The command
+      // then blocked in its open for ever and the run never ended (H6 and the
+      // holder-pid test, each red once on a loaded runner). So "no reader" is
+      // "gone" only when the command's process is gone; while it is alive the open
+      // is tried again until the reader is there.
+      const deadline = Date.now() + scaled(10000);
+      for (;;) {
         try {
-          fs.writeSync(fd, 'go\n');
-        } finally {
-          fs.closeSync(fd);
+          const fd = fs.openSync(`${dir}/go`, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+          try {
+            fs.writeSync(fd, 'go\n');
+          } finally {
+            fs.closeSync(fd);
+          }
+          return;
+        } catch (error) {
+          if (error.code !== 'ENXIO') return; // the fifo itself is gone with its directory
+          let pid;
+          try {
+            pid = Number(fs.readFileSync(`${dir}/ready`, 'utf8'));
+          } catch {
+            return; // the command never came up; there is nothing to let go of
+          }
+          if (!Number.isInteger(pid) || pid <= 0 || !alive(pid)) return; // really gone
+          // Bounded, and quiet when the bound is reached: a command that was
+          // KILLed and not yet reaped still answers as alive and will never read.
+          // A test that then waits for its run times out there, with this as why.
+          if (fs.existsSync(`${dir}/done`) || Date.now() >= deadline) return;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
         }
-      } catch {
-        /* the command is gone; there is nothing to let go of */
       }
     },
   };
@@ -276,7 +301,7 @@ export function stopped(pid) {
 
 /** Wait until `pid` is not a live process any more. */
 export async function waitForDead(pid, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaled(timeoutMs);
   while (Date.now() < deadline && alive(pid)) {
     await new Promise((r) => setTimeout(r, 20));
   }

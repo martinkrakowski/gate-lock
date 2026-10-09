@@ -1285,10 +1285,20 @@ describe('D10 a loop that keeps dying', () => {
       // still be parked on it, and the slot is byte for byte what the second run
       // wrote: nothing of the first run is left to write into it.
       const block2 = blocker(pool, 'second');
+      const trace2 = path.join(tmpRoot, 'trace-second.log');
       const gate2 = startRun(pool, 'second-lane', block2.cmd, {
-        env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '60' },
+        env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '60', GATE_LOCK_TEST_TRACE: trace2 },
       });
       await up(block2);
+      // The second run's own loop refreshes once as it starts and only then sleeps
+      // its period: the slot is read after that first beat has landed, or a slow
+      // host puts it between the two reads and it looks like a stranger's write.
+      // The next one is a minute away.
+      await untilTraced(
+        () => /is still this caller's after the rename/.test(traceText(trace2)),
+        trace2,
+        20000,
+      );
       const held = readSlot(pool, 'gate.lock');
       expect(held.pid, 'the second run holds the slot').toBe(String(gate2.child.pid));
       clearInterval(timer);
@@ -1347,10 +1357,20 @@ describe('D10 a loop that keeps dying', () => {
       expect(stagedBeats(pool).length, 'the heartbeat left alone is still staged').toBe(1);
       // A second run takes the slot while that heartbeat is still parked...
       const block2 = blocker(pool, 'second');
+      const trace2 = path.join(tmpRoot, 'trace-second.log');
       const gate2 = startRun(pool, 'second-lane', block2.cmd, {
-        env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '60' },
+        env: { ...TM, GATE_LOCK_HEARTBEAT_SECONDS: '60', GATE_LOCK_TEST_TRACE: trace2 },
       });
       await up(block2);
+      // The second run's own loop refreshes once as it starts and only then sleeps
+      // its period: the slot is read after that first beat has landed, or a slow
+      // host puts it between the two reads and it looks like a stranger's write.
+      // The next one is a minute away.
+      await untilTraced(
+        () => /is still this caller's after the rename/.test(traceText(trace2)),
+        trace2,
+        20000,
+      );
       const held = readSlot(pool, 'gate.lock');
       expect(held.pid, 'the second run holds the slot').toBe(String(gate2.child.pid));
       // ...and the heartbeat is let go. It checks the holder again immediately

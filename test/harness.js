@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach } from 'vitest';
+import { scaled } from './wait-scale.js';
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const BIN = path.join(REPO_ROOT, 'bin', 'gate-lock');
@@ -138,7 +139,7 @@ export function startBin(args = [], { env = {}, cwd, fd3, ...rest } = {}) {
 
 /** Resolve when `file` exists (a pause-hook handshake); reject after timeoutMs. */
 export async function waitForFile(file, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaled(timeoutMs);
   while (!fs.existsSync(file)) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for ${file}`);
     await new Promise((r) => setTimeout(r, 20));
