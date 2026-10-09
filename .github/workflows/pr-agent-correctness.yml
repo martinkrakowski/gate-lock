@@ -73,8 +73,11 @@ jobs:
           pr_reviewer.enable_review_labels_security: 'false'
           pr_reviewer.enable_review_labels_effort: 'false'
           pr_reviewer.inline_key_issues: 'true'
-          # The default is 3, and what is over the number is dropped silently.
-          pr_reviewer.num_max_findings: '8'
+          # The default is 3, and what is over the number is dropped silently. 12, not 8: on a
+          # sibling repository's first large pull request the reviewer posted exactly 8, the cap,
+          # seven of them valid, so a ninth may have been lost. A review that posts exactly 12 is
+          # reported.
+          pr_reviewer.num_max_findings: '12'
           pr_reviewer.extra_instructions: |
             You are the correctness reviewer for gate-lock, a host-wide lock: every project and
             git worktree on one host shares a pool of N slots on disk, so at most N expensive
