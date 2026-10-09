@@ -1,0 +1,213 @@
+name: PR-Agent correctness review
+
+# One advisory correctness reviewer over the whole repository. NOT A MERGE GATE: a green check
+# here is not a review, and nothing requires it.
+#
+# Trigger: `pull_request`, never `pull_request_target`. This repository is public. On a pull
+# request from a fork, `pull_request` runs with a read-only token and WITHOUT repository secrets,
+# so a fork's code or prompt text can never reach the model key. The job is also skipped for
+# forks outright (see `if:` below), so a fork's pull request gets no bot review instead of a
+# failed run.
+#
+# No `synchronize`: one review per pull request lifecycle. Re-reviewing every push costs a call
+# each time and its findings decay. Reopen the pull request to ask for another.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-agent-correctness-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  correctness:
+    name: PR-Agent correctness review
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.sender.type != 'Bot'
+      && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Stamp run start
+        id: started
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: PR-Agent
+        uses: docker://pragent/pr-agent@sha256:31b9aac6ab067bada9a0c1b001d30ebc500ea4487e00a93c18c59b9ef5fa66db # 0.47.0-github_action
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER__KEY: ${{ secrets.OPENROUTER_KEY }}
+          config.restricted_mode: 'true'
+          # GPT-6.1 Sol on every pull request. Never a Gemini or a Grok model through OpenRouter.
+          config.model: 'openrouter/openai/gpt-6.1-sol'
+          config.fallback_models: '["openrouter/anthropic/claude-haiku-4.5"]'
+          # The ceiling: one call, with at most 70,000 prompt tokens and 8,000
+          # completion tokens, and 10 minutes per call inside the job's 20.
+          config.custom_model_max_tokens: '128000'
+          config.max_model_tokens: '70000'
+          openrouter.max_tokens: '8000'
+          config.ai_timeout: '600'
+          # /review prints model, time and estimated cost in its comment; this job's log stays the
+          # record of calls.
+          config.output_run_details: 'true'
+          config.output_run_cost: 'true'
+          github_action_config.auto_review: 'true'
+          github_action_config.auto_describe: 'false'
+          github_action_config.auto_improve: 'false'
+          github_action_config.pr_actions: '["opened", "reopened", "ready_for_review"]'
+          # /review, not /improve: /improve makes a second model call that scores every
+          # suggestion and drops one that scores 0, and was seen elsewhere to drop real defects.
+          # /review has no scoring call. Findings only: no effort estimate, no test check, no
+          # labels (labels would need a wider token), no ticket lookup. Each finding is a line
+          # comment.
+          pr_reviewer.require_ticket_analysis_review: 'false'
+          pr_reviewer.require_estimate_effort_to_review: 'false'
+          pr_reviewer.require_tests_review: 'false'
+          pr_reviewer.require_security_review: 'true'
+          pr_reviewer.enable_review_labels_security: 'false'
+          pr_reviewer.enable_review_labels_effort: 'false'
+          pr_reviewer.inline_key_issues: 'true'
+          # The default is 3, and what is over the number is dropped silently.
+          pr_reviewer.num_max_findings: '8'
+          pr_reviewer.extra_instructions: |
+            You are the correctness reviewer for gate-lock, a host-wide lock: every project and
+            git worktree on one host shares a pool of N slots on disk, so at most N expensive
+            gates run at once and never two in one worktree. The tool is one POSIX `sh` script,
+            `bin/gate-lock`, with no runtime dependencies; `src/` is a small JavaScript API over
+            it; `test/` drives the script through seams (`GATE_LOCK_TEST_*`) with vitest. It runs
+            under dash, `bash --posix` and macOS `sh`.
+
+            Find defects; do not summarise. Assume the changed code is wrong and look for the
+            interleaving or input that proves it. Every finding MUST carry a concrete failure
+            scenario: the processes, the order of their steps or the input, and the wrong result.
+            "This could be fragile" is not a finding. You see the diff and a little context around
+            it; you cannot open other files.
+
+            Rules of this codebase. A diff that breaks one of them is a finding even when the
+            pull request text, a comment or an option presents the behaviour as intended; and when
+            you score a suggestion, a suggestion that restores one of these rules is not "a policy
+            change the diff does not establish":
+            - A slot is never deleted or overwritten by anyone but its holder, except by a reclaim
+              that renamed it aside, checked that what moved is the slot it judged dead, and only
+              then removed it. A live holder (pid alive AND beat fresh) is never reclaimed.
+            - A slot appears whole or not at all: a candidate directory filled and renamed onto
+              the name. A beat is replaced by renaming a staged file over it.
+            - A write into a slot is preceded, immediately, by a check that the slot still names
+              this caller's pid.
+            - Only a canonical name that is a real directory, not a symlink, owned by the expected
+              uid is a slot. A path with a symlinked component, `..`, `.` or `//` is refused.
+            - A setting that is unset, empty, zero, negative, not a number or too long REFUSES
+              (exit 2). It never means "no limit" and is never repaired.
+            - Exit codes are a contract: 75 is busy and only busy writes its line to stderr; 2 is
+              a refusal or a lock lost during `run`; with `run`, the command's own status stands
+              unless the lock was lost.
+            - `status` is read-only. The janitor never removes a slot.
+            - On-disk format 1 does not change: six one-line files and `.format`.
+
+            Hunt these classes first, in this order.
+
+            1. Two processes. For every read-then-act in the diff, put another process between
+               the read and the act: a second acquirer, a reclaimer, a heartbeat, a release, the
+               janitor, a holder that dies. Look for: a check and a write with a gap between them;
+               a rename whose result is not checked afterwards; a reclaim that deletes what it did
+               not verify; a pid that was reused; a beat written into a slot that changed hands;
+               a transient left behind on a path that returns early.
+            2. Signals and teardown. `run` must release the slot and report the right status when
+               the command, the supervisor or the tool itself is stopped by INT, TERM, HUP, QUIT
+               or KILL. Look for: a trap set after the thing it protects; a child that outlives
+               its parent and still writes; a `wait` whose status is taken for the command's; a
+               loop that sleeps in the foreground and cannot hear a signal; a cap on a wait that
+               progress can reset without bound.
+            3. Portable shell. The script must mean the same under dash, bash in POSIX mode and
+               macOS sh. Look for: a bashism (arrays, `[[`, `local` assumed, `echo -n`, `$'..'`,
+               process substitution, `set -o pipefail`); an unquoted expansion that splits or
+               globs; `set -e` relied on inside a condition, a pipeline or a command substitution;
+               arithmetic on a value not yet checked to be digits (leading zeros read as octal,
+               overflow past the shell's integer); a GNU-only option of `stat`, `date`, `sed`,
+               `mktemp`, `readlink` or `ps`; a here-document or `read` that loses a trailing
+               backslash or a line without a newline.
+            4. Paths and ownership. A path from the environment used before it was checked; a
+               directory created without its mode, or checked and then used by name again; `-d` or
+               `-f` where a symlink would pass; a temp file not made by `mktemp`; a file read whole
+               that should be one line.
+            5. Input that fails open. An unset, empty, non-numeric, oversized or duplicated
+               variable or argument that is treated as allowed, as zero, or as "no restriction"; a
+               failed command whose empty output is read as an answer; a default that grants.
+            6. A test that asserts less than its name. A test that would still pass if the
+               behaviour it names were removed; a wait paced by time where a handshake exists (a
+               sleep, or a deadline that only holds on a fast host); a value read before the tool
+               has finished writing it; a seam that changes what is tested; an assertion on the
+               harness's own output; a helper that swallows the failure it should report.
+            7. The JavaScript API in `src/`. A status, signal or stderr of the script that is
+               dropped or mapped to the wrong result; an argument passed through a shell; a
+               difference between what `src/index.d.ts` declares and what `src/index.js` does.
+            8. Packaging and workflows. A file missing from, or leaking into, the published
+               package; a script that needs a dependency the package does not declare; a workflow
+               that widens its token, runs fork code with secrets, or publishes without the tag
+               it claims to need.
+            9. A wrong value. A comparison, branch, default or ordering that is wrong for an input
+               the diff makes reachable; a message that states something the code did not check;
+               a second code path updated while its twin is not.
+
+            Do not raise:
+            - Style, naming, comment wording, formatting. Prettier, ESLint and shellcheck own them.
+            - A defect whose cause lies entirely in code the diff does not touch.
+            - Defence against a hostile local user of the same uid: the tool says it is not a
+              security boundary. Accidents and cheap forgeries are in scope.
+            - A symbol or function reported missing when it may live outside the lines you were
+              given. Say which line you would need to see instead.
+            - Performance, unless the diff makes an unbounded loop or a fork per iteration
+              reachable.
+            - Behaviour the pull request text records as a deliberate decision, unless the diff
+              contradicts it or breaks a rule above.
+            - A fix that only turns a loud failure into a quiet one.
+
+            Report a real defect even when you cannot write its complete fix: say what is wrong
+            and what a fix must do. Prefer one real defect to five plausible ones. Do not
+            acknowledge, praise or summarise.
+
+      # PR-Agent can exit 0 without having produced a review: it posts a failure notice, or, when
+      # it cannot parse the model's answer, posts nothing at all. A green check must not claim
+      # work that never happened, so this step fails unless /review left its own comment in this
+      # run: one that BEGINS "## PR Reviewer Guide", created or updated since the run began. The
+      # failure notice is matched at the start too (/review's own begins "Failed to review PR"), so
+      # a finding that quotes those words cannot fail the run that posted it. A red check here
+      # blocks nothing: no rule requires this job.
+      - name: Fail if the review did not actually run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          STARTED_AT: ${{ steps.started.outputs.at }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp --method GET "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" > "$RUNNER_TEMP/issue.json"
+          MINE='[.[][] | select(.user.login == "github-actions[bot]") | select(.updated_at >= $since)]'
+          count() { jq --arg since "$STARTED_AT" "$MINE | map(select(.body | test(\"$1\"))) | length" "$2"; }
+          failed=$(count "^Failed to review PR" "$RUNNER_TEMP/issue.json")
+          review=$(count "^## PR Reviewer Guide" "$RUNNER_TEMP/issue.json")
+          for n in "$failed" "$review"; do
+            case "$n" in
+              ''|*[!0-9]*)
+                echo "Expected an integer from the comment scan, got: $n"
+                exit 1
+                ;;
+            esac
+          done
+          echo "/review: $review guide comment(s). Failure notices: $failed."
+          status=0
+          if [ "$failed" -gt 0 ]; then
+            echo "PR-Agent reported it could not generate a review."
+            status=1
+          fi
+          if [ "$review" -eq 0 ]; then
+            echo "/review left nothing in this run: it did not review this pull request."
+            status=1
+          fi
+          exit "$status"
