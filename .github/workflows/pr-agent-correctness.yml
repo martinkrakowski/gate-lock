@@ -44,9 +44,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENROUTER__KEY: ${{ secrets.OPENROUTER_KEY }}
           config.restricted_mode: 'true'
-          # GPT-6.1 Sol on every pull request. Never a Gemini or a Grok model through OpenRouter.
+          # GPT-6.1 Sol on every pull request. Never a Claude, Gemini or Grok model through OpenRouter.
           config.model: 'openrouter/openai/gpt-6.1-sol'
-          config.fallback_models: '["openrouter/anthropic/claude-haiku-4.5"]'
+          config.fallback_models: '["openrouter/openai/gpt-6-luna"]'
           # The ceiling: one call, with at most 70,000 prompt tokens and 8,000
           # completion tokens, and 10 minutes per call inside the job's 20.
           config.custom_model_max_tokens: '128000'
